@@ -8,6 +8,7 @@ Agents should outlive their processes.
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](tsconfig.json)
 [![Effect](https://img.shields.io/badge/Effect-v4-000000?style=for-the-badge)](https://effect.website)
 [![SQLite](https://img.shields.io/badge/SQLite-WAL-003B57?style=for-the-badge&logo=sqlite&logoColor=white)](src/durable/sqlite/storage.ts)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](LICENSE)
 
 </div>
 
@@ -24,6 +25,8 @@ reconnect to.
 > **libfx decides. Effect executes. Journal transitions. Storage persists.**
 
 ## Quick Start
+
+Requires Node.js 22.13+ (for the built-in `node:sqlite`) and pnpm.
 
 ```bash
 pnpm install
@@ -129,8 +132,8 @@ Otherwise pass `jsonSchema` yourself. A plain JSON Schema object works as `input
 
 `fx-durable/effect` exposes the Effect-native side:
 - `durableFxLayer(options)`: the whole service graph as one `Layer`.
-- `Database`: the durability boundary. `run(journal => …)` and `read(storage => …)` turn synchronous journal calls
-  into Effects with typed storage errors.
+- `Database`: the durability boundary. `run(journal => …)`, `read(storage => …)` and `executors(registry => …)` turn
+  synchronous journal calls into Effects with typed storage errors.
 - The service tags: `EventLog`, `AgentSupervisor`, `RecoveryManager` and others.
 - `openDurableFx(options, { ids, clock })`: open with your own id generator or clock.
 
@@ -198,7 +201,7 @@ The [crash suite](tests/crash/crash-matrix.test.ts) checks each of these by kill
                    │
                 Effect            supervisor, turn attempts, tool executor,
                    │              cancellation, resource scopes, live fan-out
-               Database           run(journal => …) · read(storage => …)
+               Database           run(journal => …) · read(storage => …) · executors(…)
                    │
        ── durability boundary ──
                    │
@@ -286,7 +289,7 @@ TURN #1 turn_… completed attempts: 2
 | `fxd events <agent> [--after N] [--follow]` | Print the event log from a cursor |
 | `fxd trace <agent> [--turn ID]` | Show the execution trace of a turn |
 | `fxd recover` | Classify work left by dead processes without running anything |
-| `fxd cancel <submission-id>` | Request cancellation (takes effect at the next tool or model call) |
+| `fxd cancel <submission-id>` | Cancel a queued submission, or request cancellation of a running one (honored at its next model or tool call) |
 | `fxd demo [--reset] [--crash-at POINT[:NAME]]` | Run the demo |
 
 All commands take `--db PATH` (default `$FXD_DB` or `./fx.db`).
@@ -296,6 +299,13 @@ All commands take `--db PATH` (default `$FXD_DB` or `./fx.db`).
 ```bash
 pnpm test
 ```
+
+It runs four kinds of tests:
+- **Journal tests** (`tests/journal/`): plain synchronous tests of every state transition, rollback, checkpoint
+  ordering, `outcome_unknown` and recovery. They need no Effect runtime and run in about a second.
+- **The storage contract** (`tests/storage/`): the conformance suite any `Storage` backend must pass.
+- **Runtime tests:** concurrency, cancellation, reconnect, and use from code that doesn't use Effect.
+- **The crash suite** (`tests/crash/`), described below.
 
 The crash suite starts a real app process, kills it at a named crash point, restarts it, and checks the database and
 a side-effect ledger. It covers model, tool, checkpoint, submission and recovery boundaries. After each case it
@@ -338,26 +348,30 @@ fx-durable/
 ├── src/
 │   ├── cli/                 # fxd and the demo
 │   ├── domain/              # schemas, event taxonomy, state machines, errors
-│   ├── durable/             # Journal, Storage, Clock, SQLite (plain sync code)
+│   ├── durable/             # Journal, ExecutorRegistry, Storage, Clock, SQLite (plain sync code)
 │   ├── runtime/             # Database boundary, supervisor, recovery, tool executor (Effect)
 │   ├── testing/             # scripted model, storage contract, manual clock
 │   ├── tools/               # defineDurableTool, replay policies, Standard Schema
 │   ├── types/               # libfx type declarations
-│   ├── effect.ts
-│   └── index.ts
+│   ├── effect.ts            # Effect-native entry
+│   └── index.ts             # main entry, no Effect required
 ├── tests/
 │   ├── boundary/            # using fx-durable without Effect
 │   ├── crash/               # SIGKILL crash matrix
 │   ├── fixtures/            # app process the crash suite kills
 │   ├── idempotency/
 │   ├── journal/             # exhaustive synchronous tests of durable state
+│   ├── live/                # crash scenarios against the real AI Gateway (opt-in)
 │   ├── reconnect/
 │   ├── recovery/
 │   ├── state-machine/
 │   ├── storage/             # storage contract
 │   └── helpers.ts
-├── GOAL.md
+├── tools/
+│   └── oxlint/              # anti-slop lint rules
+├── LICENSE
 ├── package.json
+├── tsconfig.check.json
 ├── tsconfig.json
 └── vitest.config.ts
 ```
@@ -366,7 +380,6 @@ fx-durable/
 
 | Resource | Description |
 |----------|-------------|
-| [GOAL.md](GOAL.md) | Full specification: invariants, architecture, MVP scope |
 | [src/index.ts](src/index.ts) | Public API exports |
 | [src/durable/journal.ts](src/durable/journal.ts) | Every durable state transition |
 | [src/durable/storage.ts](src/durable/storage.ts) | Storage interface and its durability contract |
@@ -385,3 +398,7 @@ Run `pnpm typecheck && pnpm lint && pnpm test` before opening a change.
 
 Out of scope for v1: Postgres or Redis, distributed workers, agent forks, durable subagents, approval workflows, and
 Effect Workflow or Cluster.
+
+## License
+
+[MIT](LICENSE)
