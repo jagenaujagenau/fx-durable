@@ -7,7 +7,7 @@ Agents should outlive their processes.
 [![Node](https://img.shields.io/badge/node-%3E%3D22.13-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/api/sqlite.html)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](tsconfig.json)
 [![Effect](https://img.shields.io/badge/Effect-v4-000000?style=for-the-badge)](https://effect.website)
-[![SQLite](https://img.shields.io/badge/SQLite-WAL-003B57?style=for-the-badge&logo=sqlite&logoColor=white)](src/sqlite/storage.ts)
+[![SQLite](https://img.shields.io/badge/SQLite-WAL-003B57?style=for-the-badge&logo=sqlite&logoColor=white)](src/durable/sqlite/storage.ts)
 
 </div>
 
@@ -21,7 +21,8 @@ libfx still runs the agent loop, model calls and checkpoints. fx-durable adds th
 journal in SQLite, crash recovery, replay rules for tools, stable agent identity, and an event log clients can
 reconnect to.
 
-> **Effect models execution. SQLite models durability. libfx models the agent.**
+> **libfx models agent behavior. Effect models concurrent execution. Journal models durable state. Storage provides
+> atomic persistence.**
 
 ## Quick Start
 
@@ -129,10 +130,10 @@ Otherwise pass `jsonSchema` yourself. A plain JSON Schema object works as `input
 
 `fx-durable/effect` exposes the Effect-native side:
 - `durableFxLayer(options)`: the whole service graph as one `Layer`.
-- The service tags: `JournalService`, `EventLog`, `AgentSupervisor`, `RecoveryManager` and others, plus `db()`, which
-  runs a synchronous journal call inside an Effect with typed storage errors.
-- `sqliteLayer`.
-- `openDurableFx(options, { storage, ids })`: open with your own layers.
+- `Database`: the durability boundary. `run(journal => …)` and `read(storage => …)` turn synchronous journal calls
+  into Effects with typed storage errors.
+- The service tags: `EventLog`, `AgentSupervisor`, `RecoveryManager` and others.
+- `openDurableFx(options, { ids, clock })`: open with your own id generator or clock.
 
 Effect Schema works as a tool `inputSchema` directly.
 
@@ -186,40 +187,73 @@ The [crash suite](tests/crash/crash-matrix.test.ts) checks each of these by kill
 
 ## How it works
 
-```mermaid
-graph TD
-    App[Application: CLI, API, UI] -->|submit, attach, events| Fx[DurableFx facade]
-    Fx --> Sup[AgentSupervisor: one worker Fiber per agent]
-    Sup --> Lib[libfx agent]
-    Lib -->|tool calls| Exec[ToolExecutor: write-ahead]
-    Lib -->|model requests| Journal[Model journaling transport]
-    Exec --> Engine[Journal: plain sync code]
-    Journal --> Engine
-    Engine --> DB[(SQLite WAL: agents, submissions, turns, tasks, checkpoints, events)]
-    Rec[RecoveryManager] -->|on startup| DB
-    Rec --> Sup
-    DB -->|committed events| Bus[PubSub to live subscribers]
+```text
+            IMPURE / ASYNC
+
+                 libfx            agent loop, model calls, tools
+                   │
+                Effect            supervisor, turn attempts, tool executor,
+                   │              cancellation, resource scopes, live fan-out
+               Database           run(journal => …) · read(storage => …)
+                   │
+       ── durability boundary ──
+                   │
+                Journal           every durable transition, its event, checkpoints,
+                   │              turn and recovery bookkeeping
+                Storage           synchronous transactions
+                   │
+                SQLite
+
+             SYNC / DURABLE
 ```
 
-libfx can only take a checkpoint while it's idle. So fx-durable writes the checkpoint in the same transaction that
-marks the turn complete, which means a checkpoint never exists for an unfinished turn. When a process dies mid-turn,
-recovery:
+The central invariant: **all durable state transitions are synchronous and transactional; no asynchronous operation
+may occur inside a Journal transaction.**
+
+**The durable core is plain synchronous code.** `Storage` is a synchronous interface; the built-in implementation
+uses Node's `node:sqlite` in WAL mode with `synchronous=FULL`. A transaction is a function,
+`storage.transaction(() => { … })`. Its body must be synchronous (a Promise is rejected), so nothing can interleave
+with it, and nested transactions join the outer one. The `Journal` sits on top and holds every durable transition
+the system can make: validated state changes, the event that describes each one, checkpoints, and turn and recovery
+bookkeeping. Open `src/durable/journal.ts` to see all of them.
+
+**Effect runs execution.** The supervisor, turn attempts, tool execution, cancellation, resource scopes and live
+event fan-out are Effect code. They reach durable state only through the `Database` service, which keeps storage
+errors typed and turns programmer errors (such as an invalid state transition) into defects. A lint rule forbids
+runtime code from importing the journal or storage directly. libfx's transport callback, which is plain Promise
+code, journals model calls through a narrow `ModelJournal` interface instead of bridging into Effect.
+
+**Turns and checkpoints.** libfx can only take a checkpoint while it's idle. So fx-durable writes the checkpoint in
+the same transaction that marks the turn complete, which means a checkpoint never exists for an unfinished turn.
+When a process dies mid-turn, recovery:
 
 1. finds turns whose process is gone, by pid on the same host or heartbeat timeout elsewhere,
 2. sorts the unfinished calls by their saved replay policy (replay, retry with the same key, or `outcome_unknown`),
 3. restores the checkpoint from before the turn into a fresh libfx agent, and
 4. re-prompts with the original request, every saved call and its outcome, and a warning for each unknown outcome.
 
-Model calls are recorded by wrapping the `fetch` that libfx uses.
+### Custom storage
 
-**Storage and the journal are plain synchronous code.** Effect runs the execution core: Fibers, cancellation,
-resource scopes. Persistence doesn't use it. `Storage` is a synchronous interface; the only implementation uses
-Node's built-in `node:sqlite` in WAL mode with `synchronous=FULL`. A transaction is a function:
-`storage.transaction(() => { … })`. Its body must be synchronous (a Promise is rejected), so JavaScript can't
-interleave other work into it, and nested transactions join the outer one. `Journal` holds every durable
-transition on top of storage: validated state changes, events, checkpoints, turn bookkeeping. Effect code calls it
-through `db(() => journal.…)`, which keeps `StorageError` typed and turns programmer errors into defects. You can
-pass your own `Storage` implementation to `DurableFx.open({ storage })`.
+`DurableFx.open({ storage })` accepts any object implementing `Storage`, and fx-durable closes it when it closes.
+The implementation must keep the durability contract documented on the interface:
+- transactions are atomic,
+- nested transactions join the outer one,
+- an exception rolls back everything,
+- async bodies are rejected,
+- reads see the transaction's own writes,
+- `afterCommit` runs only after the outermost commit,
+- committed writes survive a crash,
+- and the uniqueness and sequencing constraints hold.
+
+Run the conformance suite against your backend:
+
+```ts
+import { storageContract } from "fx-durable/testing"
+
+for (const check of storageContract) {
+  test(check.name, () => check.run(openMyStorage()))
+}
+```
 
 ## CLI
 
@@ -285,20 +319,24 @@ fx-durable/
 │   └── model.ts
 ├── src/
 │   ├── cli/                 # fxd and the demo
-│   ├── core/                # supervisor, turns, tasks, recovery, events, façade
-│   ├── sqlite/              # node:sqlite storage and migrations
-│   ├── testing/             # scripted model for offline runs
-│   ├── tools/               # defineDurableTool, replay policies, executor
+│   ├── domain/              # schemas, event taxonomy, state machines, errors
+│   ├── durable/             # Journal, Storage, Clock, SQLite (plain sync code)
+│   ├── runtime/             # Database boundary, supervisor, recovery, tool executor (Effect)
+│   ├── testing/             # scripted model, storage contract, manual clock
+│   ├── tools/               # defineDurableTool, replay policies, Standard Schema
 │   ├── types/               # libfx type declarations
+│   ├── effect.ts
 │   └── index.ts
 ├── tests/
+│   ├── boundary/            # using fx-durable without Effect
 │   ├── crash/               # SIGKILL crash matrix
 │   ├── fixtures/            # app process the crash suite kills
 │   ├── idempotency/
+│   ├── journal/             # exhaustive synchronous tests of durable state
 │   ├── reconnect/
 │   ├── recovery/
 │   ├── state-machine/
-│   ├── storage/
+│   ├── storage/             # storage contract
 │   └── helpers.ts
 ├── GOAL.md
 ├── package.json
@@ -312,16 +350,20 @@ fx-durable/
 |----------|-------------|
 | [GOAL.md](GOAL.md) | Full specification: invariants, architecture, MVP scope |
 | [src/index.ts](src/index.ts) | Public API exports |
-| [src/core/recovery.ts](src/core/recovery.ts) | Recovery procedure |
-| [src/tools/executor.ts](src/tools/executor.ts) | Write-ahead tool execution and replay |
-| [src/sqlite/migrations/001_initial.ts](src/sqlite/migrations/001_initial.ts) | Database schema and constraints |
+| [src/durable/journal.ts](src/durable/journal.ts) | Every durable state transition |
+| [src/durable/storage.ts](src/durable/storage.ts) | Storage interface and its durability contract |
+| [src/runtime/recovery.ts](src/runtime/recovery.ts) | Recovery procedure |
+| [src/runtime/tool-executor.ts](src/runtime/tool-executor.ts) | Write-ahead tool execution and replay |
+| [src/durable/sqlite/migrations/001_initial.ts](src/durable/sqlite/migrations/001_initial.ts) | Database schema and constraints |
 | [tests/crash/crash-matrix.test.ts](tests/crash/crash-matrix.test.ts) | Crash matrix |
 | [examples/](examples) | Runnable examples (`npx tsx examples/<name>/index.ts` after `pnpm build`) |
 
 ## Contributing
 
-Run `pnpm typecheck && pnpm test` before opening a change. Any change that touches recovery or tool execution needs a
-case in the crash suite, and the suite should pass on repeated runs before you build anything on top of it.
+Run `pnpm typecheck && pnpm lint && pnpm test` before opening a change.
+- New durable behavior belongs in the Journal, with tests in `tests/journal/` that need no Effect runtime.
+- Changes to recovery or tool execution need a case in the crash suite, and the suite should pass on repeated runs
+  before you build anything on top of it.
 
 Out of scope for v1: Postgres or Redis, distributed workers, agent forks, durable subagents, approval workflows, and
 Effect Workflow or Cluster.
