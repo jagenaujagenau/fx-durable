@@ -25,8 +25,8 @@
   "author": "Diego Peralta <hi@diegoperalta.com>",
   "type": "module",
   "bin": {
-    "fxd": "./dist/cli/main.js",
-    "fx-durable": "./dist/cli/main.js"
+    "fxd": "dist/cli/main.js",
+    "fx-durable": "dist/cli/main.js"
   },
   "exports": {
     ".": {
