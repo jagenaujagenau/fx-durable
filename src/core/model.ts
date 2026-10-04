@@ -1,7 +1,7 @@
 import { Effect, Exit, Option, Schema } from "effect"
 import { CrashInjector } from "./crash.js"
 import { InterruptedError } from "./errors.js"
-import type { Transport } from "./libfx.js"
+import type { Transport } from "./transport.js"
 import { Storage } from "./storage.js"
 import { TaskEngine } from "./task.js"
 import type { TurnContext } from "./turn-context.js"

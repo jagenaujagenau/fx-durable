@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Exit, Layer, ManagedRuntime, Option, Stream } from "effect"
+import { Cause, Effect, Exit, Layer, ManagedRuntime, Option, Stream } from "effect"
 import * as Sqlite from "../sqlite/storage.js"
 import * as Executor from "../tools/executor.js"
 import * as Registry from "../tools/registry.js"
@@ -22,6 +22,7 @@ import {
   type TurnRecord
 } from "./schema.js"
 import { Storage } from "./storage.js"
+import type { Transport } from "./transport.js"
 import * as Task from "./task.js"
 
 /**
@@ -30,19 +31,18 @@ import * as Task from "./task.js"
  */
 
 export interface DurableFxOptions {
-  readonly storage: Sqlite.SqliteStorageConfig | Layer.Layer<Storage, StorageError>
+  readonly storage: Sqlite.SqliteStorageConfig
   readonly runtimes?: Readonly<Record<string, RuntimeDefinition>>
   /** AI Gateway key. Defaults to `AI_GATEWAY_API_KEY`. */
   readonly apiKey?: string
   /** Model transport override (e.g. a scripted model for tests and offline demos). */
-  readonly fetch?: typeof globalThis.fetch
+  readonly fetch?: Transport
   readonly backend?: "auto" | "native" | "wasm"
   /** `auto` (default) recovers interrupted work during `open()`; `manual` waits for `resume()`. */
   readonly recovery?: "auto" | "manual"
   readonly maxRecoveryAttempts?: number
   /** Crash injection. Defaults to reading `FXD_CRASH_AT` from the environment (no-op when unset). */
   readonly crash?: (CrashPlan & { readonly onCrash?: (point: string) => void }) | "env" | "off"
-  readonly ids?: Layer.Layer<IdGenerator>
   readonly heartbeatMillis?: number
   readonly idlePollMillis?: number
 }
@@ -79,8 +79,15 @@ type Services =
 
 const decodeContent = decodeWith(SubmissionContent, "submission content")
 
-const buildLayer = (options: DurableFxOptions) => {
-  const storage = "_tag" in options.storage ? options.storage.layer : options.storage
+/** Effect-native overrides, available from `fx-durable/effect`. */
+export interface DurableFxLayers {
+  readonly storage?: Layer.Layer<Storage, StorageError>
+  readonly ids?: Layer.Layer<IdGenerator>
+}
+
+/** The complete fx-durable service graph as one Effect `Layer`. */
+export const buildLayer = (options: DurableFxOptions, layers: DurableFxLayers = {}) => {
+  const storage = layers.storage ?? Sqlite.layer(options.storage.options)
   const crash =
     options.crash === "off"
       ? CrashInjector.noop
@@ -94,7 +101,7 @@ const buildLayer = (options: DurableFxOptions) => {
           })
   const base = Layer.mergeAll(
     storage,
-    options.ids ?? IdGenerator.layer,
+    layers.ids ?? IdGenerator.layer,
     crash,
     RuntimeRegistry.layer(options.runtimes ?? {}),
     Registry.layer,
@@ -110,32 +117,58 @@ const buildLayer = (options: DurableFxOptions) => {
   return recoveryLayer({ maxAttempts: options.maxRecoveryAttempts }).pipe(Layer.provideMerge(supervisor))
 }
 
+interface Runner {
+  readonly run: <A, E>(effect: Effect.Effect<A, E, Services>) => Promise<A>
+  readonly stream: <A, E>(stream: Stream.Stream<A, E, Services>) => AsyncIterable<A>
+  readonly dispose: () => Promise<void>
+}
+
+// The Effect runtime behind each façade object. Module-private, so the
+// public classes expose no Effect types.
+const runners = new WeakMap<DurableFx, Runner>()
+
+const notOpen = () => new Error("DurableFx is not open")
+
+const runnerOf = (fx: DurableFx): Runner => {
+  const runner = runners.get(fx)
+  if (!runner) throw notOpen()
+  return runner
+}
+
+/** Run on an open façade; a closed or never-opened one rejects instead of throwing. */
+const runOn = <A, E>(fx: DurableFx, effect: Effect.Effect<A, E, Services>): Promise<A> => {
+  const runner = runners.get(fx)
+  return runner ? runner.run(effect) : Promise.reject(notOpen())
+}
+
+/** Open with Effect-native layer overrides (see `fx-durable/effect`). */
+export const openDurableFx = async (options: DurableFxOptions, layers: DurableFxLayers = {}): Promise<DurableFx> => {
+  const runtime = ManagedRuntime.make(buildLayer(options, layers))
+  const context = await runtime.context()
+  const fx = new DurableFx()
+  runners.set(fx, {
+    run: (effect) =>
+      runtime.runPromiseExit(effect).then((exit) => {
+        if (Exit.isSuccess(exit)) return exit.value
+        throw Cause.squash(exit.cause)
+      }),
+    stream: (stream) => Stream.toAsyncIterableWith(stream, context),
+    dispose: () => runtime.dispose()
+  })
+  if ((options.recovery ?? "auto") === "auto") await fx.resume()
+  return fx
+}
+
 export class DurableFx {
-  private constructor(
-    private readonly runtime: ManagedRuntime.ManagedRuntime<Services, unknown>,
-    private readonly context: Context.Context<Services>
-  ) {}
+  /** Use `DurableFx.open()`; an instance created directly is not open. */
 
   /** Open the durable runtime. With `recovery: "auto"` (default), interrupted work resumes now. */
-  static async open(options: DurableFxOptions): Promise<DurableFx> {
-    const runtime = ManagedRuntime.make(buildLayer(options))
-    const context = await runtime.context()
-    const fx = new DurableFx(runtime, context)
-    if ((options.recovery ?? "auto") === "auto") await fx.resume()
-    return fx
+  static open(options: DurableFxOptions): Promise<DurableFx> {
+    return openDurableFx(options)
   }
 
-  /** @internal Run an effect, rejecting with the typed error (not a wrapper). */
-  run<A, E>(effect: Effect.Effect<A, E, Services>): Promise<A> {
-    return this.runtime.runPromiseExit(effect).then((exit) => {
-      if (Exit.isSuccess(exit)) return exit.value
-      throw Cause.squash(exit.cause)
-    })
-  }
-
-  /** @internal */
-  stream<A, E>(stream: Stream.Stream<A, E, Services>): AsyncIterable<A> {
-    return Stream.toAsyncIterableWith(stream, this.context)
+  private run<A, E>(effect: Effect.Effect<A, E, Services>): Promise<A> {
+    return runOn(this, effect)
   }
 
   registerRuntime(id: string, definition: RuntimeDefinition): Promise<void> {
@@ -222,7 +255,8 @@ export class DurableFx {
   /** Stop executing. In-flight turns are left interrupted and recover on the next open. */
   async close(): Promise<void> {
     await this.run(Effect.flatMap(AgentSupervisor, (s) => s.shutdown())).catch(() => undefined)
-    await this.runtime.dispose()
+    await runnerOf(this).dispose()
+    runners.delete(this)
   }
 }
 
@@ -236,7 +270,8 @@ export class DurableAgent {
   async submit(content: SubmissionContent, options: SubmitOptions = {}): Promise<Submission> {
     const agentId = this.id
     const requestId = options.requestId ?? null
-    const { record, created } = await this.fx.run(
+    const { record, created } = await runOn(
+      this.fx,
       Effect.gen(function* () {
         const storage = yield* Storage
         const events = yield* EventLog
@@ -295,7 +330,7 @@ export class DurableAgent {
   /** Persisted events after the cursor, then live events, without gaps. */
   events(options: EventsOptions = {}): AsyncIterable<DurableEvent> {
     const agentId = this.id
-    return this.fx.stream(
+    return runnerOf(this.fx).stream(
       Stream.unwrap(
         Effect.gen(function* () {
           const log = yield* EventLog
@@ -310,7 +345,8 @@ export class DurableAgent {
 
   info(): Promise<DurableAgentRecord> {
     const id = this.id
-    return this.fx.run(
+    return runOn(
+      this.fx,
       Effect.gen(function* () {
         const storage = yield* Storage
         const agent = yield* storage.getAgent(id)
@@ -321,13 +357,14 @@ export class DurableAgent {
   }
 
   submissions(limit = 20): Promise<ReadonlyArray<SubmissionRecord>> {
-    return this.fx.run(Effect.flatMap(Storage, (s) => s.listSubmissions(this.id, limit)))
+    return runOn(this.fx, Effect.flatMap(Storage, (s) => s.listSubmissions(this.id, limit)))
   }
 
   /** Current turn and its task journal, if any. */
   currentTurn(): Promise<{ readonly turn: TurnRecord; readonly tasks: ReadonlyArray<TaskRecord> } | null> {
     const id = this.id
-    return this.fx.run(
+    return runOn(
+      this.fx,
       Effect.gen(function* () {
         const storage = yield* Storage
         const turn = yield* storage.activeTurn(id)
@@ -350,7 +387,8 @@ export class Submission {
 
   status(): Promise<SubmissionRecord> {
     const id = this.id
-    return this.fx.run(
+    return runOn(
+      this.fx,
       Effect.gen(function* () {
         const storage = yield* Storage
         const record = yield* storage.getSubmission(id)
@@ -364,7 +402,7 @@ export class Submission {
   events(options: { readonly after?: number } = {}): AsyncIterable<DurableEvent> {
     const id = this.id
     const agentId = this.agentId
-    return this.fx.stream(
+    return runnerOf(this.fx).stream(
       Stream.unwrap(
         Effect.gen(function* () {
           const log = yield* EventLog
@@ -381,7 +419,8 @@ export class Submission {
   result(): Promise<SubmissionResult> {
     const id = this.id
     const agentId = this.agentId
-    return this.fx.run(
+    return runOn(
+      this.fx,
       Effect.gen(function* () {
         const storage = yield* Storage
         const log = yield* EventLog
@@ -413,6 +452,6 @@ export class Submission {
    */
   cancel(): Promise<void> {
     const id = this.id
-    return this.fx.run(Effect.flatMap(AgentSupervisor, (s) => s.cancel(id)))
+    return runOn(this.fx, Effect.flatMap(AgentSupervisor, (s) => s.cancel(id)))
   }
 }

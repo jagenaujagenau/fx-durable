@@ -2,6 +2,7 @@ import { Config, Context, Effect, Layer, Option, Redacted } from "effect"
 import { createFxAgent, type CreateFxAgentOptions, type FxTool, type FxTurnResult } from "libfx"
 import { CheckpointError, ModelError } from "./errors.js"
 import type { DurableAgentRecord, SubmissionContent, TurnUsage } from "./schema.js"
+import type { Transport } from "./transport.js"
 
 /**
  * The only module that talks to libfx. libfx owns the agent loop, model
@@ -9,8 +10,7 @@ import type { DurableAgentRecord, SubmissionContent, TurnUsage } from "./schema.
  * inspects checkpoint bytes.
  */
 
-/** The HTTP transport libfx uses for model requests. */
-export type Transport = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+export type { Transport }
 
 export type LibfxTool = FxTool
 

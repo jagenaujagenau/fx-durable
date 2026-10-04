@@ -5,8 +5,11 @@ import { Schema } from "effect"
  * application: submission content, tool inputs and outputs, event payloads.
  * Values are validated as JSON where they enter the system.
  */
-export type Json = Schema.Json
-export type JsonObject = Schema.JsonObject
+export type Json = null | boolean | number | string | JsonArray | JsonObject
+export interface JsonArray extends ReadonlyArray<Json> {}
+export interface JsonObject {
+  readonly [key: string]: Json
+}
 
 export const isJsonObject = Schema.is(Schema.JsonObject)
 export const isJsonString = Schema.is(Schema.String)

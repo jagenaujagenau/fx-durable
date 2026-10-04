@@ -502,14 +502,13 @@ export const layer = (options: SqliteOptions): Layer.Layer<Storage, StorageError
     Effect.acquireRelease(makeSqliteStorage(options), (storage) => storage.close())
   )
 
-/** Storage configuration accepted by `DurableFx.open({ storage })`. */
+/** Storage configuration accepted by `DurableFx.open({ storage })`. Plain data. */
 export interface SqliteStorageConfig {
   readonly _tag: "SqliteStorageConfig"
   readonly options: SqliteOptions
-  readonly layer: Layer.Layer<Storage, StorageError>
 }
 
-export const sqlite = (path: string, options?: Omit<SqliteOptions, "path">): SqliteStorageConfig => {
-  const full = { ...options, path }
-  return { _tag: "SqliteStorageConfig", options: full, layer: layer(full) }
-}
+export const sqlite = (path: string, options?: Omit<SqliteOptions, "path">): SqliteStorageConfig => ({
+  _tag: "SqliteStorageConfig",
+  options: { ...options, path }
+})

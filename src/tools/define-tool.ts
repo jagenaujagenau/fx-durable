@@ -1,6 +1,7 @@
 import { Schema } from "effect"
 import type { Json, JsonObject } from "../core/json.js"
 import type { ReplayPolicy } from "./replay-policy.js"
+import { formatIssues, type StandardSchemaV1 } from "./standard-schema.js"
 
 export interface DurableToolContext {
   readonly agentId: string
@@ -34,6 +35,17 @@ export interface SchemaToolDefinition<S extends ToolSchema> extends ToolBase {
   readonly execute: (input: S["Type"], context: DurableToolContext) => ToolResult | Promise<ToolResult>
 }
 
+/**
+ * A tool validated by any Standard Schema library (Zod, Valibot, ArkType, …).
+ * The model needs a JSON Schema: it is taken from the validator when it
+ * implements Standard JSON Schema (Zod 4 does), otherwise pass `jsonSchema`.
+ */
+export interface StandardToolDefinition<S extends StandardSchemaV1> extends ToolBase {
+  readonly inputSchema: S
+  readonly jsonSchema?: JsonObject
+  readonly execute: (input: StandardSchemaV1.InferOutput<S>, context: DurableToolContext) => ToolResult | Promise<ToolResult>
+}
+
 /** A tool described by a plain JSON Schema; it receives the model's JSON input as-is. */
 export interface JsonToolDefinition extends ToolBase {
   readonly inputSchema?: JsonObject
@@ -62,10 +74,34 @@ const toJsonSchema = (schema: ToolSchema): JsonObject => {
   return Object.keys(definitions).length > 0 ? { ...root, $defs: definitions } : root
 }
 
-const isSchemaDefinition = (
-  definition: SchemaToolDefinition<ToolSchema> | JsonToolDefinition
-): definition is SchemaToolDefinition<ToolSchema> =>
+type AnyDefinition = SchemaToolDefinition<ToolSchema> | StandardToolDefinition<StandardSchemaV1> | JsonToolDefinition
+
+const isSchemaDefinition = (definition: AnyDefinition): definition is SchemaToolDefinition<ToolSchema> =>
   definition.inputSchema !== undefined && Schema.isSchema(definition.inputSchema)
+
+type InputSchema = NonNullable<AnyDefinition["inputSchema"]>
+
+const isStandardSchema = (schema: InputSchema): schema is StandardSchemaV1 => "~standard" in schema
+
+const isStandardDefinition = (definition: AnyDefinition): definition is StandardToolDefinition<StandardSchemaV1> =>
+  definition.inputSchema !== undefined && isStandardSchema(definition.inputSchema)
+
+const standardJsonSchema = (definition: StandardToolDefinition<StandardSchemaV1>): JsonObject => {
+  if (definition.jsonSchema) return definition.jsonSchema
+  const converter = definition.inputSchema["~standard"].jsonSchema
+  if (!converter) {
+    throw new TypeError(
+      `tool ${definition.name}: its validator does not implement Standard JSON Schema; pass \`jsonSchema\` for the model`
+    )
+  }
+  return decodeJsonObject(converter.input({ target: "draft-2020-12" }))
+}
+
+const validateStandard = async (definition: StandardToolDefinition<StandardSchemaV1>, input: Json) => {
+  const result = await definition.inputSchema["~standard"].validate(input)
+  if (result.issues) throw new TypeError(`invalid input for ${definition.name}: ${formatIssues(result.issues)}`)
+  return result.value
+}
 
 const validateName = (name: string) => {
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name)) throw new TypeError(`invalid tool name: ${name}`)
@@ -75,8 +111,9 @@ const settle = async (result: ToolResult | Promise<ToolResult>): Promise<Json> =
 
 /** Declare a tool together with its replay semantics. */
 export function defineDurableTool<S extends ToolSchema>(definition: SchemaToolDefinition<S>): DurableTool
+export function defineDurableTool<S extends StandardSchemaV1>(definition: StandardToolDefinition<S>): DurableTool
 export function defineDurableTool(definition: JsonToolDefinition): DurableTool
-export function defineDurableTool(definition: SchemaToolDefinition<ToolSchema> | JsonToolDefinition): DurableTool {
+export function defineDurableTool(definition: AnyDefinition): DurableTool {
   validateName(definition.name)
   const base = {
     _tag: "DurableTool" as const,
@@ -90,6 +127,13 @@ export function defineDurableTool(definition: SchemaToolDefinition<ToolSchema> |
       ...base,
       jsonSchema: toJsonSchema(definition.inputSchema),
       run: async (input, context) => settle(definition.execute(decode(input), context))
+    }
+  }
+  if (isStandardDefinition(definition)) {
+    return {
+      ...base,
+      jsonSchema: standardJsonSchema(definition),
+      run: async (input, context) => settle(definition.execute(await validateStandard(definition, input), context))
     }
   }
   return {

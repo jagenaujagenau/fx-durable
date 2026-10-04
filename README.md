@@ -102,8 +102,38 @@ const result = await submission.result() // { text, stopReason, usage }
 ```
 
 Credentials come from `AI_GATEWAY_API_KEY` or `DurableFx.open({ apiKey })`. Opening the runtime recovers interrupted
-work. Pass `recovery: "manual"` to do that later with `fx.resume()`. The public API uses Promises and
-AsyncIterables, so your code doesn't have to use Effect.
+work. Pass `recovery: "manual"` to do that later with `fx.resume()`.
+
+### Without Effect
+
+fx-durable is built on Effect, but the main `fx-durable` entry doesn't require it. Every call returns a Promise or an
+AsyncIterable, errors are ordinary `Error` subclasses with a `_tag`, and records are plain objects. Tool input can
+be validated with any [Standard Schema](https://standardschema.dev) library:
+
+```ts
+import { z } from "zod"
+import { DurableFx, defineDurableTool, sqlite } from "fx-durable"
+
+const forecast = defineDurableTool({
+  name: "forecast",
+  replay: "safe",
+  inputSchema: z.object({ city: z.string(), days: z.number().int().min(1).max(7) }),
+  execute: ({ city, days }) => getForecast(city, days)
+})
+```
+
+The JSON Schema the model sees comes from the validator when it implements Standard JSON Schema, as Zod 4 does.
+Otherwise pass `jsonSchema` yourself. A plain JSON Schema object works as `inputSchema` too.
+
+### With Effect
+
+`fx-durable/effect` exposes the Effect-native side:
+- `durableFxLayer(options)`: the whole service graph as one `Layer`.
+- The service tags: `Storage`, `EventLog`, `TaskEngine`, `AgentSupervisor`, `RecoveryManager` and others.
+- `sqliteLayer`.
+- `openDurableFx(options, { storage, ids })`: open with your own layers.
+
+Effect Schema works as a tool `inputSchema` directly.
 
 ### Replay policies
 
