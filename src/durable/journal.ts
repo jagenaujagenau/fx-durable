@@ -26,7 +26,7 @@ import {
   assertTaskTransition,
   assertTurnTransition
 } from "../domain/state-machine.js"
-import type { Storage, TaskPatch } from "./storage.js"
+import { readerOf, type Storage, type StorageReader, type TaskPatch } from "./storage.js"
 import { recoveryActionFor } from "../tools/replay-policy.js"
 
 /**
@@ -117,13 +117,20 @@ export interface TurnCompletion {
 const isTerminal = (state: string) => ["completed", "failed", "cancelled", "outcome_unknown"].includes(state)
 
 export class Journal {
-  readonly storage: Storage
+  /**
+   * Private (an ES private field, not just a TypeScript modifier): every
+   * durable write goes through a named journal method. Reads use `reader`.
+   */
+  readonly #storage: Storage
+  /** Read-only queries. A separate object with no write methods. */
+  readonly reader: StorageReader
   readonly nextId: (prefix: string) => string
   readonly clock: Clock
   private readonly listeners = new Set<(event: DurableEvent) => void>()
 
   constructor(options: JournalOptions) {
-    this.storage = options.storage
+    this.#storage = options.storage
+    this.reader = readerOf(options.storage)
     this.nextId = options.nextId
     this.clock = options.clock ?? SystemClock
   }
@@ -133,7 +140,12 @@ export class Journal {
   }
 
   transaction<A>(fn: () => A): A {
-    return this.storage.transaction(fn)
+    return this.#storage.transaction(fn)
+  }
+
+  /** Close the underlying storage. */
+  close(): void {
+    this.#storage.close()
   }
 
   /** Listen for events after their transaction commits. Returns an unsubscribe function. */
@@ -150,9 +162,9 @@ export class Journal {
   appendEvent(event: AppendEvent): DurableEvent {
     let submissionId = event.submissionId ?? null
     if (submissionId === null && event.turnId) {
-      submissionId = this.storage.getTurn(event.turnId)?.submissionId ?? null
+      submissionId = this.#storage.getTurn(event.turnId)?.submissionId ?? null
     }
-    const persisted = this.storage.appendEvent({
+    const persisted = this.#storage.appendEvent({
       id: this.nextId("evt"),
       agentId: event.agentId,
       submissionId,
@@ -162,7 +174,7 @@ export class Journal {
       payload: event.payload ?? {},
       createdAt: this.now()
     })
-    this.storage.afterCommit(() => {
+    this.#storage.afterCommit(() => {
       for (const listener of this.listeners) listener(persisted)
     })
     return persisted
@@ -192,7 +204,7 @@ export class Journal {
       startedAt
     }
     this.transaction(() => {
-      this.storage.insertTask(record)
+      this.#storage.insertTask(record)
       if (task.event) this.appendEvent({ ...task.event, agentId: task.agentId, turnId: task.turnId, taskId: id })
     })
     return { ...record, output: null, error: null, acknowledged: false, completedAt: null }
@@ -200,13 +212,13 @@ export class Journal {
 
   transitionTask(taskId: string, to: TaskState, patch: Omit<TaskPatch, "state"> = {}, event: TransitionEvent = null): TaskRecord {
     return this.transaction(() => {
-      const task = this.storage.getTask(taskId)
+      const task = this.#storage.getTask(taskId)
       if (!task) throw new NotFoundError({ entity: "task", id: taskId })
       assertTaskTransition(task.state, to)
       const completedAt = isTerminal(to) || to === "interrupted" ? this.now() : undefined
-      this.storage.updateTask(taskId, { ...patch, state: to, completedAt: patch.completedAt ?? completedAt })
+      this.#storage.updateTask(taskId, { ...patch, state: to, completedAt: patch.completedAt ?? completedAt })
       if (event) this.appendEvent({ ...event, agentId: task.agentId, turnId: task.turnId, taskId })
-      return this.storage.getTask(taskId) ?? task
+      return this.#storage.getTask(taskId) ?? task
     })
   }
 
@@ -217,11 +229,11 @@ export class Journal {
     event: TransitionEvent = null
   ): void {
     this.transaction(() => {
-      const turn = this.storage.getTurn(turnId)
+      const turn = this.#storage.getTurn(turnId)
       if (!turn) throw new NotFoundError({ entity: "turn", id: turnId })
       assertTurnTransition(turn.state, to)
       const completedAt = isTerminal(to) ? this.now() : undefined
-      this.storage.updateTurn(turnId, { ...patch, state: to, completedAt })
+      this.#storage.updateTurn(turnId, { ...patch, state: to, completedAt })
       if (event) this.appendEvent({ submissionId: turn.submissionId, ...event, agentId: turn.agentId, turnId })
     })
   }
@@ -233,20 +245,20 @@ export class Journal {
     event: TransitionEvent = null
   ): void {
     this.transaction(() => {
-      const submission = this.storage.getSubmission(submissionId)
+      const submission = this.#storage.getSubmission(submissionId)
       if (!submission) throw new NotFoundError({ entity: "submission", id: submissionId })
       assertSubmissionTransition(submission.state, to)
-      this.storage.updateSubmission(submissionId, { ...patch, state: to }, this.now())
+      this.#storage.updateSubmission(submissionId, { ...patch, state: to }, this.now())
       if (event) this.appendEvent({ ...event, agentId: submission.agentId, submissionId })
     })
   }
 
   transitionAgent(agentId: string, to: AgentState, reason: string | null = null, event: TransitionEvent = null): void {
     this.transaction(() => {
-      const agent = this.storage.getAgent(agentId)
+      const agent = this.#storage.getAgent(agentId)
       if (!agent) throw new NotFoundError({ entity: "agent", id: agentId })
       assertAgentTransition(agent.state, to)
-      this.storage.updateAgent(agentId, { state: to, stateReason: reason }, this.now())
+      this.#storage.updateAgent(agentId, { state: to, stateReason: reason }, this.now())
       if (event) this.appendEvent({ ...event, agentId })
     })
   }
@@ -257,7 +269,7 @@ export class Journal {
    */
   writeCheckpoint(fields: WriteCheckpoint): AgentCheckpoint {
     return this.transaction(() => {
-      const previousSeq = this.storage.latestCheckpoint(fields.agentId)?.sequence ?? null
+      const previousSeq = this.#storage.latestCheckpoint(fields.agentId)?.sequence ?? null
       if (previousSeq !== fields.expectedPrevious) {
         throw new Error(
           `checkpoint sequence conflict for ${fields.agentId}: expected ${fields.expectedPrevious}, found ${previousSeq}`
@@ -272,7 +284,7 @@ export class Journal {
         model: fields.model,
         createdAt: this.now()
       }
-      this.storage.insertCheckpoint(checkpoint)
+      this.#storage.insertCheckpoint(checkpoint)
       this.appendEvent({
         agentId: fields.agentId,
         submissionId: fields.submissionId,
@@ -292,9 +304,9 @@ export class Journal {
   /** Begin a turn for a queued submission. Returns null if it is no longer runnable. */
   startTurn(submission: SubmissionRecord, executorId: string): TurnRecord | null {
     return this.transaction(() => {
-      const current = this.storage.getSubmission(submission.id)
+      const current = this.#storage.getSubmission(submission.id)
       if (!current || current.state !== "queued" || current.cancelRequested) return null
-      const checkpoint = this.storage.latestCheckpoint(submission.agentId)
+      const checkpoint = this.#storage.latestCheckpoint(submission.agentId)
       const startedAt = this.now()
       const turn: TurnRecord = {
         id: this.nextId("turn"),
@@ -307,8 +319,8 @@ export class Journal {
         startedAt,
         completedAt: null
       }
-      this.storage.insertTurn(turn)
-      this.storage.insertTask({
+      this.#storage.insertTurn(turn)
+      this.#storage.insertTask({
         id: this.nextId("task"),
         turnId: turn.id,
         agentId: turn.agentId,
@@ -359,7 +371,7 @@ export class Journal {
   classifyTurnTasks(turnId: string, reason: UnknownOutcomeReason): ReadonlyArray<string> {
     return this.transaction(() => {
       const unknown: Array<string> = []
-      for (const task of this.storage.tasksForTurn(turnId)) {
+      for (const task of this.#storage.tasksForTurn(turnId)) {
         if (task.state !== "running" && task.state !== "pending") continue
         switch (task.type) {
           case "turn":
@@ -394,7 +406,7 @@ export class Journal {
 
   /** Close the turn's root task, if it is still open. */
   closeTurnTask(turnId: string, to: "completed" | "failed" | "cancelled", error?: string): void {
-    const root = this.storage.tasksForTurn(turnId).find((t) => t.type === "turn" && t.parentTaskId === null)
+    const root = this.#storage.tasksForTurn(turnId).find((t) => t.type === "turn" && t.parentTaskId === null)
     if (root && root.state === "running") this.transitionTask(root.id, to, error ? { error } : {})
   }
 
@@ -426,7 +438,7 @@ export class Journal {
   /** The turn's owner went away cleanly (shutdown): leave it for recovery. */
   interruptTurn(turn: TurnRecord, reason: string): void {
     this.transaction(() => {
-      const current = this.storage.getTurn(turn.id)
+      const current = this.#storage.getTurn(turn.id)
       if (!current || current.state !== "running") return
       this.transitionTurn(turn.id, "interrupted", { executorId: null }, {
         type: "turn.interrupted",
@@ -442,11 +454,11 @@ export class Journal {
   /** Create the agent, or update its runtime/model/cwd. Stable identity: the id never changes. */
   upsertAgent(id: string, config: AgentConfig): "created" | "updated" | "unchanged" {
     return this.transaction(() => {
-      const existing = this.storage.getAgent(id)
+      const existing = this.#storage.getAgent(id)
       const at = this.now()
       if (!existing) {
         const cwd = config.cwd ?? null
-        this.storage.insertAgent({
+        this.#storage.insertAgent({
           id,
           runtimeId: config.runtime,
           model: config.model,
@@ -461,7 +473,7 @@ export class Journal {
       }
       const cwd = config.cwd === undefined ? existing.cwd : config.cwd
       if (existing.runtimeId === config.runtime && existing.model === config.model && existing.cwd === cwd) return "unchanged"
-      this.storage.updateAgent(id, { runtimeId: config.runtime, model: config.model, cwd }, at)
+      this.#storage.updateAgent(id, { runtimeId: config.runtime, model: config.model, cwd }, at)
       this.appendEvent({ agentId: id, type: "agent.updated", payload: { runtime: config.runtime, model: config.model, cwd } })
       return "updated"
     })
@@ -475,7 +487,7 @@ export class Journal {
   ): { readonly record: SubmissionRecord; readonly created: boolean } {
     return this.transaction(() => {
       if (requestId !== null) {
-        const existing = this.storage.findSubmissionByRequest(agentId, requestId)
+        const existing = this.#storage.findSubmissionByRequest(agentId, requestId)
         if (existing) return { record: existing, created: false }
       }
       const at = this.now()
@@ -491,7 +503,7 @@ export class Journal {
         createdAt: at,
         updatedAt: at
       }
-      this.storage.insertSubmission(record)
+      this.#storage.insertSubmission(record)
       this.appendEvent({ agentId, submissionId: record.id, type: "submission.created", payload: { requestId, content } })
       return { record, created: true }
     })
@@ -500,7 +512,7 @@ export class Journal {
   /** Record a cancellation request; a queued submission is cancelled outright. */
   requestCancellation(submission: SubmissionRecord): void {
     this.transaction(() => {
-      this.storage.updateSubmission(submission.id, { cancelRequested: true }, this.now())
+      this.#storage.updateSubmission(submission.id, { cancelRequested: true }, this.now())
       if (submission.state === "queued") {
         this.transitionSubmission(submission.id, "cancelled", { error: "cancelled" }, { type: "submission.cancelled" })
       }
@@ -513,15 +525,15 @@ export class Journal {
 
   registerExecutor(id: string, pid: number, host: string): void {
     const at = this.now()
-    this.storage.registerExecutor({ id, pid, hostname: host, startedAt: at, heartbeatAt: at, stoppedAt: null })
+    this.#storage.registerExecutor({ id, pid, hostname: host, startedAt: at, heartbeatAt: at, stoppedAt: null })
   }
 
   heartbeatExecutor(id: string): void {
-    this.storage.heartbeatExecutor(id, this.now())
+    this.#storage.heartbeatExecutor(id, this.now())
   }
 
   stopExecutor(id: string): void {
-    this.storage.stopExecutor(id, this.now())
+    this.#storage.stopExecutor(id, this.now())
   }
 
   // -------------------------------------------------------------------------
@@ -530,7 +542,7 @@ export class Journal {
 
   /** Commit the intent of a model request. Refuses once cancellation was requested. */
   modelStarted(call: ModelCall): string {
-    if (this.storage.getSubmission(call.submissionId)?.cancelRequested) {
+    if (this.#storage.getSubmission(call.submissionId)?.cancelRequested) {
       throw new InterruptedError({ message: "model request refused: submission cancellation requested" })
     }
     return this.startTask({
@@ -570,7 +582,7 @@ export class Journal {
   /** Record a failed model request (no-op if the task already settled). */
   modelFailed(call: ModelCall, taskId: string, error: string): void {
     this.transaction(() => {
-      const task = this.storage.getTask(taskId)
+      const task = this.#storage.getTask(taskId)
       if (!task || task.state !== "running") return
       this.transitionTask(taskId, "failed", { error }, {
         type: "model.failed",
@@ -587,7 +599,7 @@ export class Journal {
   /** The first repeat of an outcome-unknown call is refused; record that it was. */
   refuseUnknownOutcomeRepeat(task: TaskRecord, submissionId: string, input: Json): void {
     this.transaction(() => {
-      this.storage.updateTask(task.id, { acknowledged: true })
+      this.#storage.updateTask(task.id, { acknowledged: true })
       this.appendEvent({
         agentId: task.agentId,
         submissionId,
@@ -730,8 +742,8 @@ export class Journal {
   settleOrphanedTasks(): ReadonlyArray<string> {
     return this.transaction(() => {
       const unknown: Array<string> = []
-      for (const task of this.storage.unfinishedTasks()) {
-        const turn = this.storage.getTurn(task.turnId)
+      for (const task of this.#storage.unfinishedTasks()) {
+        const turn = this.#storage.getTurn(task.turnId)
         if (!turn || turn.state === "running" || turn.state === "interrupted") continue
         if (task.type === "tool" && task.replayPolicy !== "safe") {
           this.markOutcomeUnknown(task, "process_terminated")
@@ -747,8 +759,8 @@ export class Journal {
   /** An agent left `running`/`recovering` with no active turn goes back to idle. */
   idleIfStranded(agentId: string): void {
     this.transaction(() => {
-      const agent = this.storage.getAgent(agentId)
-      if (!agent || this.storage.activeTurn(agentId)) return
+      const agent = this.#storage.getAgent(agentId)
+      if (!agent || this.#storage.activeTurn(agentId)) return
       if (agent.state === "running" || agent.state === "recovering") {
         this.transitionAgent(agentId, "idle", null, { type: "agent.idle" })
       }
@@ -763,12 +775,12 @@ export class Journal {
   recoverJournal(): ReadonlyArray<{ readonly turnId: string; readonly agentId: string; readonly unknown: ReadonlyArray<string> }> {
     const at = this.now()
     const classified: Array<{ turnId: string; agentId: string; unknown: ReadonlyArray<string> }> = []
-    for (const turn of this.storage.unfinishedTurns()) {
-      const record = turn.executorId ? this.storage.getExecutor(turn.executorId) : null
+    for (const turn of this.#storage.unfinishedTurns()) {
+      const record = turn.executorId ? this.#storage.getExecutor(turn.executorId) : null
       if (turn.executorId !== null && !executorGone(record, at, null)) continue
       const reason = lostReason(record)
       const unknown = this.transaction(() => {
-        const agent = this.storage.getAgent(turn.agentId)
+        const agent = this.#storage.getAgent(turn.agentId)
         if (agent && agent.state !== "recovering") {
           this.transitionAgent(agent.id, "recovering", "interrupted turn awaiting application resume", {
             type: "recovery.started",

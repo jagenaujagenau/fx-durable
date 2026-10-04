@@ -29,15 +29,12 @@ const T0 = 1_700_000_000_000
 const open = () => {
   const clock = manualClock(T0)
   let n = 0
-  const journal = new Journal({
-    storage: openSqliteStorage({ path: ":memory:" }),
-    nextId: (prefix) => `${prefix}_${++n}`,
-    clock
-  })
-  return { journal, clock, storage: journal.storage }
+  const storage = openSqliteStorage({ path: ":memory:" })
+  const journal = new Journal({ storage, nextId: (prefix) => `${prefix}_${++n}`, clock })
+  return { journal, clock, storage }
 }
 
-const events = (journal: Journal, agentId = "a") => journal.storage.eventsAfter(agentId, 0, 1000)
+const events = (journal: Journal, agentId = "a") => journal.reader.eventsAfter(agentId, 0, 1000)
 const eventTypes = (journal: Journal, agentId = "a") => events(journal, agentId).map((e) => e.type)
 
 /** An agent with a queued submission. */
@@ -254,7 +251,7 @@ describe("events and time", () => {
 describe("checkpoints", () => {
   const completion = (journal: Journal, turn: TurnRecord) => {
     const checkpointTask = journal.startTask({ turnId: turn.id, agentId: "a", type: "checkpoint" })
-    const agent = journal.storage.getAgent("a")
+    const agent = journal.reader.getAgent("a")
     if (!agent) throw new Error("no agent")
     return {
       turn,
@@ -429,7 +426,7 @@ describe("submissions", () => {
     const { journal } = open()
     const cancelled = withSubmission(journal)
     journal.requestCancellation(cancelled)
-    expect(journal.storage.getSubmission(cancelled.id)?.state).toBe("cancelled")
+    expect(journal.reader.getSubmission(cancelled.id)?.state).toBe("cancelled")
     expect(journal.startTurn(cancelled, "exec_1")).toBeNull()
   })
 
@@ -489,5 +486,23 @@ describe("model calls", () => {
     journal.modelFailed(call(turn), taskId, "HTTP 500")
     journal.modelFailed(call(turn), taskId, "again")
     expect(storage.getTask(taskId)).toMatchObject({ state: "failed", error: "HTTP 500" })
+  })
+})
+
+describe("the journal's storage is private", () => {
+  it("cannot be reached from outside, by type or at runtime", () => {
+    const { journal } = open()
+    // @ts-expect-error durable writes go through named journal methods only
+    expect(journal.storage).toBeUndefined()
+    expect("storage" in journal).toBe(false)
+    expect(Object.values(journal).some((value) => value instanceof Object && "updateTask" in value)).toBe(false)
+  })
+
+  it("the reader is a separate object with read methods only", () => {
+    const { journal } = open()
+    const writes = ["transaction", "insertAgent", "updateAgent", "insertSubmission", "updateSubmission", "insertTurn",
+      "updateTurn", "insertTask", "updateTask", "insertCheckpoint", "appendEvent", "registerExecutor", "close"]
+    for (const method of writes) expect(method in journal.reader).toBe(false)
+    expect(Object.keys(journal.reader)).toContain("eventsAfter")
   })
 })

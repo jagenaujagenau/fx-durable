@@ -54,11 +54,11 @@ const requireDb = () => {
 const currentTask = (tasks: ReadonlyArray<TaskRecord>): TaskRecord | null =>
   [...tasks].reverse().find((t) => t.state === "running" && t.type !== "turn") ?? null
 
-const agents = ({ storage }: Journal) => {
+const agents = ({ reader }: Journal) => {
   const rows: Array<Array<string>> = [["NAME", "STATE", "CURRENT TASK"]]
-  for (const agent of storage.listAgents()) {
-    const turn = storage.activeTurn(agent.id)
-    const task = turn ? currentTask(storage.tasksForTurn(turn.id)) : null
+  for (const agent of reader.listAgents()) {
+    const turn = reader.activeTurn(agent.id)
+    const task = turn ? currentTask(reader.tasksForTurn(turn.id)) : null
     const state = agent.state === "idle" ? agent.state : agent.state === "running" ? green(agent.state) : yellow(agent.state)
     rows.push([agent.id, state, task ? taskLabel(task) : "-"])
   }
@@ -90,17 +90,17 @@ const renderTurn = (turn: TurnRecord, tasks: ReadonlyArray<TaskRecord>) => {
   return [`Turn ${dim(turn.id)} attempt ${turn.attempt} ${turn.state}`, ...lines].join("\n")
 }
 
-const inspect = ({ storage }: Journal, id: string) => {
-  const agent = storage.getAgent(id)
+const inspect = ({ reader }: Journal, id: string) => {
+  const agent = reader.getAgent(id)
   if (!agent) {
     console.error(`no agent ${id}`)
     process.exitCode = 1
     return
   }
-  const turn = storage.activeTurn(id)
-  const tasks = turn ? storage.tasksForTurn(turn.id) : []
-  const checkpoint = storage.latestCheckpoint(id)
-  const submissions = storage.listSubmissions(id, 5)
+  const turn = reader.activeTurn(id)
+  const tasks = turn ? reader.tasksForTurn(turn.id) : []
+  const checkpoint = reader.latestCheckpoint(id)
+  const submissions = reader.listSubmissions(id, 5)
   console.log(
     table([
       ["Agent", agent.id],
@@ -135,11 +135,11 @@ const inspect = ({ storage }: Journal, id: string) => {
   }
 }
 
-const events = async ({ storage }: Journal, id: string) => {
+const events = async ({ reader }: Journal, id: string) => {
   let cursor = values.after ? Number(values.after) : 0
   // Another process writes the log; a follower simply polls it from its cursor.
   while (true) {
-    const page = storage.eventsAfter(id, cursor, 500)
+    const page = reader.eventsAfter(id, cursor, 500)
     for (const event of page) console.log(eventLine(event))
     cursor = page[page.length - 1]?.sequence ?? cursor
     if (page.length === 500) continue
@@ -148,14 +148,14 @@ const events = async ({ storage }: Journal, id: string) => {
   }
 }
 
-const trace = ({ storage }: Journal, id: string) => {
-  const turns = storage.listTurns(id, 50)
+const trace = ({ reader }: Journal, id: string) => {
+  const turns = reader.listTurns(id, 50)
   const turn = values.turn ? turns.find((t) => t.id === values.turn) : turns[0]
   if (!turn) {
     console.error(`no turns for ${id}`)
     return
   }
-  const tasks = storage.tasksForTurn(turn.id)
+  const tasks = reader.tasksForTurn(turn.id)
   const index = turns.length - turns.indexOf(turn)
   console.log(`${bold(`TURN #${index}`)} ${dim(turn.id)} ${turn.state} ${dim(`attempts: ${turn.attempt}`)}`)
   const steps = tasks.filter((t) => t.type === "tool" || t.type === "model")
@@ -190,9 +190,10 @@ const recover = (journal: Journal) => {
   console.log(dim("The application continues these turns on its next resume()."))
 }
 
-const cancel = ({ storage }: Journal, id: string) => {
-  if (!storage.getSubmission(id)) throw new Error(`no submission ${id}`)
-  storage.updateSubmission(id, { cancelRequested: true }, new Date())
+const cancel = (journal: Journal, id: string) => {
+  const submission = journal.reader.getSubmission(id)
+  if (!submission) throw new Error(`no submission ${id}`)
+  journal.requestCancellation(submission)
   console.log(`cancellation requested for ${id}; the owning process stops at the next task boundary`)
 }
 
@@ -233,7 +234,7 @@ const main = async () => {
         process.exitCode = 1
     }
   } finally {
-    journal.storage.close()
+    journal.close()
   }
 }
 

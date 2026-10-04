@@ -39,55 +39,55 @@ describe("SQLite storage (plain synchronous code)", () => {
   })
 
   it("transactions are atomic: a throw rolls back every write and its events", () => {
-    const j = openTestJournal(tempDb())
-    j.storage.insertAgent(agent("a"))
+    const { journal: j, storage } = openTestJournal(tempDb())
+    storage.insertAgent(agent("a"))
     expect(() =>
       j.transaction(() => {
-        j.storage.updateAgent("a", { state: "running" }, new Date(2))
+        storage.updateAgent("a", { state: "running" }, new Date(2))
         j.appendEvent({ agentId: "a", type: "agent.updated" })
         throw new Error("boom")
       })
     ).toThrow("boom")
-    expect(j.storage.getAgent("a")?.state).toBe("idle")
-    expect(j.storage.eventsAfter("a", 0, 10)).toEqual([])
-    j.storage.close()
+    expect(storage.getAgent("a")?.state).toBe("idle")
+    expect(storage.eventsAfter("a", 0, 10)).toEqual([])
+    storage.close()
   })
 
   it("invalid state transitions throw and roll back", () => {
-    const j = openTestJournal(tempDb())
-    j.storage.insertAgent(agent("a"))
+    const { journal: j, storage } = openTestJournal(tempDb())
+    storage.insertAgent(agent("a"))
     expect(() =>
       j.transaction(() => {
-        j.storage.updateAgent("a", { stateReason: "half-written" }, new Date(2))
+        storage.updateAgent("a", { stateReason: "half-written" }, new Date(2))
         j.transitionAgent("a", "needs_input")
         j.transitionAgent("a", "failed") // needs_input → failed is not allowed
       })
     ).toThrow(InvalidTransitionError)
-    expect(j.storage.getAgent("a")).toMatchObject({ state: "idle", stateReason: null })
-    j.storage.close()
+    expect(storage.getAgent("a")).toMatchObject({ state: "idle", stateReason: null })
+    storage.close()
   })
 
   it("nested transactions flatten into the outer one", () => {
-    const j = openTestJournal(tempDb())
-    j.storage.insertAgent(agent("a"))
+    const { journal: j, storage } = openTestJournal(tempDb())
+    storage.insertAgent(agent("a"))
     expect(() =>
       j.transaction(() => {
         j.transaction(() => j.transitionAgent("a", "running"))
         throw new Error("outer fails")
       })
     ).toThrow("outer fails")
-    expect(j.storage.getAgent("a")?.state).toBe("idle")
-    j.storage.close()
+    expect(storage.getAgent("a")?.state).toBe("idle")
+    storage.close()
   })
 
   it("rejects asynchronous transaction bodies", () => {
-    const j = openTestJournal(tempDb())
+    const { journal: j, storage } = openTestJournal(tempDb())
     expect(() => j.transaction(async () => undefined)).toThrow(/must be synchronous/)
-    j.storage.close()
+    storage.close()
   })
 
   it("committed-event listeners run only after a successful commit", () => {
-    const j = openTestJournal(tempDb())
+    const { journal: j, storage } = openTestJournal(tempDb())
     const seen: Array<string> = []
     j.onCommitted((event) => seen.push(event.type))
     j.transaction(() => j.appendEvent({ agentId: "a", type: "agent.idle" }))
@@ -98,15 +98,15 @@ describe("SQLite storage (plain synchronous code)", () => {
       })
     ).toThrow()
     expect(seen).toEqual(["agent.idle"])
-    j.storage.close()
+    storage.close()
   })
 
   it("enforces UNIQUE(agent_id, request_id) at the database level", () => {
-    const j = openTestJournal(tempDb())
-    j.storage.insertAgent(agent("a"))
-    j.storage.insertSubmission(submission("s1"))
-    expect(() => j.storage.insertSubmission(submission("s2"))).toThrow(StorageError)
-    j.storage.close()
+    const { storage } = openTestJournal(tempDb())
+    storage.insertAgent(agent("a"))
+    storage.insertSubmission(submission("s1"))
+    expect(() => storage.insertSubmission(submission("s2"))).toThrow(StorageError)
+    storage.close()
   })
 
   it("enforces one active turn per agent at the database level", () => {
@@ -122,14 +122,14 @@ describe("SQLite storage (plain synchronous code)", () => {
   })
 
   it("event sequences are per-agent and gap-free", () => {
-    const j = openTestJournal(tempDb())
+    const { journal: j, storage } = openTestJournal(tempDb())
     for (let i = 0; i < 3; i++) {
       j.appendEvent({ agentId: "a", type: "agent.idle" })
       j.appendEvent({ agentId: "b", type: "agent.idle" })
     }
-    expect(j.storage.eventsAfter("a", 0, 10).map((e) => e.sequence)).toEqual([1, 2, 3])
-    expect(j.storage.eventsAfter("b", 1, 10).map((e) => e.sequence)).toEqual([2, 3])
-    j.storage.close()
+    expect(storage.eventsAfter("a", 0, 10).map((e) => e.sequence)).toEqual([1, 2, 3])
+    expect(storage.eventsAfter("b", 1, 10).map((e) => e.sequence)).toEqual([2, 3])
+    storage.close()
   })
 })
 
@@ -148,11 +148,11 @@ describe("persisted payload envelopes", () => {
 
   it("rejects persisted rows with invalid states", () => {
     const db = tempDb()
-    const j = openTestJournal(db)
+    const { storage } = openTestJournal(db)
     const raw = new DatabaseSync(db)
     raw.exec("INSERT INTO agents VALUES ('bad','coding','m',NULL,'exploded',NULL,1,1)")
     raw.close()
-    expect(() => j.storage.getAgent("bad")).toThrow(StorageError)
-    j.storage.close()
+    expect(() => storage.getAgent("bad")).toThrow(StorageError)
+    storage.close()
   })
 })

@@ -21,9 +21,14 @@ export const openFx = (db: string, script: Script, options: Partial<DurableFxOpt
     ...options
   })
 
-/** The plain synchronous journal over a fresh SQLite database (no Effect). */
-export const openTestJournal = (db: string): Journal =>
-  new Journal({ storage: openSqliteStorage({ path: db }), nextId: sequentialIds() })
+/**
+ * The plain synchronous journal over a fresh SQLite database (no Effect),
+ * plus the raw storage behind it for test setup and assertions.
+ */
+export const openTestJournal = (db: string) => {
+  const storage = openSqliteStorage({ path: db })
+  return { journal: new Journal({ storage, nextId: sequentialIds() }), storage }
+}
 
 const sequentialIds = () => {
   let n = 0

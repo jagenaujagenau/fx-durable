@@ -55,7 +55,7 @@ const attemptRead = <A>(f: () => A): Effect.Effect<A, StorageError> =>
 
 export const makeDatabase = (journal: Journal): DatabaseInterface => ({
   run: (f) => attempt(() => f(journal)),
-  read: (f) => attemptRead(() => f(journal.storage)),
+  read: (f) => attemptRead(() => f(journal.reader)),
   models: {
     modelStarted: (call) => journal.modelStarted(call),
     modelCompleted: (call, taskId, summary) => journal.modelCompleted(call, taskId, summary),

@@ -199,3 +199,27 @@ export type StorageReader = Pick<
   | "eventsAfter"
   | "getExecutor"
 >
+
+/**
+ * A read-only view of `storage`: a separate object that has only the read
+ * methods, so it cannot be cast back into something that writes.
+ */
+export const readerOf = (storage: Storage): StorageReader => ({
+  getAgent: (id) => storage.getAgent(id),
+  listAgents: () => storage.listAgents(),
+  getSubmission: (id) => storage.getSubmission(id),
+  findSubmissionByRequest: (agentId, requestId) => storage.findSubmissionByRequest(agentId, requestId),
+  nextQueuedSubmission: (agentId) => storage.nextQueuedSubmission(agentId),
+  listSubmissions: (agentId, limit) => storage.listSubmissions(agentId, limit),
+  getTurn: (id) => storage.getTurn(id),
+  activeTurn: (agentId) => storage.activeTurn(agentId),
+  unfinishedTurns: () => storage.unfinishedTurns(),
+  listTurns: (agentId, limit) => storage.listTurns(agentId, limit),
+  turnForSubmission: (submissionId) => storage.turnForSubmission(submissionId),
+  getTask: (id) => storage.getTask(id),
+  tasksForTurn: (turnId) => storage.tasksForTurn(turnId),
+  unfinishedTasks: () => storage.unfinishedTasks(),
+  latestCheckpoint: (agentId) => storage.latestCheckpoint(agentId),
+  eventsAfter: (agentId, after, limit) => storage.eventsAfter(agentId, after, limit),
+  getExecutor: (id) => storage.getExecutor(id)
+})
