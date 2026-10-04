@@ -349,6 +349,7 @@ fx-durable/
 │   ├── hello-durable/       # smallest durable agent; history survives restarts
 │   ├── reconnect/           # resume an event stream from a saved cursor
 │   ├── unsafe-tool/         # interrupted deploy becomes outcome_unknown
+│   ├── web-ui/              # Claude Code-style coding agent: AI SDK harness + AI Elements
 │   └── model.ts
 ├── src/
 │   ├── cli/                 # fxd and the demo
@@ -393,6 +394,7 @@ fx-durable/
 | [src/durable/sqlite/migrations/001_initial.ts](src/durable/sqlite/migrations/001_initial.ts) | Database schema and constraints |
 | [tests/crash/crash-matrix.test.ts](tests/crash/crash-matrix.test.ts) | Crash matrix |
 | [examples/](examples) | Runnable examples (`npx tsx examples/<name>/index.ts` after `pnpm build`) |
+| [examples/web-ui/](examples/web-ui) | A Claude Code-style coding agent UI: fx-durable as an AI SDK harness adapter, with AI Elements |
 
 ## Contributing
 

@@ -9,7 +9,10 @@
   "ignorePatterns": [
     "dist/**",
     "node_modules/**",
-    "tools/oxlint/anti-slop/**"
+    "tools/oxlint/anti-slop/**",
+    "examples/web-ui/components/**",
+    "examples/web-ui/hooks/**",
+    "examples/web-ui/.next/**"
   ],
   "rules": {
     "anti-slop/no-chained-type-assertions": "error",
