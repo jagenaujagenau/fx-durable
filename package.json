@@ -2,33 +2,31 @@
   "name": "fx-durable",
   "version": "0.1.0",
   "description": "Durable execution for libfx. Agents should outlive their processes.",
+  "keywords": [
+    "libfx",
+    "fx",
+    "agents",
+    "ai-agents",
+    "durable-execution",
+    "crash-recovery",
+    "sqlite",
+    "effect",
+    "journal"
+  ],
+  "homepage": "https://github.com/jagenaujagenau/fx-durable#readme",
+  "bugs": {
+    "url": "https://github.com/jagenaujagenau/fx-durable/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jagenaujagenau/fx-durable.git"
+  },
+  "license": "MIT",
+  "author": "Diego Peralta <hi@diegoperalta.com>",
   "type": "module",
-  "private": true,
   "bin": {
     "fxd": "./dist/cli/main.js",
     "fx-durable": "./dist/cli/main.js"
-  },
-  "scripts": {
-    "build": "tsc -p .",
-    "typecheck": "tsc --noEmit -p . && tsc -p tsconfig.check.json",
-    "test": "vitest run",
-    "demo": "node dist/cli/main.js demo",
-    "fxd": "node dist/cli/main.js",
-    "lint": "oxlint",
-    "test:live": "vitest run tests/live"
-  },
-  "dependencies": {
-    "effect": "4.0.0",
-    "libfx": "0.0.12"
-  },
-  "devDependencies": {
-    "@oxlint/plugins": "1.86.0",
-    "@types/node": "^26.6.4",
-    "oxlint": "1.86.0",
-    "tsx": "^4.23.15",
-    "typescript": "^7.0.2",
-    "vitest": "^5.0.3",
-    "zod": "4.6.5"
   },
   "exports": {
     ".": {
@@ -48,13 +46,35 @@
       "default": "./dist/effect.js"
     }
   },
-  "engines": {
-    "node": ">=22.13"
-  },
   "files": [
     "dist",
     "README.md",
     "LICENSE"
   ],
-  "license": "MIT"
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc -p . && node scripts/postbuild.mjs",
+    "typecheck": "tsc --noEmit -p . && tsc -p tsconfig.check.json",
+    "test": "vitest run",
+    "demo": "node dist/cli/main.js demo",
+    "fxd": "node dist/cli/main.js",
+    "lint": "oxlint",
+    "test:live": "vitest run tests/live",
+    "prepublishOnly": "pnpm typecheck && pnpm lint && pnpm build"
+  },
+  "dependencies": {
+    "effect": "4.0.0",
+    "libfx": "0.0.12"
+  },
+  "devDependencies": {
+    "@oxlint/plugins": "1.86.0",
+    "@types/node": "^26.6.4",
+    "oxlint": "1.86.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3",
+    "zod": "4.6.5"
+  }
 }

@@ -1,3 +1,5 @@
+// oxlint-disable-next-line typescript/triple-slash-reference -- ambient `declare module "libfx"` types (libfx ships none) can only be attached by reference, not imported
+/// <reference path="../types/libfx.d.ts" preserve="true" />
 import { Context, Effect, Layer, type Scope } from "effect"
 import { RuntimeConfigurationError } from "../domain/errors.js"
 import type { McpClientSpec, RuntimeDefinition } from "./runtime-registry.js"

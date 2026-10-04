@@ -1,3 +1,5 @@
+// oxlint-disable-next-line typescript/triple-slash-reference -- ambient `declare module "libfx"` types (libfx ships none) can only be attached by reference, not imported
+/// <reference path="../types/libfx.d.ts" preserve="true" />
 import { Config, Context, Effect, Layer, Option, Redacted } from "effect"
 import { createFxAgent, type CreateFxAgentOptions, type FxTool, type FxTurnResult } from "libfx"
 import { CheckpointError, ModelError } from "../domain/errors.js"
