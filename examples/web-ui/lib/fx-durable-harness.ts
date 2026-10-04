@@ -67,6 +67,7 @@ const SubmissionCompleted = Schema.Struct({
   usage: Schema.NullOr(Schema.Struct({ inputTokens: Schema.Number, outputTokens: Schema.Number }))
 })
 const SubmissionFailed = Schema.Struct({ error: Schema.optional(Schema.String) })
+const TurnSteered = Schema.Struct({ text: Schema.String })
 const TurnCursor = Schema.Struct({ agentId: Schema.String, submissionId: Schema.String, after: Schema.Number })
 type TurnCursor = typeof TurnCursor.Type
 
@@ -75,6 +76,7 @@ const decodeModelCompleted = Schema.decodeUnknownSync(ModelCompleted)
 const decodeToolEvent = Schema.decodeUnknownSync(ToolEvent)
 const decodeSubmissionCompleted = Schema.decodeUnknownSync(SubmissionCompleted)
 const decodeSubmissionFailed = Schema.decodeUnknownSync(SubmissionFailed)
+const decodeTurnSteered = Schema.decodeUnknownSync(TurnSteered)
 const decodeTurnCursor = Schema.decodeUnknownSync(TurnCursor)
 const isString = Schema.is(Schema.String)
 
@@ -305,6 +307,16 @@ const historyFromEvents = (events: ReadonlyArray<DurableEvent>, outputs: Readonl
           at: event.createdAt.toISOString()
         })
         break
+      case "turn.steered":
+        // Guidance typed while the turn ran: a user message in the middle of the turn.
+        flush()
+        messages.push({
+          role: "user",
+          content: [{ type: "text", text: decodeTurnSteered(event.payload).text }],
+          at: event.createdAt.toISOString()
+        })
+        stepStart = 0
+        break
       case "model.started":
         stepStart = assistant.length
         break
@@ -351,6 +363,49 @@ const historyFromEvents = (events: ReadonlyArray<DurableEvent>, outputs: Readonl
   }
   flush()
   return messages
+}
+
+const AgentForked = Schema.Struct({ from: Schema.String, checkpoint: Schema.NullOr(Schema.Number) })
+const CheckpointCreated = Schema.Struct({ sequence: Schema.Number })
+const isAgentForked = Schema.is(AgentForked)
+const isCheckpointCreated = Schema.is(CheckpointCreated)
+
+interface Conversation {
+  readonly messages: Array<HarnessV1Message>
+  /** The last event sequence read. */
+  readonly cursor: number | null
+}
+
+/**
+ * An agent's conversation from its journal. A fork's journal starts empty, so
+ * its history begins with its source's, up to the checkpoint it was forked
+ * from (recursively, for forks of forks). `until` cuts a source there.
+ */
+const conversationOf = async (fx: DurableFx, agentId: string, after: number, until: number | null, depth: number): Promise<Conversation> => {
+  const agent = await fx.attach(agentId)
+  const events: Array<DurableEvent> = []
+  for await (const event of agent.events({ after, follow: false })) {
+    events.push(event)
+    if (until !== null && event.type === "checkpoint.created" && isCheckpointCreated(event.payload) && event.payload.sequence === until) break
+  }
+
+  const forked = after === 0 ? events.find((event) => event.type === "agent.forked") : undefined
+  const prefix =
+    forked && isAgentForked(forked.payload) && forked.payload.checkpoint !== null && depth < 10
+      ? (await conversationOf(fx, forked.payload.from, 0, forked.payload.checkpoint, depth + 1).catch(() => null))?.messages ?? []
+      : []
+
+  // Tool results live in the task journal, not in the events.
+  const outputs = new Map<string, Json>()
+  await Promise.all(
+    events
+      .filter((event) => event.type === "tool.completed" && event.taskId !== null)
+      .map(async (event) => {
+        const task = await agent.task(event.taskId ?? "").catch(() => null)
+        if (task?.output !== null && task?.output !== undefined) outputs.set(task.id, task.output)
+      })
+  )
+  return { messages: [...prefix, ...historyFromEvents(events, outputs)], cursor: events.at(-1)?.sequence ?? null }
 }
 
 // ---------------------------------------------------------------------------
@@ -475,19 +530,8 @@ export const createFxDurableHarness = (settings: FxDurableHarnessSettings): Harn
 
       async doReadHistory({ since } = {}) {
         const after = since ? Number(since) : 0
-        const events: Array<DurableEvent> = []
-        for await (const event of agent.events({ after, follow: false })) events.push(event)
-        // Tool results live in the task journal, not in the events.
-        const outputs = new Map<string, Json>()
-        await Promise.all(
-          events
-            .filter((event) => event.type === "tool.completed" && event.taskId !== null)
-            .map(async (event) => {
-              const task = await agent.task(event.taskId ?? "").catch(() => null)
-              if (task?.output !== null && task?.output !== undefined) outputs.set(task.id, task.output)
-            })
-        )
-        return { messages: historyFromEvents(events, outputs), cursor: String(events.at(-1)?.sequence ?? after) }
+        const { messages, cursor } = await conversationOf(fx, agentId, after, null, 0)
+        return { messages, cursor: String(cursor ?? after) }
       },
 
       doCompact: async () => {

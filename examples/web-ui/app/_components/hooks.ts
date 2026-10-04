@@ -101,6 +101,8 @@ export const useSessionStream = (id: string | null, onSettled: () => void) => {
   const [events, setEvents] = useState<Array<JournalEvent>>([])
   const [approvals, setApprovals] = useState<Array<PendingApproval>>([])
   const [mode, setMode] = useState<PermissionMode | null>(null)
+  // Live output of running tools (bash), by task id = tool call id.
+  const [progress, setProgress] = useState<ReadonlyMap<string, string>>(new Map())
   const [connected, setConnected] = useState(false)
   const settled = useRef(onSettled)
   settled.current = onSettled
@@ -109,6 +111,7 @@ export const useSessionStream = (id: string | null, onSettled: () => void) => {
     setEvents([])
     setApprovals([])
     setMode(null)
+    setProgress(new Map())
     if (!id) return
     const source = new EventSource(`/api/journal?id=${encodeURIComponent(id)}`)
     source.addEventListener("hello", (message) => {
@@ -129,6 +132,8 @@ export const useSessionStream = (id: string | null, onSettled: () => void) => {
         setApprovals((previous) => (previous.some((a) => a.approvalId === event.approval.approvalId) ? previous : [...previous, event.approval]))
       } else if (event.type === "approval-resolved") {
         setApprovals((previous) => previous.filter((a) => a.approvalId !== event.approvalId))
+      } else if (event.type === "tool-progress") {
+        setProgress((previous) => new Map(previous).set(event.taskId, ((previous.get(event.taskId) ?? "") + event.chunk).slice(-20_000)))
       } else {
         setMode(event.mode)
       }
@@ -144,5 +149,5 @@ export const useSessionStream = (id: string | null, onSettled: () => void) => {
     if (event.type === "model.completed") contextTokens = (event.payload.usage?.inputTokens ?? 0) + (event.payload.usage?.outputTokens ?? 0)
   }
 
-  return { events, approvals, mode, running, contextTokens, connected }
+  return { events, approvals, mode, running, contextTokens, connected, progress }
 }

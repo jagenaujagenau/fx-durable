@@ -1,5 +1,5 @@
 import { Schema } from "effect"
-import type { DurableAgentRecord, SubmissionRecord } from "fx-durable"
+import type { DurableAgent, DurableAgentRecord, SubmissionRecord } from "fx-durable"
 import { live } from "./live"
 import { runtime } from "./runtime"
 
@@ -21,12 +21,29 @@ const titleOf = (submissions: ReadonlyArray<SubmissionRecord>) => {
   return text.length > 60 ? `${text.slice(0, 60)}…` : text
 }
 
+const ForkedFrom = Schema.Struct({ from: Schema.String })
+const isForkedFrom = Schema.is(ForkedFrom)
+
+/** "Fork of …" for a fork that has no requests of its own yet. */
+const forkTitle = async (agent: DurableAgent): Promise<string | null> => {
+  for await (const event of agent.events({ follow: false })) {
+    if (event.type === "agent.forked" && isForkedFrom(event.payload)) {
+      const { fx } = await runtime()
+      const source = await fx.attach(event.payload.from)
+      return `Fork of ${titleOf(await source.submissions(200))}`
+    }
+    if (event.sequence > 5) break
+  }
+  return null
+}
+
 const summarize = async (record: DurableAgentRecord): Promise<SessionSummary> => {
   const { fx } = await runtime()
-  const submissions = await (await fx.attach(record.id)).submissions(200)
+  const agent = await fx.attach(record.id)
+  const submissions = await agent.submissions(200)
   return {
     id: record.id,
-    title: titleOf(submissions),
+    title: submissions.length === 0 ? ((await forkTitle(agent)) ?? titleOf(submissions)) : titleOf(submissions),
     cwd: record.cwd,
     model: record.model,
     state: record.state,
@@ -36,7 +53,8 @@ const summarize = async (record: DurableAgentRecord): Promise<SessionSummary> =>
 
 export const listSessions = async () => {
   const { fx } = await runtime()
-  const agents = await fx.listAgents()
+  // Subagents' child agents ("parent/tool/key") belong to their parent's tool call, not the sidebar.
+  const agents = (await fx.listAgents()).filter((agent) => !agent.id.includes("/"))
   const summaries = await Promise.all(agents.map(summarize))
   return summaries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
 }

@@ -40,11 +40,12 @@ Or start a session in any directory on your machine (**New session** → path, o
 
 | | |
 |---|---|
-| Tools | `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `bash`, `todo_write` |
+| Tools | `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `bash` (live output), `todo_write` |
+| Subagent | `explore`: a read-only child agent (`defineSubagent`) for investigations; its work streams into the tool card |
 | Streaming | Token-level text, tool calls as they start, terminal output, edit diffs |
 | Permissions | Ask before edits / Accept edits / Plan mode (read-only) / Bypass; **Shift+Tab** cycles. Prompts offer *Yes*, *Yes for this session*, *No* (**Enter** / **Esc**) |
-| Control | **Esc** interrupts the turn; messages typed while the agent works are queued |
-| Commands | `/new [path]`, `/clear`, `/model [id]`, `/mode [mode]`, `/files`, `/journal`, `/cost`, `/compact`, `/help` |
+| Control | **Esc** interrupts the turn; typing while the agent works **steers** it (`agent.steer()`) |
+| Commands | `/new [path]`, `/clear`, `/fork`, `/model [id]`, `/mode [mode]`, `/files`, `/journal`, `/cost`, `/compact`, `/help` |
 | Sessions | Sidebar of durable sessions; switch freely, history is read back from the journal |
 | Workspace | File tree and viewer that follow the agent's edits |
 | Context | Context-window meter and per-session token totals |
@@ -58,8 +59,12 @@ Or start a session in any directory on your machine (**New session** → path, o
 - `write_file` and `edit_file` are replay-safe: both are idempotent (an edit that is already applied reports so).
 - Read-only tools set `reuse: false`: after a crash they read the workspace again instead of returning what they saw
   before the agent's own later edits.
-- Permission prompts are not journaled: a tool replayed after a crash asks again. Permission modes are saved in
+- Permission prompts run in the runtime's `beforeTool` hook, before fx-durable journals the call. A crash while a
+  prompt is open leaves nothing half-started; the recovered turn asks again. Permission modes are saved in
   `.data/settings.json`, so a recovered turn runs under the mode you chose.
+- Steering is journaled before it reaches the model, so a crash doesn't lose it: the recovered turn gets it too.
+- A crash inside the `explore` subagent resumes the same child agent; it doesn't start a second one.
+- `/fork` starts a new session from the latest checkpoint, with its own copy of the sample workspace.
 
 ## How it maps
 
@@ -90,8 +95,6 @@ Or start a session in any directory on your machine (**New session** → path, o
 
 - Host-executed tools (`HarnessAgent({ tools })`) are not supported: fx-durable runs and journals its own tools.
 - No manual `/compact`; libfx manages its context and fx-durable checkpoints it after every turn.
-- A tool interrupted while its permission prompt was open is treated as interrupted mid-execution: for `bash` that
-  means *outcome unknown* even though it never ran.
 - `bash` is not sandboxed. It runs on your machine, in the workspace, with your permission. Credentials (`*KEY`,
   `*TOKEN`, `*SECRET`) are removed from its environment.
 - `FXD_DEBUG_STREAMS=1` saves each raw model response to `.data/streams/` for debugging.

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process"
 import { glob as fsGlob, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises"
 import { dirname, isAbsolute, relative, resolve } from "node:path"
-import { defineDurableTool, type DurableTool, type DurableToolContext } from "fx-durable"
+import { defineDurableTool, defineSubagent, type DurableTool, type DurableToolContext, type ToolHooks } from "fx-durable"
 import { z } from "zod"
 import { live, type ToolCategory } from "./live"
 
@@ -39,7 +39,7 @@ const commandEnv = (): NodeJS.ProcessEnv => ({
   FORCE_COLOR: "0"
 })
 
-const run = (command: string, cwd: string, signal: AbortSignal, timeoutMs: number) =>
+const run = (command: string, cwd: string, signal: AbortSignal, timeoutMs: number, onOutput?: (chunk: string) => void) =>
   new Promise<{ exitCode: number | null; stdout: string; stderr: string; timedOut: boolean }>((done, fail) => {
     // Not a login shell: profile scripts must not change the directory or environment.
     const child = spawn("bash", ["-c", command], { cwd, env: commandEnv() })
@@ -52,8 +52,14 @@ const run = (command: string, cwd: string, signal: AbortSignal, timeoutMs: numbe
       kill()
     }, timeoutMs)
     signal.addEventListener("abort", kill, { once: true })
-    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()))
-    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()))
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString()
+      onOutput?.(chunk.toString())
+    })
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString()
+      onOutput?.(chunk.toString())
+    })
     child.once("error", fail)
     child.once("close", (exitCode) => {
       clearTimeout(timer)
@@ -62,15 +68,16 @@ const run = (command: string, cwd: string, signal: AbortSignal, timeoutMs: numbe
     })
   })
 
-export const createCodingTools = (workspaceOf: WorkspaceResolver): ReadonlyArray<DurableTool> => {
-  /** Resolve the workspace and ask for permission before a tool touches anything. */
-  const prepare = async (tool: string, category: ToolCategory, input: z.core.util.JSONType, context: DurableToolContext) => {
-    const root = await workspaceOf(context.agentId)
-    // Permissions are not journaled: a replay after a crash asks again, since
-    // the crash may have happened while the first prompt was still open.
-    await live.authorize(context.agentId, tool, category, input, context.signal)
-    return root
-  }
+/** The tools of each runtime: the coding agent's, and the read-only explorer subagent's. */
+export interface CodingToolset {
+  readonly coding: ReadonlyArray<DurableTool>
+  readonly explorer: ReadonlyArray<DurableTool>
+}
+
+export const createCodingTools = (workspaceOf: WorkspaceResolver): CodingToolset => {
+  /** The workspace a tool works in. Permission is asked earlier, in the runtime's beforeTool hook. */
+  const prepare = async (_tool: string, _category: ToolCategory, _input: z.core.util.JSONType, context: DurableToolContext) =>
+    workspaceOf(context.agentId)
 
   const readFileTool = defineDurableTool({
     name: "read_file",
@@ -219,7 +226,11 @@ export const createCodingTools = (workspaceOf: WorkspaceResolver): ReadonlyArray
     }),
     execute: async (input, context) => {
       const root = await prepare("bash", "exec", input, context)
-      return run(input.command, root, context.signal, input.timeout_ms ?? 120_000)
+      // Stream output: durably (for viewers that reconnect) and live (for the open page).
+      return run(input.command, root, context.signal, input.timeout_ms ?? 120_000, (chunk) => {
+        context.progress(chunk)
+        live.publish(context.agentId, { type: "tool-progress", taskId: context.taskId, chunk })
+      })
     }
   })
 
@@ -242,7 +253,42 @@ export const createCodingTools = (workspaceOf: WorkspaceResolver): ReadonlyArray
     }
   })
 
-  return [readFileTool, writeFileTool, editFileTool, listFilesTool, globTool, grepTool, bashTool, todoTool]
+  const explore = defineSubagent({
+    name: "explore",
+    description:
+      "Delegate a read-only investigation to a subagent (finding code, tracing how something works, summarizing files). It cannot edit files or run commands. Give it the full question; it reports back.",
+    runtime: EXPLORER_RUNTIME
+  })
+
+  return {
+    coding: [readFileTool, writeFileTool, editFileTool, listFilesTool, globTool, grepTool, bashTool, todoTool, explore],
+    explorer: [readFileTool, listFilesTool, globTool, grepTool]
+  }
+}
+
+export const CODING_RUNTIME = "coding"
+export const EXPLORER_RUNTIME = "explorer"
+
+const CATEGORIES = new Map<string, ToolCategory>([
+  ["write_file", "edit"],
+  ["edit_file", "edit"],
+  ["bash", "exec"]
+])
+
+/**
+ * Permission prompts as a beforeTool hook. It runs before fx-durable journals
+ * the call, so a crash while a prompt is open leaves nothing half-started:
+ * the recovered turn simply asks again.
+ */
+export const permissionHooks: ToolHooks = {
+  beforeTool: async (call, context) => {
+    try {
+      await live.authorize(context.agentId, call.name, CATEGORIES.get(call.name) ?? "read", call.input, context.signal)
+      return undefined
+    } catch (error) {
+      return { block: error instanceof Error ? error.message : String(error) }
+    }
+  }
 }
 
 export const SYSTEM_PROMPT = `You are a coding agent working in a local project workspace, in the style of Claude Code.
@@ -251,7 +297,15 @@ export const SYSTEM_PROMPT = `You are a coding agent working in a local project 
 - Read before you edit. Make the smallest correct change. Keep the project's style.
 - Prefer the file tools (read_file, edit_file, write_file, glob, grep, list_files) over shell equivalents.
 - Use todo_write to plan and track multi-step work.
+- Use the explore subagent for broad read-only investigation, so your own context stays focused.
 - Verify changes: run the tests or the relevant command with bash.
 - If a tool call is denied, do not retry it; ask the user.
 - Be concise. Use GitHub-flavored Markdown. Reference code as path:line.
 - If a turn was interrupted and recovered, read the recovery notes carefully: never repeat an operation whose outcome is unknown without checking first.`
+
+export const EXPLORER_PROMPT = `You are a read-only investigator working for a coding agent, in a local project workspace.
+
+- All paths are relative to the workspace root. You can read, list, glob and grep. You cannot edit or run anything.
+- Answer the question you were given with evidence: file paths with line numbers and short quotes.
+- Be concise: your answer goes back to the agent that asked, not to a person.`
+

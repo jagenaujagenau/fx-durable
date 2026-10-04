@@ -2,6 +2,7 @@
 
 import { getToolOrDynamicToolName, type DynamicToolUIPart, type ToolUIPart } from "ai"
 import {
+  BotIcon,
   CheckCircle2Icon,
   CircleDashedIcon,
   FileEditIcon,
@@ -17,10 +18,11 @@ import {
   WrenchIcon,
   XCircleIcon
 } from "lucide-react"
-import type { ReactNode } from "react"
+import { useEffect, useState, type ReactNode } from "react"
 import type { BundledLanguage } from "shiki"
 import { z } from "zod"
 import { CodeBlock } from "@/components/ai-elements/code-block"
+import { MessageResponse } from "@/components/ai-elements/message"
 import { Tool, ToolContent } from "@/components/ai-elements/tool"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -32,7 +34,10 @@ import {
   EditInput,
   ReadInput,
   ReadOutput,
+  JournalEvent,
   SearchInput,
+  SubagentInput,
+  SubagentOutput,
   TodoInput,
   WriteInput,
   type PendingApproval,
@@ -93,6 +98,8 @@ const describe = (part: ToolPart): ToolLabel => {
       return { icon: <FolderTreeIcon />, verb: "List", argument: SearchInput.safeParse(input).data?.path ?? "." }
     case "todo_write":
       return { icon: <ListChecksIcon />, verb: "Update Todos", argument: "" }
+    case "explore":
+      return { icon: <BotIcon />, verb: "Explore", argument: SubagentInput.safeParse(input).data?.task ?? "" }
     default:
       return { icon: <WrenchIcon />, verb: getToolOrDynamicToolName(part), argument: "" }
   }
@@ -172,9 +179,42 @@ export const TodoList = ({ todos }: { todos: ReadonlyArray<Todo> }) => (
   </ul>
 )
 
-const Output = ({ name, part }: { name: string; part: ToolPart }) => {
+/** A subagent's work while it runs: its own journal, streamed. */
+const SubagentActivity = ({ agentId }: { agentId: string }) => {
+  const [lines, setLines] = useState<ReadonlyArray<string>>([])
+  useEffect(() => {
+    const source = new EventSource(`/api/journal?id=${encodeURIComponent(agentId)}`)
+    source.onmessage = (message) => {
+      const event = JournalEvent.safeParse(JSON.parse(message.data)).data
+      if (!event) return
+      const line =
+        event.type === "tool.started"
+          ? `→ ${event.payload.tool ?? "tool"}`
+          : event.type === "model.completed" && event.payload.text
+            ? event.payload.text.split("\n")[0] ?? ""
+            : null
+      if (line) setLines((previous) => [...previous, line].slice(-8))
+    }
+    return () => source.close()
+  }, [agentId])
+  return (
+    <div className="space-y-1 rounded-md border bg-muted/30 p-3 font-mono text-xs text-muted-foreground">
+      <div className="text-[11px] uppercase tracking-wide">subagent {agentId.split("/").at(-1)?.slice(0, 13)}</div>
+      {lines.length === 0 ? <div>starting…</div> : lines.map((line, i) => <div key={i} className="truncate">{line}</div>)}
+    </div>
+  )
+}
+
+const Output = ({ name, part, liveOutput, sessionId }: { name: string; part: ToolPart; liveOutput?: string; sessionId: string }) => {
   const input = part.input
   const output = part.state === "output-available" ? part.output : undefined
+
+  if (name === "explore") {
+    const result = SubagentOutput.safeParse(output).data
+    if (result) return <MessageResponse>{result.text}</MessageResponse>
+    // The child is named after the call's idempotency key, which is the call's first task id.
+    return part.state === "input-available" ? <SubagentActivity agentId={`${sessionId}/explore/${part.toolCallId}`} /> : null
+  }
 
   if (name === "bash") {
     const result = BashOutput.safeParse(output).data
@@ -195,7 +235,9 @@ const Output = ({ name, part }: { name: string; part: ToolPart }) => {
             {!result.stdout && !result.stderr && <span className="text-zinc-500">(no output)</span>}
           </pre>
         ) : (
-          part.state === "input-available" && <div className="p-3 text-zinc-500">running…</div>
+          part.state === "input-available" && (
+            <pre className="max-h-80 overflow-auto whitespace-pre-wrap p-3">{liveOutput || <span className="text-zinc-500">running…</span>}</pre>
+          )
         )}
       </div>
     )
@@ -272,18 +314,23 @@ export const ApprovalPrompt = ({
 export const ToolCall = ({
   part,
   approval,
-  onDecide
+  onDecide,
+  liveOutput,
+  sessionId
 }: {
   part: ToolPart
   approval?: PendingApproval
   onDecide: (approvalId: string, decision: ApprovalDecision) => void
+  liveOutput?: string
+  sessionId: string
 }) => {
   const name = getToolOrDynamicToolName(part)
   const { icon, verb, argument } = describe(part)
   const summary = summaryOf(name, part)
   const errorText = part.state === "output-error" ? part.errorText : undefined
   // Edits, writes, todos and anything waiting for permission open by default, like Claude Code.
-  const openByDefault = approval !== undefined || name === "edit_file" || name === "todo_write" || name === "bash" || errorText !== undefined
+  const openByDefault =
+    approval !== undefined || name === "edit_file" || name === "todo_write" || name === "bash" || name === "explore" || errorText !== undefined
 
   return (
     <Tool defaultOpen={openByDefault} className="mb-2 bg-card">
@@ -303,7 +350,7 @@ export const ToolCall = ({
       </CollapsibleTrigger>
       <ToolContent className="space-y-3 px-3 pt-0 pb-3">
         {approval && <ApprovalPrompt approval={approval} onDecide={onDecide} />}
-        <Output name={name} part={part} />
+        <Output name={name} part={part} liveOutput={liveOutput} sessionId={sessionId} />
         {errorText && (
           <div
             className={cn(

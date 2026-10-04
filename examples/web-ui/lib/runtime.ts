@@ -9,12 +9,11 @@ import { createFxDurableHarness } from "./fx-durable-harness"
 import { live } from "./live"
 import { localSandbox } from "./local-sandbox"
 import { offlineScript } from "./offline-script"
-import { createCodingTools, SYSTEM_PROMPT } from "./tools"
+import { CODING_RUNTIME, createCodingTools, EXPLORER_PROMPT, EXPLORER_RUNTIME, permissionHooks, SYSTEM_PROMPT } from "./tools"
 
 export const DATA_DIR = join(process.cwd(), ".data")
 const WORKSPACES_DIR = join(DATA_DIR, "workspaces")
 const TEMPLATE_DIR = join(process.cwd(), "workspace-template")
-const RUNTIME_ID = "coding"
 
 export const OFFLINE = !process.env.AI_GATEWAY_API_KEY
 export const DEFAULT_MODEL = process.env.FXD_MODEL ?? "anthropic/claude-sonnet-4.5"
@@ -109,18 +108,24 @@ const open = async (): Promise<Runtime> => {
   const base: Transport = OFFLINE ? scriptedModel(offlineScript, { latencyMs: 500, chunkDelayMs: 12 }) : (input, init) => fetch(input, init)
   const options: DurableFxOptions = {
     storage: sqlite(join(DATA_DIR, "fx.db")),
-    runtimes: { [RUNTIME_ID]: { tools, instructions: SYSTEM_PROMPT } },
+    runtimes: {
+      [CODING_RUNTIME]: { tools: tools.coding, instructions: SYSTEM_PROMPT, hooks: permissionHooks },
+      [EXPLORER_RUNTIME]: { tools: tools.explorer, instructions: EXPLORER_PROMPT }
+    },
     fetch: streamingTransport(base),
-    idlePollMillis: 100
+    idlePollMillis: 100,
+    // Recover after `opened` is set: recovered tool calls look up their workspace through it.
+    recovery: "manual"
   }
-  // Opening recovers any turn that was running when the previous process died.
   const fx = await DurableFx.open(options)
   opened = fx
+  // Recover any turn that was running when the previous process died.
+  await fx.resume()
 
   const harness = createFxDurableHarness({
     fx,
-    runtime: RUNTIME_ID,
-    tools,
+    runtime: CODING_RUNTIME,
+    tools: tools.coding,
     defaultModel: DEFAULT_MODEL,
     textDeltas: (agentId, onDelta) =>
       live.subscribe(agentId, (event) => {
@@ -143,6 +148,27 @@ export const runtime = (): Promise<Runtime> => (globalThis.fxDurableRuntime ??= 
 // Sessions: a durable agent + a HarnessAgent session + a workspace directory
 // ---------------------------------------------------------------------------
 
+/**
+ * Fork a session from its latest checkpoint. A sample-project workspace is
+ * copied, so the two sessions don't edit the same files; a directory you
+ * chose is shared (it's yours).
+ */
+export const forkChatSession = async (sourceId: string) => {
+  const { fx, workspaces } = await runtime()
+  const source = await fx.attach(sourceId)
+  const sourceCwd = (await source.info()).cwd
+  const id = `s-${randomUUID().slice(0, 8)}`
+  let cwd = sourceCwd
+  if (sourceCwd?.startsWith(WORKSPACES_DIR)) {
+    cwd = join(WORKSPACES_DIR, id)
+    await cp(sourceCwd, cwd, { recursive: true })
+  }
+  await source.fork(id, { cwd })
+  live.setMode(id, live.modeOf(sourceId))
+  if (cwd) workspaces.set(id, cwd)
+  return { id, cwd: cwd ?? "" }
+}
+
 export const createChatSession = async (options: { readonly cwd?: string; readonly model?: string }) => {
   const { fx, workspaces } = await runtime()
   const id = `s-${randomUUID().slice(0, 8)}`
@@ -153,7 +179,7 @@ export const createChatSession = async (options: { readonly cwd?: string; readon
     cwd = join(WORKSPACES_DIR, id)
     await cp(TEMPLATE_DIR, cwd, { recursive: true })
   }
-  await fx.agent(id, { runtime: RUNTIME_ID, model: options.model ?? DEFAULT_MODEL, cwd })
+  await fx.agent(id, { runtime: CODING_RUNTIME, model: options.model ?? DEFAULT_MODEL, cwd })
   workspaces.set(id, cwd)
   return { id, cwd }
 }

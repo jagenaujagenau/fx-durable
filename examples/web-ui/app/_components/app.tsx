@@ -50,6 +50,7 @@ const MODES: ReadonlyArray<{ id: PermissionMode; label: string; hint: string }> 
 const COMMANDS: ReadonlyArray<{ name: string; args?: string; description: string }> = [
   { name: "/new", args: "[path]", description: "Start a new session (optionally in an existing directory)" },
   { name: "/clear", description: "Start a fresh session in the same workspace" },
+  { name: "/fork", description: "Fork this conversation into a new session (with its own copy of the sample workspace)" },
   { name: "/model", args: "[id]", description: "Switch model" },
   { name: "/mode", args: "[default|acceptEdits|plan|bypassPermissions]", description: "Set the permission mode" },
   { name: "/files", description: "Show the workspace files" },
@@ -204,6 +205,7 @@ export function App() {
             onSessionsChanged={refreshSessions}
             onNewSession={startSession}
             onMissing={recover}
+            onSelect={select}
           />
         ) : (
           <div className="flex flex-1 items-center justify-center">
@@ -376,13 +378,15 @@ function ChatView({
   restarts,
   onSessionsChanged,
   onNewSession,
-  onMissing
+  onMissing,
+  onSelect
 }: {
   sessionId: string
   config: Config
   online: boolean
   restarts: number
   onMissing: () => void
+  onSelect: (id: string) => void
   onSessionsChanged: () => Promise<void>
   onNewSession: (options?: { cwd?: string; model?: string }) => Promise<{ id: string; cwd: string }>
 }) {
@@ -424,6 +428,17 @@ function ChatView({
     void loadHistory()
   }, [loadHistory, restarts])
 
+  // When a streamed turn ends, read it back from the journal: steering then
+  // appears where it entered the turn, instead of as a note at the bottom.
+  const previousStatus = useRef(status)
+  useEffect(() => {
+    const was = previousStatus.current
+    previousStatus.current = status
+    if ((was === "streaming" || was === "submitted") && status === "ready") {
+      void loadHistory().then(() => setNotices((previous) => previous.filter((n) => !n.text.startsWith("↳ "))))
+    }
+  }, [status, loadHistory])
+
   const mode = stream.mode ?? details?.mode ?? "default"
   const busy = status === "submitted" || status === "streaming" || stream.running
   const notice = (text: string) => setNotices((previous) => [...previous, { after: messages.length, text }])
@@ -463,6 +478,18 @@ function ChatView({
       case "/new":
         await onNewSession(arg ? { cwd: arg } : {}).catch((failure: Error) => notice(failure.message))
         return
+      case "/fork": {
+        const response = await fetch("/api/sessions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ forkFrom: sessionId })
+        })
+        const created = CreatedSession.safeParse(await response.json()).data
+        if (!response.ok || !created) return notice("Could not fork: the session needs at least one finished turn.")
+        await onSessionsChanged()
+        onSelect(created.id)
+        return
+      }
       case "/clear":
         await onNewSession(details?.cwd && !details.cwd.includes("/.data/workspaces/") ? { cwd: details.cwd } : {})
         return
@@ -497,10 +524,17 @@ function ChatView({
         notice(
           [
             "Commands: " + COMMANDS.map((c) => `${c.name}${c.args ? ` ${c.args}` : ""}`).join(" · "),
-            "Shortcuts: Enter send · Shift+Enter newline · Shift+Tab cycle permission mode · Esc interrupt (or deny a permission prompt) · type while the agent works to queue a message"
+            "Shortcuts: Enter send · Shift+Enter newline · Shift+Tab cycle permission mode · Esc interrupt (or deny a permission prompt) · type while the agent works to steer it"
           ].join("\n")
         )
     }
+  }
+
+  /** Typing while the agent works steers it: the guidance joins the running turn. */
+  const steer = async (text: string) => {
+    notice(`↳ ${text}`)
+    const response = await fetch("/api/steer", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: sessionId, text }) })
+    if (!response.ok) notice("Could not steer the agent; your message was not sent.")
   }
 
   const submit = (text: string) => {
@@ -508,7 +542,8 @@ function ChatView({
     if (!trimmed) return
     setInput("")
     if (trimmed.startsWith("/")) return void runCommand(trimmed)
-    if (busy || !online) return setQueue((previous) => [...previous, trimmed])
+    if (!online) return setQueue((previous) => [...previous, trimmed])
+    if (busy) return void steer(trimmed)
     void sendMessage({ text: trimmed })
   }
 
@@ -615,7 +650,18 @@ function ChatView({
                             </p>
                           )
                         }
-                        if (isToolUIPart(part)) return <ToolCall key={i} part={part} approval={approvalFor(part, stream.approvals)} onDecide={decide} />
+                        if (isToolUIPart(part)) {
+                          return (
+                            <ToolCall
+                              key={i}
+                              part={part}
+                              approval={approvalFor(part, stream.approvals)}
+                              onDecide={decide}
+                              liveOutput={stream.progress.get(part.toolCallId)}
+                              sessionId={sessionId}
+                            />
+                          )
+                        }
                         return null
                       })}
                     </MessageContent>
@@ -629,20 +675,15 @@ function ChatView({
               ))
             )}
             {messages.length === 0 && notices.map((n, i) => <NoticeLine key={i} text={n.text} />)}
+            {/* The beforeTool hook asks before the call is journaled, so it has no card yet: show one. */}
             {orphanApprovals.map((approval) => (
-              <div key={approval.approvalId} className="rounded-md border p-3">
-                <p className="mb-2 font-mono text-xs">
-                  {approval.tool} {JSON.stringify(approval.input)}
-                </p>
-                <div className="flex gap-2">
-                  <Button size="sm" onClick={() => void decide(approval.approvalId, "allow")}>
-                    Allow
-                  </Button>
-                  <Button size="sm" variant="outline" onClick={() => void decide(approval.approvalId, "deny")}>
-                    Deny
-                  </Button>
-                </div>
-              </div>
+              <ToolCall
+                key={approval.approvalId}
+                part={{ type: "dynamic-tool", toolName: approval.tool, toolCallId: approval.approvalId, state: "input-available", input: approval.input }}
+                approval={approval}
+                onDecide={decide}
+                sessionId={sessionId}
+              />
             ))}
             {busy && status !== "streaming" && (
               <Shimmer className="text-sm">{stream.running && status !== "submitted" ? "Working (durably)… Esc to interrupt" : "Thinking…"}</Shimmer>
@@ -689,7 +730,7 @@ function ChatView({
                 value={input}
                 onChange={(event) => setInput(event.currentTarget.value)}
                 onKeyDown={onTextareaKeyDown}
-                placeholder={busy ? "The agent is working. Type to queue a message…" : "Ask the agent to change, run or explain code. / for commands"}
+                placeholder={busy ? "The agent is working. Type to steer it…" : "Ask the agent to change, run or explain code. / for commands"}
               />
             </PromptInputBody>
             <PromptInputFooter>

@@ -16,7 +16,12 @@ export async function GET(request: Request) {
   const after = Number(request.headers.get("last-event-id") ?? url.searchParams.get("after") ?? 0)
 
   const { fx } = await runtime()
-  const agent = await fx.attach(id).catch(() => null)
+  // A subagent's child agent is created a moment after its tool call starts; give it a few seconds.
+  let agent = await fx.attach(id).catch(() => null)
+  for (let i = 0; !agent && id.includes("/") && i < 50; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    agent = await fx.attach(id).catch(() => null)
+  }
   if (!agent) return new Response("unknown session", { status: 404 })
   const encoder = new TextEncoder()
   let unsubscribe = () => {}

@@ -28,6 +28,7 @@ export type ApprovalDecision = "allow" | "allow-session" | "deny"
 
 export type LiveEvent =
   | { readonly type: "text-delta"; readonly taskId: string; readonly delta: string }
+  | { readonly type: "tool-progress"; readonly taskId: string; readonly chunk: string }
   | { readonly type: "approval-requested"; readonly approval: PendingApproval }
   | { readonly type: "approval-resolved"; readonly approvalId: string; readonly decision: ApprovalDecision }
   | { readonly type: "mode-changed"; readonly mode: PermissionMode }

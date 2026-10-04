@@ -11,6 +11,34 @@ export const offlineScript: Script = (req): ScriptedResponse => {
   const count = (name: string) => results.filter((n) => n === name).length
   const last = req.toolResults.at(-1)
 
+  // The explore subagent: its requests offer read-only tools, no bash.
+  if (!req.tools.includes("bash")) {
+    if (count("list_files") === 0) return { text: "Looking around.", toolCalls: [{ name: "list_files", input: {} }] }
+    if (count("read_file") === 0) return { toolCalls: [{ name: "read_file", input: { path: "src/cart.js" } }] }
+    return {
+      text: "`src/cart.js` exports `subtotal`, `applyDiscount` and `total`; `test/cart.test.js` covers them with 4 tests. `subtotal` (src/cart.js:4) ignores `quantity`."
+    }
+  }
+
+  if (text.includes("explain") || text.includes("explore")) {
+    const explored = req.toolResults.find((r) => r.toolName === "explore")
+    if (!explored) {
+      return {
+        text: "I'll send a subagent to look around, so this conversation stays focused.",
+        toolCalls: [{ name: "explore", input: { task: "Summarize this project: its modules, their exports, and its tests. Note anything that looks wrong." } }]
+      }
+    }
+    return {
+      text: [
+        "Here's what the subagent found:",
+        "",
+        "- **`src/cart.js`**: `subtotal`, `applyDiscount`, `total` for a shopping cart (prices in cents).",
+        "- **`test/cart.test.js`**: 4 tests with Node's built-in runner (`npm test`).",
+        "- **Suspicious:** `subtotal` ignores `quantity`, so two tests should fail. Ask me to fix them."
+      ].join("\n")
+    }
+  }
+
   if (last?.isError && last.output.includes("denied")) {
     return { text: `You denied \`${last.toolName}\`, so I stopped there. Tell me how you'd like to proceed.` }
   }

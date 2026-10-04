@@ -65,7 +65,8 @@ export type JournalEvent = z.infer<typeof JournalEvent>
 export const LiveEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("approval-requested"), approval: PendingApproval }),
   z.object({ type: z.literal("approval-resolved"), approvalId: z.string(), decision: z.string() }),
-  z.object({ type: z.literal("mode-changed"), mode: PermissionMode })
+  z.object({ type: z.literal("mode-changed"), mode: PermissionMode }),
+  z.object({ type: z.literal("tool-progress"), taskId: z.string(), chunk: z.string() })
 ])
 
 export const Hello = z.object({ pid: z.number() })
@@ -95,3 +96,5 @@ export const SearchInput = z.object({ pattern: z.string().optional(), path: z.st
 export const Todo = z.object({ content: z.string(), status: z.enum(["pending", "in_progress", "completed"]) })
 export type Todo = z.infer<typeof Todo>
 export const TodoInput = z.object({ todos: z.array(Todo) })
+export const SubagentInput = z.object({ task: z.string() })
+export const SubagentOutput = z.object({ agentId: z.string(), text: z.string() })
