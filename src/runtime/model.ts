@@ -1,8 +1,7 @@
 import { Option, Schema } from "effect"
 import type { CrashInjectorInterface } from "./crash.js"
-import { InterruptedError } from "./errors.js"
-import type { Transport } from "./transport.js"
-import type { Journal } from "./journal.js"
+import type { Transport } from "../domain/transport.js"
+import type { ModelJournal } from "./database.js"
 import type { TurnContext } from "./turn-context.js"
 
 /**
@@ -101,60 +100,30 @@ export interface ModelTransportHolder {
 export const makeDurableFetch = (
   holder: ModelTransportHolder,
   transport: Transport,
-  journal: Journal,
+  models: ModelJournal,
   crash: CrashInjectorInterface
 ): Transport => {
+  const callOf = (ctx: TurnContext) => ({
+    agentId: ctx.agentId,
+    submissionId: ctx.submissionId,
+    turnId: ctx.turnId,
+    attempt: ctx.attempt,
+    model: ctx.model
+  })
+
   const begin = (ctx: TurnContext): string => {
-    if (journal.storage.getSubmission(ctx.submissionId)?.cancelRequested) {
-      throw new InterruptedError({ message: "model request refused: submission cancellation requested" })
-    }
-    const task = journal.startTask({
-      turnId: ctx.turnId,
-      agentId: ctx.agentId,
-      type: "model",
-      name: ctx.model,
-      attempt: ctx.attempt,
-      replayPolicy: "safe",
-      event: { type: "model.started", submissionId: ctx.submissionId, payload: { model: ctx.model } }
-    })
+    const taskId = models.modelStarted(callOf(ctx))
     crash.hitSync("model.before-request", { name: ctx.model })
-    return task.id
+    return taskId
   }
 
   const complete = (ctx: TurnContext, taskId: string, summary: StreamSummary, startedAt: number): void => {
-    const durationMs = Date.now() - startedAt
-    journal.transitionTask(
-      taskId,
-      "completed",
-      {
-        output: { text: summary.text, toolCalls: summary.toolCalls, finishReason: summary.finishReason },
-        metadata: { durationMs, inputTokens: summary.inputTokens, outputTokens: summary.outputTokens }
-      },
-      {
-        type: "model.completed",
-        submissionId: ctx.submissionId,
-        payload: {
-          model: ctx.model,
-          durationMs,
-          text: summary.text,
-          toolCalls: summary.toolCalls,
-          finishReason: summary.finishReason,
-          usage: { inputTokens: summary.inputTokens, outputTokens: summary.outputTokens }
-        }
-      }
-    )
+    models.modelCompleted(callOf(ctx), taskId, { ...summary, durationMs: Date.now() - startedAt })
     crash.hitSync("model.after-response", { name: ctx.model })
   }
 
   const fail = (ctx: TurnContext, taskId: string, error: string): void => {
-    const task = journal.storage.getTask(taskId)
-    if (!task || task.state !== "running") return
-    journal.transitionTask(
-      taskId,
-      "failed",
-      { error },
-      { type: "model.failed", submissionId: ctx.submissionId, payload: { model: ctx.model, error } }
-    )
+    models.modelFailed(callOf(ctx), taskId, error)
   }
 
   const durableFetch: Transport = async (input, init) => {

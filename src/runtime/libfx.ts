@@ -1,8 +1,8 @@
 import { Config, Context, Effect, Layer, Option, Redacted } from "effect"
 import { createFxAgent, type CreateFxAgentOptions, type FxTool, type FxTurnResult } from "libfx"
-import { CheckpointError, ModelError } from "./errors.js"
-import type { DurableAgentRecord, SubmissionContent, TurnUsage } from "./schema.js"
-import type { Transport } from "./transport.js"
+import { CheckpointError, ModelError } from "../domain/errors.js"
+import type { DurableAgentRecord, SubmissionContent, TurnUsage } from "../domain/schema.js"
+import type { Transport } from "../domain/transport.js"
 
 /**
  * The only module that talks to libfx. libfx owns the agent loop, model

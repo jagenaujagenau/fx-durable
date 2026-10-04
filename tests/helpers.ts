@@ -4,11 +4,11 @@ import { join } from "node:path"
 import { Effect, Layer, ManagedRuntime } from "effect"
 import { DurableFx, sqlite, type DurableFxOptions } from "../src/index.js"
 import { scriptedModel, type Script } from "../src/testing/index.js"
-import { EventLog, layer as eventLogLayer } from "../src/core/events.js"
-import { IdGenerator } from "../src/core/ids.js"
-import { Journal } from "../src/core/journal.js"
-import { JournalService, journalLayer } from "../src/core/journal-service.js"
-import { openSqliteStorage } from "../src/sqlite/storage.js"
+import { EventLog, layer as eventLogLayer } from "../src/runtime/events.js"
+import { IdGenerator } from "../src/runtime/ids.js"
+import { Journal } from "../src/durable/journal.js"
+import { Database, databaseLayer } from "../src/runtime/database.js"
+import { openSqliteStorage } from "../src/durable/sqlite/storage.js"
 
 export const tempDb = (name = "fx.db") => join(mkdtempSync(join(tmpdir(), "fxd-test-")), name)
 
@@ -30,17 +30,13 @@ const sequentialIds = () => {
   return (prefix: string) => `${prefix}_${String(++n).padStart(6, "0")}`
 }
 
-/** Journal + EventLog in an Effect runtime, for live-subscription tests. */
+/** Database + EventLog in an Effect runtime, for live-subscription tests. */
 export const eventRuntime = (db: string) => {
-  const layer = eventLogLayer.pipe(
-    Layer.provideMerge(journalLayer(() => openSqliteStorage({ path: db }))),
-    Layer.provideMerge(IdGenerator.layer)
-  )
+  const layer = eventLogLayer.pipe(Layer.provideMerge(databaseLayer(sqlite(db))), Layer.provideMerge(IdGenerator.layer))
   const runtime = ManagedRuntime.make(layer)
   return {
     runtime,
-    journal: () => runtime.runPromise(Effect.map(JournalService, (journal) => journal)),
-    run: <A, E>(effect: Effect.Effect<A, E, JournalService | EventLog | IdGenerator>) => runtime.runPromise(effect)
+    run: <A, E>(effect: Effect.Effect<A, E, Database | EventLog | IdGenerator>) => runtime.runPromise(effect)
   }
 }
 

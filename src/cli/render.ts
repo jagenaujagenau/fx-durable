@@ -1,5 +1,5 @@
-import { isJsonObject, jsonField, jsonText, type Json } from "../core/json.js"
-import type { DurableEvent, TaskRecord } from "../core/schema.js"
+import { isJsonObject, jsonField, jsonText, type Json } from "../domain/json.js"
+import type { DurableEvent, TaskRecord } from "../domain/schema.js"
 
 const tty = process.stdout.isTTY && !process.env.NO_COLOR
 const paint = (code: string) => (text: string) => (tty ? `\x1b[${code}m${text}\x1b[0m` : text)

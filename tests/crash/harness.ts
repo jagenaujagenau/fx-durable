@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite"
 import { Option, Schema } from "effect"
-import { crashEnv, type CrashPlan } from "../../src/core/crash.js"
+import { crashEnv, type CrashPlan } from "../../src/runtime/crash.js"
 
 const FIXTURE = resolve(import.meta.dirname, "../fixtures/agent-process.ts")
 

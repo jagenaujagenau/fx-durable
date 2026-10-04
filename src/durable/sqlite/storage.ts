@@ -1,7 +1,7 @@
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue, type StatementSync } from "node:sqlite"
 import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
-import { StorageError } from "../core/errors.js"
+import { StorageError } from "../../domain/errors.js"
 import {
   AgentCheckpoint,
   DurableAgentRecord,
@@ -12,8 +12,8 @@ import {
   decodePayloadSync,
   decodeSync,
   encodePayload
-} from "../core/schema.js"
-import type { ExecutorRecord, Storage } from "../core/storage.js"
+} from "../../domain/schema.js"
+import type { ExecutorRecord, Storage } from "../storage.js"
 import { applyMigrations } from "./schema.js"
 
 export interface SqliteOptions {

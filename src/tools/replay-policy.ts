@@ -1,5 +1,5 @@
-import type { Json } from "../core/json.js"
-import type { ReplayPolicyName } from "../core/schema.js"
+import type { Json } from "../domain/json.js"
+import type { ReplayPolicyName } from "../domain/schema.js"
 
 /**
  * How an interrupted tool call may be handled after a crash.

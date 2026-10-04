@@ -1,5 +1,5 @@
 import { Schema } from "effect"
-import type { Json, JsonObject } from "../core/json.js"
+import type { Json, JsonObject } from "../domain/json.js"
 import type { ReplayPolicy } from "./replay-policy.js"
 import { formatIssues, type StandardSchemaV1 } from "./standard-schema.js"
 

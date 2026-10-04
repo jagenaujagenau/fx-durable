@@ -3,8 +3,8 @@
  *
  * Effect models execution. SQLite models durability. libfx models the agent.
  */
-export { DurableFx, DurableAgent, Submission } from "./core/durable-fx.js"
-export type { AgentOptions, DurableFxOptions, EventsOptions, SubmitOptions } from "./core/durable-fx.js"
+export { DurableFx, DurableAgent, Submission } from "./runtime/durable-fx.js"
+export type { AgentOptions, DurableFxOptions, EventsOptions, SubmitOptions } from "./runtime/durable-fx.js"
 export { defineDurableTool, OutcomeUnknown } from "./tools/define-tool.js"
 export type {
   DurableTool,
@@ -15,16 +15,16 @@ export type {
   ToolResult
 } from "./tools/define-tool.js"
 export type { StandardSchemaV1 } from "./tools/standard-schema.js"
-export type { Json, JsonArray, JsonObject } from "./core/json.js"
-export type { Transport } from "./core/transport.js"
+export type { Json, JsonArray, JsonObject } from "./domain/json.js"
+export type { Transport } from "./domain/transport.js"
 export type { ReplayPolicy } from "./tools/replay-policy.js"
-export type { McpClientSpec, RuntimeDefinition } from "./core/runtime.js"
-export type { RecoveryReport } from "./core/recovery.js"
-export { CRASH_POINTS, crashPoint } from "./core/crash.js"
-export type { CrashPoint, CrashPlan } from "./core/crash.js"
-export { EVENT_TYPES } from "./core/journal.js"
-export type { EventType } from "./core/journal.js"
-export * from "./core/errors.js"
+export type { McpClientSpec, RuntimeDefinition } from "./runtime/runtime-registry.js"
+export type { RecoveryReport } from "./runtime/recovery.js"
+export { CRASH_POINTS, crashPoint } from "./runtime/crash.js"
+export type { CrashPoint, CrashPlan } from "./runtime/crash.js"
+export { EVENT_TYPES } from "./domain/events.js"
+export type { EventType } from "./domain/events.js"
+export * from "./domain/errors.js"
 export type {
   AgentCheckpoint,
   AgentState,
@@ -40,8 +40,11 @@ export type {
   TurnRecord,
   TurnState,
   UnknownOutcome
-} from "./core/schema.js"
-export { openSqliteStorage, sqlite } from "./sqlite/storage.js"
-export type { SqliteOptions, SqliteStorageConfig } from "./sqlite/storage.js"
-export { Journal } from "./core/journal.js"
-export type { ExecutorRecord, NewEvent, NewTask, Storage, TaskPatch } from "./core/storage.js"
+} from "./domain/schema.js"
+export { openSqliteStorage, sqlite } from "./durable/sqlite/storage.js"
+export type { SqliteOptions, SqliteStorageConfig } from "./durable/sqlite/storage.js"
+export { Journal } from "./durable/journal.js"
+export type { AgentConfig, JournalOptions } from "./durable/journal.js"
+export { SystemClock } from "./durable/clock.js"
+export type { Clock } from "./durable/clock.js"
+export type { ExecutorRecord, NewEvent, NewTask, Storage, StorageReader, TaskPatch } from "./durable/storage.js"

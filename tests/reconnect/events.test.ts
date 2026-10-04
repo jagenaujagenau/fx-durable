@@ -1,8 +1,8 @@
 import { Effect, Fiber, Stream } from "effect"
 import { describe, expect, it } from "vitest"
-import { EventLog } from "../../src/core/events.js"
+import { EventLog } from "../../src/runtime/events.js"
 import type { DurableEvent } from "../../src/index.js"
-import { JournalService } from "../../src/core/journal-service.js"
+import { Database } from "../../src/runtime/database.js"
 import { eventRuntime, openFx, tempDb } from "../helpers.js"
 
 const take = async (iterable: AsyncIterable<DurableEvent>, n: number) => {
@@ -20,12 +20,12 @@ describe("reconnect from an event cursor", () => {
     const result = await j.run(
       Effect.gen(function* () {
         const log = yield* EventLog
-        const journal = yield* JournalService
-        for (let i = 0; i < 10; i++) journal.appendEvent({ agentId: "a", type: "agent.idle", payload: { i } })
+        const database = yield* Database
+        for (let i = 0; i < 10; i++) yield* database.run((journal) => journal.appendEvent({ agentId: "a", type: "agent.idle", payload: { i } }))
         // Attach after seq 4, then keep appending concurrently.
         const producer = Effect.gen(function* () {
           for (let i = 10; i < 30; i++) {
-            journal.appendEvent({ agentId: "a", type: "agent.idle", payload: { i } })
+            yield* database.run((journal) => journal.appendEvent({ agentId: "a", type: "agent.idle", payload: { i } }))
             yield* Effect.yieldNow
           }
         })
@@ -43,7 +43,7 @@ describe("reconnect from an event cursor", () => {
     const result = await j.run(
       Effect.gen(function* () {
         const log = yield* EventLog
-        const journal = yield* JournalService
+        const database = yield* Database
         const total = 3000 // more than the live channel's capacity
         const fiber = yield* Effect.forkChild(
           log.subscribe("a", { pollInterval: 50 }).pipe(
@@ -54,7 +54,7 @@ describe("reconnect from an event cursor", () => {
         )
         yield* Effect.sleep(10)
         for (let i = 0; i < total; i++) {
-          journal.appendEvent({ agentId: "a", type: "agent.idle" })
+          yield* database.run((journal) => journal.appendEvent({ agentId: "a", type: "agent.idle" }))
           if (i % 100 === 0) yield* Effect.yieldNow
         }
         const collected = yield* Fiber.join(fiber)

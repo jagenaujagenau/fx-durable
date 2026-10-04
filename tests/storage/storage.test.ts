@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite"
 import { describe, expect, it } from "vitest"
-import { InvalidTransitionError, StorageError } from "../../src/core/errors.js"
-import { decodePayloadSync, encodePayload } from "../../src/core/schema.js"
+import { InvalidTransitionError, StorageError } from "../../src/domain/errors.js"
+import { decodePayloadSync, encodePayload } from "../../src/domain/schema.js"
 import { openTestJournal, tempDb } from "../helpers.js"
 
 const agent = (id: string) => ({

@@ -2,8 +2,8 @@ import { Context, Effect, Layer } from "effect"
 import type { McpClient } from "libfx/mcp"
 import type { DurableTool } from "../tools/define-tool.js"
 import type { ReplayPolicy } from "../tools/replay-policy.js"
-import { RuntimeConfigurationError } from "./errors.js"
-import type { DurableAgentRecord } from "./schema.js"
+import { RuntimeConfigurationError } from "../domain/errors.js"
+import type { DurableAgentRecord } from "../domain/schema.js"
 
 /**
  * A checkpoint cannot serialize executable TypeScript, so agents persist a

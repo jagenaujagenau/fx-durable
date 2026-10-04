@@ -1,16 +1,17 @@
 import { Cause, Effect, Exit, Layer, ManagedRuntime, Option, Stream } from "effect"
-import * as Sqlite from "../sqlite/storage.js"
-import * as Executor from "../tools/executor.js"
-import * as Registry from "../tools/registry.js"
-import { AgentSupervisor, layer as supervisorLayer } from "./agent.js"
+import type * as Sqlite from "../durable/sqlite/storage.js"
+import * as Executor from "./tool-executor.js"
+import * as Registry from "./tool-registry.js"
+import { AgentSupervisor, layer as supervisorLayer } from "./supervisor.js"
 import { CrashInjector, type CrashPlan } from "./crash.js"
-import { NotFoundError, SubmissionError } from "./errors.js"
+import { NotFoundError, SubmissionError } from "../domain/errors.js"
 import { EventLog, layer as eventLogLayer } from "./events.js"
 import { IdGenerator } from "./ids.js"
-import { JournalService, db, journalLayer, read } from "./journal-service.js"
+import { Database, databaseLayer } from "./database.js"
+import type { Clock } from "../durable/clock.js"
 import * as LibFxModule from "./libfx.js"
 import { RecoveryManager, layer as recoveryLayer, type RecoveryReport } from "./recovery.js"
-import { RuntimeRegistry, type RuntimeDefinition } from "./runtime.js"
+import { RuntimeRegistry, type RuntimeDefinition } from "./runtime-registry.js"
 import {
   SubmissionContent,
   decodeWith,
@@ -20,9 +21,9 @@ import {
   type SubmissionResult,
   type TaskRecord,
   type TurnRecord
-} from "./schema.js"
-import type { Storage } from "./storage.js"
-import type { Transport } from "./transport.js"
+} from "../domain/schema.js"
+import type { Storage } from "../durable/storage.js"
+import type { Transport } from "../domain/transport.js"
 
 /**
  * Promise/AsyncIterable façade over the Effect-native runtime, so adopting
@@ -70,22 +71,19 @@ export interface EventsOptions {
 
 const TERMINAL_EVENTS = new Set(["submission.completed", "submission.failed", "submission.cancelled"])
 
-type Services = JournalService | EventLog | IdGenerator | RuntimeRegistry | AgentSupervisor | RecoveryManager | CrashInjector
+type Services = Database | EventLog | IdGenerator | RuntimeRegistry | AgentSupervisor | RecoveryManager | CrashInjector
 
 const decodeContent = decodeWith(SubmissionContent, "submission content")
 
 /** Effect-native overrides, available from `fx-durable/effect`. */
 export interface DurableFxLayers {
   readonly ids?: Layer.Layer<IdGenerator>
+  /** The journal's clock (defaults to the system clock). */
+  readonly clock?: Clock
 }
-
-const isSqliteConfig = (storage: Sqlite.SqliteStorageConfig | Storage): storage is Sqlite.SqliteStorageConfig =>
-  "_tag" in storage && storage._tag === "SqliteStorageConfig"
 
 /** The complete fx-durable service graph as one Effect `Layer`. */
 export const buildLayer = (options: DurableFxOptions, layers: DurableFxLayers = {}) => {
-  const configured = options.storage
-  const openStorage = isSqliteConfig(configured) ? () => Sqlite.openSqliteStorage(configured.options) : () => configured
   const crash =
     options.crash === "off"
       ? CrashInjector.noop
@@ -99,7 +97,7 @@ export const buildLayer = (options: DurableFxOptions, layers: DurableFxLayers = 
           })
   const ids = layers.ids ?? IdGenerator.layer
   const base = Layer.mergeAll(
-    journalLayer(openStorage).pipe(Layer.provideMerge(ids)),
+    databaseLayer(options.storage, layers.clock).pipe(Layer.provideMerge(ids)),
     crash,
     RuntimeRegistry.layer(options.runtimes ?? {}),
     Registry.layer,
@@ -189,44 +187,11 @@ export class DurableFx {
   async agent(id: string, options: AgentOptions): Promise<DurableAgent> {
     await this.run(
       Effect.gen(function* () {
-        const journal = yield* JournalService
-        const storage = journal.storage
+        const database = yield* Database
         const registry = yield* RuntimeRegistry
         const supervisor = yield* AgentSupervisor
         yield* registry.resolve(options.runtime)
-        yield* db(() =>
-          journal.transaction(() => {
-            const existing = storage.getAgent(id)
-            const at = journal.now()
-            if (!existing) {
-              storage.insertAgent({
-                id,
-                runtimeId: options.runtime,
-                model: options.model,
-                cwd: options.cwd ?? null,
-                state: "idle",
-                stateReason: null,
-                createdAt: at,
-                updatedAt: at
-              })
-              journal.appendEvent({
-                agentId: id,
-                type: "agent.created",
-                payload: { runtime: options.runtime, model: options.model, cwd: options.cwd ?? null }
-              })
-              return
-            }
-            const cwd = options.cwd === undefined ? existing.cwd : options.cwd
-            if (existing.runtimeId !== options.runtime || existing.model !== options.model || existing.cwd !== cwd) {
-              storage.updateAgent(id, { runtimeId: options.runtime, model: options.model, cwd }, at)
-              journal.appendEvent({
-                agentId: id,
-                type: "agent.updated",
-                payload: { runtime: options.runtime, model: options.model, cwd }
-              })
-            }
-          })
-        )
+        yield* database.run((journal) => journal.upsertAgent(id, options))
         yield* supervisor.ensureWorker(id)
       })
     )
@@ -237,8 +202,8 @@ export class DurableFx {
   async attach(id: string): Promise<DurableAgent> {
     await this.run(
       Effect.gen(function* () {
-        const storage = (yield* JournalService).storage
-        const agent = yield* db(() => storage.getAgent(id))
+        const database = yield* Database
+        const agent = yield* database.read((storage) => storage.getAgent(id))
         if (!agent) return yield* new NotFoundError({ entity: "agent", id })
       })
     )
@@ -246,7 +211,7 @@ export class DurableFx {
   }
 
   listAgents(): Promise<ReadonlyArray<DurableAgentRecord>> {
-    return this.run(Effect.flatMap(JournalService, (journal) => read(() => journal.storage.listAgents())))
+    return this.run(Effect.flatMap(Database, (database) => database.read((storage) => storage.listAgents())))
   }
 
   /** Stop executing. In-flight turns are left interrupted and recover on the next open. */
@@ -270,44 +235,15 @@ export class DurableAgent {
     const { record, created } = await runOn(
       this.fx,
       Effect.gen(function* () {
-        const journal = yield* JournalService
-        const storage = journal.storage
+        const database = yield* Database
         const supervisor = yield* AgentSupervisor
         const crash = yield* CrashInjector
         const decoded = yield* decodeContent(content)
-        const insert = () =>
-          journal.transaction(() => {
-            if (requestId !== null) {
-              const existing = storage.findSubmissionByRequest(agentId, requestId)
-              if (existing) return { record: existing, created: false }
-            }
-            const at = journal.now()
-            const record: SubmissionRecord = {
-              id: journal.nextId("sub"),
-              agentId,
-              requestId,
-              content: decoded,
-              state: "queued",
-              result: null,
-              error: null,
-              cancelRequested: false,
-              createdAt: at,
-              updatedAt: at
-            }
-            storage.insertSubmission(record)
-            journal.appendEvent({
-              agentId,
-              submissionId: record.id,
-              type: "submission.created",
-              payload: { requestId, content: decoded }
-            })
-            return { record, created: true }
-          })
-        const result = yield* db(insert).pipe(
+        const result = yield* database.run((journal) => journal.submit(agentId, requestId, decoded)).pipe(
           // Another process may have won the UNIQUE(agent_id, request_id) race.
           Effect.catchTag("StorageError", (error) =>
             requestId !== null && /UNIQUE/i.test(error.message)
-              ? Effect.flatMap(db(() => storage.findSubmissionByRequest(agentId, requestId)), (existing) =>
+              ? Effect.flatMap(database.read((storage) => storage.findSubmissionByRequest(agentId, requestId)), (existing) =>
                   existing ? Effect.succeed({ record: existing, created: false }) : Effect.fail(error)
                 )
               : Effect.fail(error)
@@ -343,8 +279,8 @@ export class DurableAgent {
     return runOn(
       this.fx,
       Effect.gen(function* () {
-        const storage = (yield* JournalService).storage
-        const agent = yield* db(() => storage.getAgent(id))
+        const database = yield* Database
+        const agent = yield* database.read((storage) => storage.getAgent(id))
         if (!agent) return yield* new NotFoundError({ entity: "agent", id })
         return agent
       })
@@ -352,7 +288,7 @@ export class DurableAgent {
   }
 
   submissions(limit = 20): Promise<ReadonlyArray<SubmissionRecord>> {
-    return runOn(this.fx, Effect.flatMap(JournalService, (journal) => read(() => journal.storage.listSubmissions(this.id, limit))))
+    return runOn(this.fx, Effect.flatMap(Database, (database) => database.read((storage) => storage.listSubmissions(this.id, limit))))
   }
 
   /** Current turn and its task journal, if any. */
@@ -361,10 +297,10 @@ export class DurableAgent {
     return runOn(
       this.fx,
       Effect.gen(function* () {
-        const storage = (yield* JournalService).storage
-        const turn = yield* db(() => storage.activeTurn(id))
+        const database = yield* Database
+        const turn = yield* database.read((storage) => storage.activeTurn(id))
         if (!turn) return null
-        return { turn, tasks: yield* db(() => storage.tasksForTurn(turn.id)) }
+        return { turn, tasks: yield* database.read((storage) => storage.tasksForTurn(turn.id)) }
       })
     )
   }
@@ -385,8 +321,8 @@ export class Submission {
     return runOn(
       this.fx,
       Effect.gen(function* () {
-        const storage = (yield* JournalService).storage
-        const record = yield* db(() => storage.getSubmission(id))
+        const database = yield* Database
+        const record = yield* database.read((storage) => storage.getSubmission(id))
         if (!record) return yield* new NotFoundError({ entity: "submission", id })
         return record
       })
@@ -417,11 +353,11 @@ export class Submission {
     return runOn(
       this.fx,
       Effect.gen(function* () {
-        const storage = (yield* JournalService).storage
+        const database = yield* Database
         const log = yield* EventLog
         const settled = (record: SubmissionRecord | null) =>
           record !== null && (record.state === "completed" || record.state === "failed" || record.state === "cancelled")
-        let record = yield* db(() => storage.getSubmission(id))
+        let record = yield* database.read((storage) => storage.getSubmission(id))
         if (!record) return yield* new NotFoundError({ entity: "submission", id })
         if (!settled(record)) {
           yield* log.subscribe(agentId).pipe(
@@ -429,7 +365,7 @@ export class Submission {
             Stream.runHead,
             Effect.map(Option.getOrUndefined)
           )
-          record = yield* db(() => storage.getSubmission(id))
+          record = yield* database.read((storage) => storage.getSubmission(id))
         }
         if (record?.state === "completed" && record.result) return record.result
         return yield* new SubmissionError({

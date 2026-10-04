@@ -35,8 +35,8 @@
       "default": "./dist/index.js"
     },
     "./sqlite": {
-      "types": "./dist/sqlite/index.d.ts",
-      "default": "./dist/sqlite/index.js"
+      "types": "./dist/durable/sqlite/index.d.ts",
+      "default": "./dist/durable/sqlite/index.js"
     },
     "./testing": {
       "types": "./dist/testing/index.d.ts",

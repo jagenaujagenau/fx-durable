@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
-import { Journal } from "../core/journal.js"
-import { openSqliteStorage } from "../sqlite/storage.js"
+import { Journal } from "../durable/journal.js"
+import { openSqliteStorage } from "../durable/sqlite/storage.js"
 
 /**
  * The CLI is an observer/controller of the same durable state, not a

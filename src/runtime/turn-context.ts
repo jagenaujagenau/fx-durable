@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { canonicalJson, type Json } from "./json.js"
+import { canonicalJson, type Json } from "../domain/json.js"
 
 /**
  * Ephemeral, in-process bookkeeping for one attempt of a turn. Everything

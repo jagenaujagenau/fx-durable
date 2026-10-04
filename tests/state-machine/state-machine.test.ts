@@ -5,7 +5,7 @@ import {
   assertTaskTransition,
   assertTurnTransition,
   TaskTransitions
-} from "../../src/core/state-machine.js"
+} from "../../src/domain/state-machine.js"
 import { recoveryActionFor } from "../../src/tools/replay-policy.js"
 
 describe("task state machine", () => {

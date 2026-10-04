@@ -1,6 +1,6 @@
 import { Schema } from "effect"
-import { isJsonString, jsonText, type JsonObject } from "../core/json.js"
-import type { Transport } from "../core/transport.js"
+import { isJsonString, jsonText, type JsonObject } from "../domain/json.js"
+import type { Transport } from "../domain/transport.js"
 
 /**
  * A scripted language model that speaks the AI Gateway streaming protocol

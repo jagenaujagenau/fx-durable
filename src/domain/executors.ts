@@ -1,6 +1,6 @@
 import { hostname } from "node:os"
 import type { UnknownOutcomeReason } from "./schema.js"
-import type { ExecutorRecord } from "./storage.js"
+import type { ExecutorRecord } from "../durable/storage.js"
 
 /** Executor liveness: decides whether a running turn's owning process is gone. */
 

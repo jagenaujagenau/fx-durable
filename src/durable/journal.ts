@@ -1,11 +1,15 @@
-import { NotFoundError } from "./errors.js"
-import { executorGone, lostReason } from "./executors.js"
-import type { Json, JsonObject } from "./json.js"
+import { InterruptedError, NotFoundError } from "../domain/errors.js"
+import type { AppendEvent } from "../domain/events.js"
+import { SystemClock, type Clock } from "./clock.js"
+import { executorGone, lostReason } from "../domain/executors.js"
+import type { Json } from "../domain/json.js"
 import type {
   AgentCheckpoint,
   AgentState,
+  DurableAgentRecord,
   DurableEvent,
   ReplayPolicyName,
+  SubmissionContent,
   SubmissionRecord,
   SubmissionResult,
   SubmissionState,
@@ -15,13 +19,13 @@ import type {
   TurnRecord,
   TurnState,
   UnknownOutcomeReason
-} from "./schema.js"
+} from "../domain/schema.js"
 import {
   assertAgentTransition,
   assertSubmissionTransition,
   assertTaskTransition,
   assertTurnTransition
-} from "./state-machine.js"
+} from "../domain/state-machine.js"
 import type { Storage, TaskPatch } from "./storage.js"
 import { recoveryActionFor } from "../tools/replay-policy.js"
 
@@ -38,53 +42,8 @@ import { recoveryActionFor } from "../tools/replay-policy.js"
  * Committed events are delivered to `onCommitted` listeners after commit.
  */
 
-export const EVENT_TYPES = [
-  "agent.created",
-  "agent.updated",
-  "agent.idle",
-  "agent.configuration_error",
-  "agent.needs_input",
-  "submission.created",
-  "submission.started",
-  "submission.completed",
-  "submission.failed",
-  "submission.cancelled",
-  "submission.needs_input",
-  "turn.started",
-  "turn.completed",
-  "turn.failed",
-  "turn.cancelled",
-  "turn.interrupted",
-  "turn.recovered",
-  "model.started",
-  "model.completed",
-  "model.failed",
-  "model.interrupted",
-  "tool.started",
-  "tool.completed",
-  "tool.failed",
-  "tool.cancelled",
-  "tool.interrupted",
-  "tool.replayed",
-  "tool.reused",
-  "tool.outcome_unknown",
-  "tool.outcome_unknown_refused",
-  "checkpoint.created",
-  "recovery.started",
-  "recovery.completed",
-  "recovery.failed"
-] as const
-
-export type EventType = (typeof EVENT_TYPES)[number]
-
-export interface AppendEvent {
-  readonly agentId: string
-  readonly type: EventType
-  readonly submissionId?: string | null
-  readonly turnId?: string | null
-  readonly taskId?: string | null
-  readonly payload?: JsonObject
-}
+export { EVENT_TYPES } from "../domain/events.js"
+export type { AppendEvent, EventType } from "../domain/events.js"
 
 /** An event attached to a transition; the journal fills in the owning ids. */
 export type TransitionEvent = Omit<AppendEvent, "agentId"> | null
@@ -120,7 +79,39 @@ export interface WriteCheckpoint {
 export interface JournalOptions {
   readonly storage: Storage
   readonly nextId: (prefix: string) => string
-  readonly now?: () => Date
+  readonly clock?: Clock
+}
+
+export interface AgentConfig {
+  readonly runtime: string
+  readonly model: string
+  /** `undefined` keeps the stored cwd. */
+  readonly cwd?: string | null
+}
+
+export interface ModelCall {
+  readonly agentId: string
+  readonly submissionId: string
+  readonly turnId: string
+  readonly attempt: number
+  readonly model: string
+}
+
+export interface ModelSummary {
+  readonly text: string
+  readonly toolCalls: ReadonlyArray<string>
+  readonly finishReason: string | null
+  readonly inputTokens: number | null
+  readonly outputTokens: number | null
+  readonly durationMs: number
+}
+
+export interface TurnCompletion {
+  readonly turn: TurnRecord
+  readonly agent: DurableAgentRecord
+  readonly checkpointTaskId: string
+  readonly checkpoint: Uint8Array
+  readonly result: SubmissionResult
 }
 
 const isTerminal = (state: string) => ["completed", "failed", "cancelled", "outcome_unknown"].includes(state)
@@ -128,13 +119,17 @@ const isTerminal = (state: string) => ["completed", "failed", "cancelled", "outc
 export class Journal {
   readonly storage: Storage
   readonly nextId: (prefix: string) => string
-  readonly now: () => Date
+  readonly clock: Clock
   private readonly listeners = new Set<(event: DurableEvent) => void>()
 
   constructor(options: JournalOptions) {
     this.storage = options.storage
     this.nextId = options.nextId
-    this.now = options.now ?? (() => new Date())
+    this.clock = options.clock ?? SystemClock
+  }
+
+  now(): Date {
+    return new Date(this.clock.now())
   }
 
   transaction<A>(fn: () => A): A {
@@ -437,6 +432,326 @@ export class Journal {
         type: "turn.interrupted",
         payload: { reason, attempt: current.attempt }
       })
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // Agents and submissions
+  // -------------------------------------------------------------------------
+
+  /** Create the agent, or update its runtime/model/cwd. Stable identity: the id never changes. */
+  upsertAgent(id: string, config: AgentConfig): "created" | "updated" | "unchanged" {
+    return this.transaction(() => {
+      const existing = this.storage.getAgent(id)
+      const at = this.now()
+      if (!existing) {
+        const cwd = config.cwd ?? null
+        this.storage.insertAgent({
+          id,
+          runtimeId: config.runtime,
+          model: config.model,
+          cwd,
+          state: "idle",
+          stateReason: null,
+          createdAt: at,
+          updatedAt: at
+        })
+        this.appendEvent({ agentId: id, type: "agent.created", payload: { runtime: config.runtime, model: config.model, cwd } })
+        return "created"
+      }
+      const cwd = config.cwd === undefined ? existing.cwd : config.cwd
+      if (existing.runtimeId === config.runtime && existing.model === config.model && existing.cwd === cwd) return "unchanged"
+      this.storage.updateAgent(id, { runtimeId: config.runtime, model: config.model, cwd }, at)
+      this.appendEvent({ agentId: id, type: "agent.updated", payload: { runtime: config.runtime, model: config.model, cwd } })
+      return "updated"
+    })
+  }
+
+  /** Accept a submission, or resolve to the existing one with the same `(agent, requestId)`. */
+  submit(
+    agentId: string,
+    requestId: string | null,
+    content: SubmissionContent
+  ): { readonly record: SubmissionRecord; readonly created: boolean } {
+    return this.transaction(() => {
+      if (requestId !== null) {
+        const existing = this.storage.findSubmissionByRequest(agentId, requestId)
+        if (existing) return { record: existing, created: false }
+      }
+      const at = this.now()
+      const record: SubmissionRecord = {
+        id: this.nextId("sub"),
+        agentId,
+        requestId,
+        content,
+        state: "queued",
+        result: null,
+        error: null,
+        cancelRequested: false,
+        createdAt: at,
+        updatedAt: at
+      }
+      this.storage.insertSubmission(record)
+      this.appendEvent({ agentId, submissionId: record.id, type: "submission.created", payload: { requestId, content } })
+      return { record, created: true }
+    })
+  }
+
+  /** Record a cancellation request; a queued submission is cancelled outright. */
+  requestCancellation(submission: SubmissionRecord): void {
+    this.transaction(() => {
+      this.storage.updateSubmission(submission.id, { cancelRequested: true }, this.now())
+      if (submission.state === "queued") {
+        this.transitionSubmission(submission.id, "cancelled", { error: "cancelled" }, { type: "submission.cancelled" })
+      }
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // Executors (process liveness)
+  // -------------------------------------------------------------------------
+
+  registerExecutor(id: string, pid: number, host: string): void {
+    const at = this.now()
+    this.storage.registerExecutor({ id, pid, hostname: host, startedAt: at, heartbeatAt: at, stoppedAt: null })
+  }
+
+  heartbeatExecutor(id: string): void {
+    this.storage.heartbeatExecutor(id, this.now())
+  }
+
+  stopExecutor(id: string): void {
+    this.storage.stopExecutor(id, this.now())
+  }
+
+  // -------------------------------------------------------------------------
+  // Model calls
+  // -------------------------------------------------------------------------
+
+  /** Commit the intent of a model request. Refuses once cancellation was requested. */
+  modelStarted(call: ModelCall): string {
+    if (this.storage.getSubmission(call.submissionId)?.cancelRequested) {
+      throw new InterruptedError({ message: "model request refused: submission cancellation requested" })
+    }
+    return this.startTask({
+      turnId: call.turnId,
+      agentId: call.agentId,
+      type: "model",
+      name: call.model,
+      attempt: call.attempt,
+      replayPolicy: "safe",
+      event: { type: "model.started", submissionId: call.submissionId, payload: { model: call.model } }
+    }).id
+  }
+
+  modelCompleted(call: ModelCall, taskId: string, summary: ModelSummary): void {
+    this.transitionTask(
+      taskId,
+      "completed",
+      {
+        output: { text: summary.text, toolCalls: summary.toolCalls, finishReason: summary.finishReason },
+        metadata: { durationMs: summary.durationMs, inputTokens: summary.inputTokens, outputTokens: summary.outputTokens }
+      },
+      {
+        type: "model.completed",
+        submissionId: call.submissionId,
+        payload: {
+          model: call.model,
+          durationMs: summary.durationMs,
+          text: summary.text,
+          toolCalls: summary.toolCalls,
+          finishReason: summary.finishReason,
+          usage: { inputTokens: summary.inputTokens, outputTokens: summary.outputTokens }
+        }
+      }
+    )
+  }
+
+  /** Record a failed model request (no-op if the task already settled). */
+  modelFailed(call: ModelCall, taskId: string, error: string): void {
+    this.transaction(() => {
+      const task = this.storage.getTask(taskId)
+      if (!task || task.state !== "running") return
+      this.transitionTask(taskId, "failed", { error }, {
+        type: "model.failed",
+        submissionId: call.submissionId,
+        payload: { model: call.model, error }
+      })
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // Tool calls
+  // -------------------------------------------------------------------------
+
+  /** The first repeat of an outcome-unknown call is refused; record that it was. */
+  refuseUnknownOutcomeRepeat(task: TaskRecord, submissionId: string, input: Json): void {
+    this.transaction(() => {
+      this.storage.updateTask(task.id, { acknowledged: true })
+      this.appendEvent({
+        agentId: task.agentId,
+        submissionId,
+        turnId: task.turnId,
+        taskId: task.id,
+        type: "tool.outcome_unknown_refused",
+        payload: { tool: task.name, input }
+      })
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // Turn completion and parking
+  // -------------------------------------------------------------------------
+
+  /**
+   * Complete a turn: write the checkpoint and mark the checkpoint task, turn,
+   * and submission completed in ONE transaction, so a checkpoint never exists
+   * for an unfinished turn. `beforeCommit` runs inside the transaction (used
+   * for crash injection).
+   */
+  completeTurn(completion: TurnCompletion, beforeCommit?: () => void): AgentCheckpoint {
+    const { turn, agent, result } = completion
+    return this.transaction(() => {
+      const checkpoint = this.writeCheckpoint({
+        agentId: agent.id,
+        turnId: turn.id,
+        submissionId: turn.submissionId,
+        taskId: completion.checkpointTaskId,
+        runtimeId: agent.runtimeId,
+        model: agent.model,
+        data: completion.checkpoint,
+        expectedPrevious: turn.baseCheckpointSeq
+      })
+      beforeCommit?.()
+      this.transitionTask(completion.checkpointTaskId, "completed", { output: { sequence: checkpoint.sequence } })
+      this.closeTurnTask(turn.id, "completed")
+      this.transitionTurn(turn.id, "completed", {}, {
+        type: "turn.completed",
+        payload: { attempt: turn.attempt, stopReason: result.stopReason, usage: result.usage }
+      })
+      this.transitionSubmission(turn.submissionId, "completed", { result }, {
+        type: "submission.completed",
+        turnId: turn.id,
+        payload: { text: result.text, stopReason: result.stopReason, usage: result.usage }
+      })
+      return checkpoint
+    })
+  }
+
+  /** The agent's runtime is not registered: park the turn without discarding work. */
+  parkTurn(turn: TurnRecord, runtimeId: string, message: string): void {
+    this.transaction(() => {
+      this.interruptTurn(turn, "runtime unavailable")
+      this.transitionAgent(turn.agentId, "configuration_error", message, {
+        type: "agent.configuration_error",
+        payload: { runtimeId, error: message }
+      })
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // Recovery
+  // -------------------------------------------------------------------------
+
+  /** Step 1 of recovering a turn: the agent is recovering, the turn interrupted. */
+  beginRecovery(turn: TurnRecord, reason: UnknownOutcomeReason): void {
+    this.transaction(() => {
+      this.transitionAgent(turn.agentId, "recovering", null, {
+        type: "recovery.started",
+        turnId: turn.id,
+        submissionId: turn.submissionId,
+        payload: { attempt: turn.attempt, previousExecutor: turn.executorId }
+      })
+      if (turn.state === "running") {
+        this.transitionTurn(turn.id, "interrupted", { executorId: null }, {
+          type: "turn.interrupted",
+          payload: { reason, attempt: turn.attempt }
+        })
+      }
+    })
+  }
+
+  /** Recovery cannot proceed because the agent's runtime is not registered. */
+  recoveryParked(turn: TurnRecord, runtimeId: string): void {
+    this.transitionAgent(turn.agentId, "configuration_error", `runtime "${runtimeId}" is not registered; turn parked until it is`, {
+      type: "recovery.failed",
+      turnId: turn.id,
+      submissionId: turn.submissionId,
+      payload: { reason: "runtime_unavailable", runtimeId }
+    })
+  }
+
+  /** Stop retrying a turn that keeps crashing: fail it and ask for input. */
+  abandonRecovery(turn: TurnRecord, reason: UnknownOutcomeReason): void {
+    this.transaction(() => {
+      const message = `turn interrupted ${turn.attempt} times; giving up automatic recovery`
+      this.classifyTurnTasks(turn.id, reason)
+      this.closeTurnTask(turn.id, "failed", message)
+      this.transitionTurn(turn.id, "failed", {}, { type: "turn.failed", payload: { error: message } })
+      this.transitionSubmission(turn.submissionId, "failed", { error: message }, {
+        type: "submission.failed",
+        turnId: turn.id,
+        payload: { error: message, reason: "max_recovery_attempts" }
+      })
+      this.transitionAgent(turn.agentId, "needs_input", message, {
+        type: "agent.needs_input",
+        turnId: turn.id,
+        payload: { reason: message }
+      })
+      this.appendEvent({
+        agentId: turn.agentId,
+        turnId: turn.id,
+        submissionId: turn.submissionId,
+        type: "recovery.failed",
+        payload: { reason: "max_attempts", attempts: turn.attempt }
+      })
+    })
+  }
+
+  /** Final recovery step: hand the turn to an executor for its next attempt. */
+  resumeTurn(turn: TurnRecord, executorId: string, replayed: ReadonlyArray<string>, unknown: ReadonlyArray<string>): void {
+    this.transaction(() => {
+      this.transitionTurn(
+        turn.id,
+        "running",
+        { attempt: turn.attempt + 1, executorId },
+        { type: "turn.recovered", payload: { attempt: turn.attempt + 1, replayed, unknownOutcomes: unknown } }
+      )
+      this.transitionAgent(turn.agentId, "running", null, {
+        type: "recovery.completed",
+        turnId: turn.id,
+        submissionId: turn.submissionId,
+        payload: { attempt: turn.attempt + 1, replayed: replayed.length, unknownOutcomes: unknown.length }
+      })
+    })
+  }
+
+  /** Unfinished tasks outside any active turn (should not exist) are made explicit. */
+  settleOrphanedTasks(): ReadonlyArray<string> {
+    return this.transaction(() => {
+      const unknown: Array<string> = []
+      for (const task of this.storage.unfinishedTasks()) {
+        const turn = this.storage.getTurn(task.turnId)
+        if (!turn || turn.state === "running" || turn.state === "interrupted") continue
+        if (task.type === "tool" && task.replayPolicy !== "safe") {
+          this.markOutcomeUnknown(task, "process_terminated")
+          unknown.push(task.id)
+        } else {
+          this.transitionTask(task.id, "interrupted", { error: "orphaned" })
+        }
+      }
+      return unknown
+    })
+  }
+
+  /** An agent left `running`/`recovering` with no active turn goes back to idle. */
+  idleIfStranded(agentId: string): void {
+    this.transaction(() => {
+      const agent = this.storage.getAgent(agentId)
+      if (!agent || this.storage.activeTurn(agentId)) return
+      if (agent.state === "running" || agent.state === "recovering") {
+        this.transitionAgent(agentId, "idle", null, { type: "agent.idle" })
+      }
     })
   }
 

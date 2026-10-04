@@ -1,5 +1,5 @@
 import { Predicate } from "effect"
-import type { Json } from "../core/json.js"
+import type { Json } from "../domain/json.js"
 
 /**
  * The subset of the Standard Schema (https://standardschema.dev) and

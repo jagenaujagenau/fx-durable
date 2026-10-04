@@ -1,4 +1,4 @@
-import type { Json, JsonObject } from "./json.js"
+import type { Json, JsonObject } from "../domain/json.js"
 import type {
   AgentCheckpoint,
   AgentState,
@@ -13,7 +13,7 @@ import type {
   TaskType,
   TurnRecord,
   TurnState
-} from "./schema.js"
+} from "../domain/schema.js"
 
 /**
  * The narrow persistence boundary: plain synchronous code, no Effect runtime.
@@ -160,3 +160,25 @@ export interface Storage {
   readonly close: () => void
 }
 
+
+/** The read-only view of storage handed to runtime code through `Database.read`. */
+export type StorageReader = Pick<
+  Storage,
+  | "getAgent"
+  | "listAgents"
+  | "getSubmission"
+  | "findSubmissionByRequest"
+  | "nextQueuedSubmission"
+  | "listSubmissions"
+  | "getTurn"
+  | "activeTurn"
+  | "unfinishedTurns"
+  | "listTurns"
+  | "turnForSubmission"
+  | "getTask"
+  | "tasksForTurn"
+  | "unfinishedTasks"
+  | "latestCheckpoint"
+  | "eventsAfter"
+  | "getExecutor"
+>

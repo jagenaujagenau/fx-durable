@@ -1,15 +1,15 @@
 import { Context, Effect, Layer, PubSub, Stream } from "effect"
-import type { StorageError } from "./errors.js"
-import { JournalService, read } from "./journal-service.js"
-import type { DurableEvent } from "./schema.js"
+import type { StorageError } from "../domain/errors.js"
+import { Database } from "./database.js"
+import type { DurableEvent } from "../domain/schema.js"
 
 /**
  * Live event distribution. The database event log is authoritative and is
  * written by the journal; this service only fans committed events out to live
  * consumers and reads history back for reconnects.
  */
-export { EVENT_TYPES } from "./journal.js"
-export type { AppendEvent, EventType } from "./journal.js"
+export { EVENT_TYPES } from "../domain/events.js"
+export type { AppendEvent, EventType } from "../domain/events.js"
 
 export interface SubscribeOptions {
   /** Deliver events with `sequence > after`. Defaults to 0 (everything). */
@@ -36,11 +36,11 @@ const LIVE_CAPACITY = 1024
 export const layer = Layer.effect(
   EventLog,
   Effect.gen(function* () {
-    const journal = yield* JournalService
+    const database = yield* Database
     // Sliding: a lagging subscriber loses live messages, never blocks
     // publishers, and catches up from the durable log by detecting the gap.
     const live = yield* Effect.acquireRelease(PubSub.sliding<DurableEvent>(LIVE_CAPACITY), PubSub.shutdown)
-    const unsubscribe = journal.onCommitted((event) => {
+    const unsubscribe = database.onCommitted((event) => {
       PubSub.publishUnsafe(live, event)
     })
     yield* Effect.addFinalizer(() => Effect.sync(unsubscribe))
@@ -50,7 +50,7 @@ export const layer = Layer.effect(
         const out: Array<DurableEvent> = []
         let cursor = after
         while (true) {
-          const page = yield* read(() => journal.storage.eventsAfter(agentId, cursor, PAGE))
+          const page = yield* database.read((storage) => storage.eventsAfter(agentId, cursor, PAGE))
           out.push(...page)
           if (page.length < PAGE) return out
           cursor = page[page.length - 1]!.sequence

@@ -1,10 +1,10 @@
 import { Context, Effect, Layer, type Scope } from "effect"
-import { RuntimeConfigurationError } from "../core/errors.js"
-import type { McpClientSpec, RuntimeDefinition } from "../core/runtime.js"
-import type { DurableAgentRecord } from "../core/schema.js"
+import { RuntimeConfigurationError } from "../domain/errors.js"
+import type { McpClientSpec, RuntimeDefinition } from "./runtime-registry.js"
+import type { DurableAgentRecord } from "../domain/schema.js"
 import type { McpAdapterOptions } from "libfx/mcp"
-import { defineDurableTool, type DurableTool } from "./define-tool.js"
-import type { ReplayPolicy } from "./replay-policy.js"
+import { defineDurableTool, type DurableTool } from "../tools/define-tool.js"
+import type { ReplayPolicy } from "../tools/replay-policy.js"
 
 export interface ResolvedTools {
   readonly tools: ReadonlyArray<DurableTool>
