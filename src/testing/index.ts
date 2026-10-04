@@ -1,3 +1,7 @@
 export { scriptedModel } from "./scripted-model.js"
 export type { Script, ScriptedModelOptions, ScriptedRequest, ScriptedResponse, ScriptedToolResult } from "./scripted-model.js"
 export { crashEnv, crashPlanFromEnv, CrashInjector } from "../runtime/crash.js"
+export { storageContract } from "./storage-contract.js"
+export type { StorageContractCase } from "./storage-contract.js"
+export { manualClock } from "../durable/clock.js"
+export type { ManualClock } from "../durable/clock.js"

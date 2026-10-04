@@ -17,15 +17,32 @@ import type {
 
 /**
  * The narrow persistence boundary: plain synchronous code, no Effect runtime.
- * SQLite is the only v1 implementation, but nothing here depends on SQLite.
+ * Storage is deliberately dumb: the Journal defines meaning, Storage provides
+ * atomic persistence. SQLite is the only built-in implementation.
  *
- * Rules:
- * - every method is synchronous and throws `StorageError` on failure;
- * - `transaction(fn)` runs `fn` atomically; calls inside it join the open
- *   transaction, and nested transactions flatten into the outer one;
- * - a transaction body must be synchronous. JavaScript cannot interleave
- *   other work into it, which is exactly what makes it atomic in-process.
- *   Never perform external I/O inside one.
+ * Every method is synchronous and throws `StorageError` on failure.
+ *
+ * ## Durability contract
+ *
+ * fx-durable's correctness guarantees hold only if an implementation keeps
+ * all of these (`storageContract` in `fx-durable/testing` checks them):
+ *
+ * 1. `transaction(fn)` is atomic: all of its writes commit, or none do.
+ * 2. A transaction opened inside another joins the outer one.
+ * 3. An exception thrown inside a transaction rolls back the whole transaction,
+ *    including writes made by nested transactions.
+ * 4. A transaction body that returns a Promise is rejected (nothing commits).
+ * 5. Transaction bodies never perform external I/O. This is the caller's side
+ *    of the contract: model calls, tool execution and network requests always
+ *    happen outside transactions.
+ * 6. Reads inside a transaction observe that transaction's own writes.
+ * 7. `afterCommit` callbacks run only after the outermost commit, never after a
+ *    rollback; outside a transaction they run immediately.
+ * 8. Committed writes are durable: they survive a process crash.
+ * 9. Constraints hold: one submission per `(agentId, requestId)`, one active
+ *    (running or interrupted) turn per agent, one checkpoint per
+ *    `(agentId, sequence)`, and event sequences per agent start at 1 and have
+ *    no gaps.
  */
 
 export interface ExecutorRecord {
