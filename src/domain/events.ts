@@ -9,6 +9,7 @@ export const EVENT_TYPES = [
   "agent.needs_input",
   "submission.created",
   "submission.started",
+  "submission.cancel_requested",
   "submission.completed",
   "submission.failed",
   "submission.cancelled",

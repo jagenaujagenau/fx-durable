@@ -2,6 +2,7 @@ import { Context, Effect, Layer } from "effect"
 import { NotFoundError, StorageError } from "../domain/errors.js"
 import type { DurableEvent } from "../domain/schema.js"
 import type { Clock } from "../durable/clock.js"
+import { ExecutorRegistry } from "../durable/executor-registry.js"
 import { Journal } from "../durable/journal.js"
 import { openSqliteStorage, type SqliteStorageConfig } from "../durable/sqlite/storage.js"
 import type { Storage, StorageReader } from "../durable/storage.js"
@@ -16,6 +17,8 @@ import { IdGenerator } from "./ids.js"
  *   `NotFoundError` stay typed; anything else (an invalid state transition, a
  *   checkpoint-sequence conflict) is a defect.
  * - `read(storage => …)` performs read-only queries.
+ * - `executors(registry => …)` records process liveness, which is not domain
+ *   state and lives outside the Journal.
  * - `models` is the narrow journal surface for libfx's transport callback,
  *   which is plain Promise code outside Effect (it throws on failure).
  *
@@ -27,6 +30,8 @@ export type ModelJournal = Pick<Journal, "modelStarted" | "modelCompleted" | "mo
 export interface DatabaseInterface {
   readonly run: <A>(f: (journal: Journal) => A) => Effect.Effect<A, StorageError | NotFoundError>
   readonly read: <A>(f: (storage: StorageReader) => A) => Effect.Effect<A, StorageError>
+  /** Process liveness (not domain state): register, heartbeat, stop, and check executors. */
+  readonly executors: <A>(f: (registry: ExecutorRegistry) => A) => Effect.Effect<A, StorageError>
   readonly models: ModelJournal
   /** Listen for events after their transaction commits. Returns an unsubscribe function. */
   readonly onCommitted: (listener: (event: DurableEvent) => void) => () => void
@@ -53,9 +58,10 @@ const attemptRead = <A>(f: () => A): Effect.Effect<A, StorageError> =>
     }
   })
 
-export const makeDatabase = (journal: Journal): DatabaseInterface => ({
+export const makeDatabase = (journal: Journal, registry: ExecutorRegistry): DatabaseInterface => ({
   run: (f) => attempt(() => f(journal)),
   read: (f) => attemptRead(() => f(journal.reader)),
+  executors: (f) => attemptRead(() => f(registry)),
   models: {
     modelStarted: (call) => journal.modelStarted(call),
     modelCompleted: (call, taskId, summary) => journal.modelCompleted(call, taskId, summary),
@@ -82,6 +88,6 @@ export const databaseLayer = (config: SqliteStorageConfig | Storage, clock?: Clo
         (opened) => Effect.sync(() => opened.close())
       )
       const journal = new Journal(clock ? { storage, nextId: ids.next, clock } : { storage, nextId: ids.next })
-      return Database.of(makeDatabase(journal))
+      return Database.of(makeDatabase(journal, new ExecutorRegistry(storage, clock)))
     })
   )

@@ -193,8 +193,15 @@ const recover = (journal: Journal) => {
 const cancel = (journal: Journal, id: string) => {
   const submission = journal.reader.getSubmission(id)
   if (!submission) throw new Error(`no submission ${id}`)
-  journal.requestCancellation(submission)
-  console.log(`cancellation requested for ${id}; the owning process stops at the next task boundary`)
+  if (!journal.requestCancellation(submission)) {
+    console.log(`nothing to do: ${id} is already ${submission.state}${submission.cancelRequested ? " (cancel requested)" : ""}`)
+    return
+  }
+  console.log(
+    submission.state === "queued"
+      ? `cancelled ${id}`
+      : `cancellation requested for ${id}; the owning process stops at its next model or tool call`
+  )
 }
 
 const main = async () => {

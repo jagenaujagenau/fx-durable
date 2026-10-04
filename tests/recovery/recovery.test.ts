@@ -154,7 +154,9 @@ describe("cancellation", () => {
     const events: Array<string> = []
     for await (const e of agent.events({ follow: false })) events.push(e.type)
     expect(events).toContain("tool.cancelled")
-    expect(events).toContain("submission.cancelled")
+    // "cancel requested" and "cancelled" are distinct, ordered facts.
+    expect(events.indexOf("submission.cancel_requested")).toBeGreaterThan(-1)
+    expect(events.indexOf("submission.cancel_requested")).toBeLessThan(events.indexOf("submission.cancelled"))
     await waitFor(async () => (await agent.info()).state === "idle")
     await fx.close()
   })

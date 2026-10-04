@@ -435,8 +435,22 @@ describe("submissions", () => {
     const turn = withTurn(journal)
     const submission = storage.getSubmission(turn.submissionId)
     if (!submission) throw new Error("no submission")
-    journal.requestCancellation(submission)
+    expect(journal.requestCancellation(submission)).toBe(true)
     expect(storage.getSubmission(turn.submissionId)).toMatchObject({ state: "running", cancelRequested: true })
+    expect(eventTypes(journal).at(-1)).toBe("submission.cancel_requested")
+  })
+
+  it("cancellation requests are idempotent and ignored once settled", () => {
+    const { journal, storage } = open()
+    const turn = withTurn(journal)
+    const submission = storage.getSubmission(turn.submissionId)
+    if (!submission) throw new Error("no submission")
+    journal.requestCancellation(submission)
+    const before = events(journal).length
+    expect(journal.requestCancellation(submission)).toBe(false)
+    journal.cancelTurn(turn)
+    expect(journal.requestCancellation(submission)).toBe(false)
+    expect(eventTypes(journal).slice(before)).toEqual(["turn.cancelled", "submission.cancelled"])
   })
 
   it("upsertAgent keeps identity stable and records real changes only", () => {

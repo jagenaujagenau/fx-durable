@@ -24,7 +24,8 @@ import {
   assertAgentTransition,
   assertSubmissionTransition,
   assertTaskTransition,
-  assertTurnTransition
+  assertTurnTransition,
+  isTerminalSubmission
 } from "../domain/state-machine.js"
 import { readerOf, type Storage, type StorageReader, type TaskPatch } from "./storage.js"
 import { recoveryActionFor } from "../tools/replay-policy.js"
@@ -509,31 +510,35 @@ export class Journal {
     })
   }
 
-  /** Record a cancellation request; a queued submission is cancelled outright. */
-  requestCancellation(submission: SubmissionRecord): void {
-    this.transaction(() => {
+  /**
+   * Record a cancellation request. "Cancel requested" and "cancelled" are
+   * different facts: a queued submission is cancelled outright, but a running
+   * one only records the request (`submission.cancel_requested`). It becomes
+   * `cancelled` when execution actually stops. In the owning process that is
+   * immediate; when another process (e.g. `fxd cancel`) asks, it is at the
+   * owner's next model or tool call. An unsafe tool that was in flight is
+   * recorded as `outcome_unknown`, because it may still complete.
+   *
+   * Idempotent: a repeated request changes nothing. Returns whether this call
+   * recorded a new request.
+   */
+  requestCancellation(submission: SubmissionRecord): boolean {
+    return this.transaction(() => {
+      const current = this.#storage.getSubmission(submission.id)
+      if (!current || current.cancelRequested || isTerminalSubmission(current.state)) return false
       this.#storage.updateSubmission(submission.id, { cancelRequested: true }, this.now())
-      if (submission.state === "queued") {
+      if (current.state === "queued") {
         this.transitionSubmission(submission.id, "cancelled", { error: "cancelled" }, { type: "submission.cancelled" })
+      } else {
+        this.appendEvent({
+          agentId: current.agentId,
+          submissionId: current.id,
+          type: "submission.cancel_requested",
+          payload: { state: current.state }
+        })
       }
+      return true
     })
-  }
-
-  // -------------------------------------------------------------------------
-  // Executors (process liveness)
-  // -------------------------------------------------------------------------
-
-  registerExecutor(id: string, pid: number, host: string): void {
-    const at = this.now()
-    this.#storage.registerExecutor({ id, pid, hostname: host, startedAt: at, heartbeatAt: at, stoppedAt: null })
-  }
-
-  heartbeatExecutor(id: string): void {
-    this.#storage.heartbeatExecutor(id, this.now())
-  }
-
-  stopExecutor(id: string): void {
-    this.#storage.stopExecutor(id, this.now())
   }
 
   // -------------------------------------------------------------------------

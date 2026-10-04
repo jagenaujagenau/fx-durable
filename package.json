@@ -14,7 +14,8 @@
     "test": "vitest run",
     "demo": "node dist/cli/main.js demo",
     "fxd": "node dist/cli/main.js",
-    "lint": "oxlint"
+    "lint": "oxlint",
+    "test:live": "vitest run tests/live"
   },
   "dependencies": {
     "effect": "4.0.0",

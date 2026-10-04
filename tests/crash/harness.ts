@@ -37,7 +37,13 @@ export interface Sandbox {
   readonly dir: string
   readonly db: string
   readonly ledger: string
-  run(options?: { crash?: CrashPlan; scenario?: string; requestId?: string; env?: Record<string, string> }): RunResult
+  run(options?: {
+    crash?: CrashPlan
+    scenario?: string
+    requestId?: string
+    env?: Record<string, string>
+    timeoutMs?: number
+  }): RunResult
   ledgerEntries(): Array<LedgerEntry>
   count(effect: string): number
   query(sql: string, ...params: Array<string | number>): Array<Row>
@@ -65,7 +71,11 @@ export const sandbox = (scenario = "deploy"): Sandbox => {
       }
       if (options.crash) Object.assign(env, crashEnv(options.crash))
       Object.assign(env, options.env)
-      const child = spawnSync(process.execPath, ["--import", "tsx", FIXTURE], { env, encoding: "utf8", timeout: 60_000 })
+      const child = spawnSync(process.execPath, ["--import", "tsx", FIXTURE], {
+        env,
+        encoding: "utf8",
+        timeout: options.timeoutMs ?? 60_000
+      })
       const line = child.stdout.trim().split("\n").filter(Boolean).pop() ?? ""
       const output = Option.getOrNull(decodeOutput(line))
       return { status: child.status, signal: child.signal, stdout: child.stdout, stderr: child.stderr, output }

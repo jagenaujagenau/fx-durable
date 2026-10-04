@@ -21,8 +21,7 @@ libfx still runs the agent loop, model calls and checkpoints. fx-durable adds th
 journal in SQLite, crash recovery, replay rules for tools, stable agent identity, and an event log clients can
 reconnect to.
 
-> **libfx models agent behavior. Effect models concurrent execution. Journal models durable state. Storage provides
-> atomic persistence.**
+> **libfx decides. Effect executes. Journal transitions. Storage persists.**
 
 ## Quick Start
 
@@ -165,8 +164,13 @@ for await (const event of agent.events({ after: lastSeenSequence })) {
 await submission.cancel()
 ```
 
-A client that disconnects doesn't cancel the agent. When you cancel a submission while an unsafe tool is running, that
-call is recorded as `outcome_unknown`, because stopping it locally doesn't prove the external effect was stopped.
+A client that disconnects doesn't cancel the agent.
+
+"Cancel requested" and "cancelled" are separate facts. A queued submission is cancelled immediately. A running one
+first records `submission.cancel_requested` and becomes `cancelled` when execution actually stops. In the owning
+process that's immediate. When another process asks (`fxd cancel`), it happens at the owner's next model or tool
+call. An unsafe tool that was running is recorded as `outcome_unknown`, because stopping it locally doesn't prove
+the external effect was stopped.
 
 ## Guarantees
 
@@ -208,14 +212,17 @@ The [crash suite](tests/crash/crash-matrix.test.ts) checks each of these by kill
 ```
 
 The central invariant: **all durable state transitions are synchronous and transactional; no asynchronous operation
-may occur inside a Journal transaction.**
+may occur inside a Journal transaction.** And the rule that keeps it honest: **all durable writes are named domain
+transitions; durable reads may use a read-only view.**
 
 **The durable core is plain synchronous code.** `Storage` is a synchronous interface; the built-in implementation
 uses Node's `node:sqlite` in WAL mode with `synchronous=FULL`. A transaction is a function,
 `storage.transaction(() => { … })`. Its body must be synchronous (a Promise is rejected), so nothing can interleave
 with it, and nested transactions join the outer one. The `Journal` sits on top and holds every durable transition
 the system can make: validated state changes, the event that describes each one, checkpoints, and turn and recovery
-bookkeeping. Open `src/durable/journal.ts` to see all of them.
+bookkeeping. Open `src/durable/journal.ts` to see all of them. The Journal holds its storage privately; reads go
+through `journal.reader`, a separate object with no write methods. Executor liveness (heartbeats, which process owns
+a turn) is process metadata rather than domain state, so it lives in a small `ExecutorRegistry` beside the Journal.
 
 **Effect runs execution.** The supervisor, turn attempts, tool execution, cancellation, resource scopes and live
 event fan-out are Effect code. They reach durable state only through the `Database` service, which keeps storage
@@ -300,6 +307,17 @@ checks that:
 - every unknown outcome has its event,
 - there is one checkpoint per completed turn, and
 - event sequences have no gaps.
+
+### Against the real model
+
+`pnpm test:live` runs the crash scenarios against the real AI Gateway, the real libfx kernel and `kill -9`:
+- an unsafe deploy that happens just before the process dies,
+- a safe tool killed mid-run,
+- and conversation memory across a restart.
+
+It needs `AI_GATEWAY_API_KEY`, and `FXD_TEST_MODEL` picks the model. It asserts what fx-durable guarantees, such as
+`outcome_unknown` and no automatic replay. What the model chooses to do next is logged, not asserted. Without a key,
+the suite is skipped.
 
 You can inject crashes into your own app the same way:
 

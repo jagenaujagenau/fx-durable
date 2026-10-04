@@ -67,8 +67,8 @@ export const layer = (options: SupervisorOptions = {}) =>
       const crash = yield* CrashInjector
 
       const executorId = ids.next("exec")
-      yield* database.run((journal) => journal.registerExecutor(executorId, process.pid, hostname()))
-      yield* database.run((journal) => journal.heartbeatExecutor(executorId)).pipe(
+      yield* database.executors((registry) => registry.register(executorId, process.pid, hostname()))
+      yield* database.executors((registry) => registry.heartbeat(executorId)).pipe(
         Effect.ignore,
         Effect.repeat(Schedule.spaced(options.heartbeatMillis ?? 5000)),
         Effect.forkScoped
@@ -354,7 +354,7 @@ export const layer = (options: SupervisorOptions = {}) =>
           yield* Effect.forEach([...attempts.values()], ({ fiber }) => Fiber.interrupt(fiber), { discard: true })
           yield* FiberMap.clear(workers)
           yield* Effect.forEach([...sessions.keys()], closeSession, { discard: true })
-          yield* database.run((journal) => journal.stopExecutor(executorId)).pipe(Effect.ignore)
+          yield* database.executors((registry) => registry.stop(executorId)).pipe(Effect.ignore)
         })
 
       yield* Effect.addFinalizer(() => shutdown())

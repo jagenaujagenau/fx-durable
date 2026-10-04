@@ -43,7 +43,8 @@
                   "**/durable/journal*",
                   "**/durable/sqlite/*",
                   "**/durable/storage*",
-                  "**/durable/clock*"
+                  "**/durable/clock*",
+                  "**/durable/executor-registry*"
                 ],
                 "allowTypeImports": true,
                 "message": "Runtime code reaches durable state only through the Database service (src/runtime/database.ts). Type imports are fine."

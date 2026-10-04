@@ -17,6 +17,10 @@ const LEDGER = process.env.FXD_TEST_LEDGER!
 const SCENARIO = process.env.FXD_TEST_SCENARIO ?? "deploy"
 const REQUEST_ID = process.env.FXD_TEST_REQUEST_ID ?? "req-1"
 const CHUNK_DELAY = Number(process.env.FXD_TEST_CHUNK_DELAY ?? "0")
+// Live mode: the real AI Gateway and a real model instead of the scripted one.
+const LIVE = process.env.FXD_TEST_LIVE === "1"
+const MODEL = process.env.FXD_TEST_MODEL ?? "anthropic/claude-sonnet-4.5"
+const INSTRUCTIONS = process.env.FXD_TEST_INSTRUCTIONS ?? "You are a test agent."
 
 const record = (effect: string, detail: JsonObject = {}) =>
   appendFileSync(LEDGER, `${JSON.stringify({ effect, detail, pid: process.pid })}\n`)
@@ -115,11 +119,11 @@ const main = async () => {
   if (!script) throw new Error(`unknown scenario: ${SCENARIO}`)
   const fx = await DurableFx.open({
     storage: sqlite(DB),
-    runtimes: { coding: { tools: [readFile, runTests, deploy, checkDeploy, charge], instructions: "You are a test agent." } },
-    fetch: scriptedModel(script, { chunkDelayMs: CHUNK_DELAY }),
+    runtimes: { coding: { tools: [readFile, runTests, deploy, checkDeploy, charge], instructions: INSTRUCTIONS } },
+    fetch: LIVE ? undefined : scriptedModel(script, { chunkDelayMs: CHUNK_DELAY }),
     idlePollMillis: 200
   })
-  const agent = await fx.agent("engineer", { runtime: "coding", model: "anthropic/claude-sonnet-4.5" })
+  const agent = await fx.agent("engineer", { runtime: "coding", model: MODEL })
   const submission = await agent.submit(process.env.FXD_TEST_PROMPT ?? "Ship version abc123", {
     requestId: REQUEST_ID
   })

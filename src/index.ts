@@ -44,6 +44,7 @@ export type {
 export { openSqliteStorage, sqlite } from "./durable/sqlite/storage.js"
 export type { SqliteOptions, SqliteStorageConfig } from "./durable/sqlite/storage.js"
 export { Journal } from "./durable/journal.js"
+export { ExecutorRegistry } from "./durable/executor-registry.js"
 export type { AgentConfig, JournalOptions } from "./durable/journal.js"
 export { SystemClock } from "./durable/clock.js"
 export type { Clock } from "./durable/clock.js"

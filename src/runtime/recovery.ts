@@ -4,7 +4,7 @@ import { ToolRegistry } from "./tool-registry.js"
 import { AgentSupervisor } from "./supervisor.js"
 import { CrashInjector } from "./crash.js"
 import type { NotFoundError, StorageError } from "../domain/errors.js"
-import { executorGone, lostReason } from "../domain/executors.js"
+import { lostReason } from "../domain/executors.js"
 import { Database } from "./database.js"
 import { RuntimeRegistry } from "./runtime-registry.js"
 import type { TaskRecord, TurnRecord } from "../domain/schema.js"
@@ -61,11 +61,7 @@ export const layer = (options: RecoveryOptions = {}) =>
       const staleAfter = options.staleExecutorMillis ?? 30_000
 
       const isExecutorGone = (executorId: string | null) =>
-        database.read((storage) => {
-          if (executorId === null) return true
-          if (executorId === supervisor.executorId) return false
-          return executorGone(storage.getExecutor(executorId), new Date(), supervisor.executorId, staleAfter)
-        })
+        database.executors((registry) => registry.isGone(executorId, supervisor.executorId, staleAfter))
 
       /** Interrupted replayable tool calls with no settled replay yet. */
       const pendingReplays = (tasks: ReadonlyArray<TaskRecord>) =>
