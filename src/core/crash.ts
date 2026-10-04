@@ -33,28 +33,28 @@ export interface CrashContext {
 
 export interface CrashInjectorInterface {
   readonly hit: (point: CrashPoint | (string & {}), context?: CrashContext) => Effect.Effect<void>
+  /** The same check, synchronously, for use inside a storage transaction. */
+  readonly hitSync: (point: CrashPoint | (string & {}), context?: CrashContext) => void
 }
 
 export class CrashInjector extends Context.Service<CrashInjector, CrashInjectorInterface>()(
   "fx-durable/CrashInjector"
 ) {
   /** Production: crash points are no-ops. */
-  static readonly noop = Layer.succeed(CrashInjector, CrashInjector.of({ hit: () => Effect.void }))
+  static readonly noop = Layer.succeed(CrashInjector, CrashInjector.of({ hit: () => Effect.void, hitSync: () => undefined }))
 
   /** Fire `onCrash` when `matches` returns true for a point. */
   static readonly make = (options: CrashPlan & { readonly onCrash: (point: string) => void }) =>
     Layer.sync(CrashInjector, () => {
       const counts = new Map<string, number>()
-      return CrashInjector.of({
-        hit: (point, context) =>
-          Effect.sync(() => {
-            if (point !== options.point) return
-            if (options.name !== undefined && context?.name !== options.name) return
-            const n = (counts.get(point) ?? 0) + 1
-            counts.set(point, n)
-            if (n === (options.occurrence ?? 1)) options.onCrash(point)
-          })
-      })
+      const hitSync = (point: string, context?: CrashContext) => {
+        if (point !== options.point) return
+        if (options.name !== undefined && context?.name !== options.name) return
+        const n = (counts.get(point) ?? 0) + 1
+        counts.set(point, n)
+        if (n === (options.occurrence ?? 1)) options.onCrash(point)
+      }
+      return CrashInjector.of({ hit: (point, context) => Effect.sync(() => hitSync(point, context)), hitSync })
     })
 
   /**

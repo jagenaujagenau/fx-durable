@@ -2,13 +2,11 @@
 import { existsSync } from "node:fs"
 import { resolve } from "node:path"
 import { parseArgs } from "node:util"
-import { Effect, Option, Stream } from "effect"
-import { EventLog } from "../core/events.js"
+import { Option } from "effect"
 import { decodeModelTaskMetadata } from "../core/model.js"
-import { journalRecover } from "../core/recovery.js"
 import type { TaskRecord, TurnRecord } from "../core/schema.js"
-import { Storage } from "../core/storage.js"
-import { openJournal, type Journal } from "./journal.js"
+import type { Journal } from "../core/journal.js"
+import { openJournal } from "./journal.js"
 import { bold, cyan, dim, duration, eventLine, green, red, table, taskLabel, toolLabel, yellow } from "./render.js"
 
 const HELP = `fxd — inspect and control fx-durable agents
@@ -56,20 +54,14 @@ const requireDb = () => {
 const currentTask = (tasks: ReadonlyArray<TaskRecord>): TaskRecord | null =>
   [...tasks].reverse().find((t) => t.state === "running" && t.type !== "turn") ?? null
 
-const agents = async (journal: Journal) => {
-  const rows = await journal.run(
-    Effect.gen(function* () {
-      const storage = yield* Storage
-      const out: Array<Array<string>> = [["NAME", "STATE", "CURRENT TASK"]]
-      for (const agent of yield* storage.listAgents()) {
-        const turn = yield* storage.activeTurn(agent.id)
-        const task = turn ? currentTask(yield* storage.tasksForTurn(turn.id)) : null
-        const state = agent.state === "idle" ? agent.state : agent.state === "running" ? green(agent.state) : yellow(agent.state)
-        out.push([agent.id, state, task ? taskLabel(task) : "-"])
-      }
-      return out
-    })
-  )
+const agents = ({ storage }: Journal) => {
+  const rows: Array<Array<string>> = [["NAME", "STATE", "CURRENT TASK"]]
+  for (const agent of storage.listAgents()) {
+    const turn = storage.activeTurn(agent.id)
+    const task = turn ? currentTask(storage.tasksForTurn(turn.id)) : null
+    const state = agent.state === "idle" ? agent.state : agent.state === "running" ? green(agent.state) : yellow(agent.state)
+    rows.push([agent.id, state, task ? taskLabel(task) : "-"])
+  }
   if (rows.length === 1) console.log(dim("no agents"))
   else console.log(table(rows))
 }
@@ -98,25 +90,17 @@ const renderTurn = (turn: TurnRecord, tasks: ReadonlyArray<TaskRecord>) => {
   return [`Turn ${dim(turn.id)} attempt ${turn.attempt} ${turn.state}`, ...lines].join("\n")
 }
 
-const inspect = async (journal: Journal, id: string) => {
-  const output = await journal.run(
-    Effect.gen(function* () {
-      const storage = yield* Storage
-      const agent = yield* storage.getAgent(id)
-      if (!agent) return null
-      const turn = yield* storage.activeTurn(id)
-      const tasks = turn ? yield* storage.tasksForTurn(turn.id) : []
-      const checkpoint = yield* storage.latestCheckpoint(id)
-      const submissions = yield* storage.listSubmissions(id, 5)
-      return { agent, turn, tasks, checkpoint, submissions }
-    })
-  )
-  if (!output) {
+const inspect = ({ storage }: Journal, id: string) => {
+  const agent = storage.getAgent(id)
+  if (!agent) {
     console.error(`no agent ${id}`)
     process.exitCode = 1
     return
   }
-  const { agent, turn, tasks, checkpoint, submissions } = output
+  const turn = storage.activeTurn(id)
+  const tasks = turn ? storage.tasksForTurn(turn.id) : []
+  const checkpoint = storage.latestCheckpoint(id)
+  const submissions = storage.listSubmissions(id, 5)
   console.log(
     table([
       ["Agent", agent.id],
@@ -151,36 +135,28 @@ const inspect = async (journal: Journal, id: string) => {
   }
 }
 
-const events = async (journal: Journal, id: string) => {
-  const after = values.after ? Number(values.after) : 0
-  await journal.run(
-    Effect.gen(function* () {
-      const log = yield* EventLog
-      if (!values.follow) {
-        for (const event of yield* log.history(id, after)) console.log(eventLine(event))
-        return
-      }
-      // Followers in other processes see committed events via the durable log.
-      yield* log.subscribe(id, { after, pollInterval: 250 }).pipe(Stream.runForEach((e) => Effect.sync(() => console.log(eventLine(e)))))
-    })
-  )
+const events = async ({ storage }: Journal, id: string) => {
+  let cursor = values.after ? Number(values.after) : 0
+  // Another process writes the log; a follower simply polls it from its cursor.
+  while (true) {
+    const page = storage.eventsAfter(id, cursor, 500)
+    for (const event of page) console.log(eventLine(event))
+    cursor = page[page.length - 1]?.sequence ?? cursor
+    if (page.length === 500) continue
+    if (!values.follow) return
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
 }
 
-const trace = async (journal: Journal, id: string) => {
-  const result = await journal.run(
-    Effect.gen(function* () {
-      const storage = yield* Storage
-      const turns = yield* storage.listTurns(id, 50)
-      const turn = values.turn ? turns.find((t) => t.id === values.turn) : turns[0]
-      if (!turn) return null
-      return { turn, tasks: yield* storage.tasksForTurn(turn.id), index: turns.length - turns.indexOf(turn) }
-    })
-  )
-  if (!result) {
+const trace = ({ storage }: Journal, id: string) => {
+  const turns = storage.listTurns(id, 50)
+  const turn = values.turn ? turns.find((t) => t.id === values.turn) : turns[0]
+  if (!turn) {
     console.error(`no turns for ${id}`)
     return
   }
-  const { turn, tasks, index } = result
+  const tasks = storage.tasksForTurn(turn.id)
+  const index = turns.length - turns.indexOf(turn)
   console.log(`${bold(`TURN #${index}`)} ${dim(turn.id)} ${turn.state} ${dim(`attempts: ${turn.attempt}`)}`)
   const steps = tasks.filter((t) => t.type === "tool" || t.type === "model")
   steps.forEach((task, i) => {
@@ -201,8 +177,8 @@ const trace = async (journal: Journal, id: string) => {
   })
 }
 
-const recover = async (journal: Journal) => {
-  const classified = await journal.run(journalRecover)
+const recover = (journal: Journal) => {
+  const classified = journal.recoverJournal()
   if (classified.length === 0) {
     console.log(dim("nothing to recover: no interrupted turns owned by dead processes"))
     return
@@ -214,15 +190,9 @@ const recover = async (journal: Journal) => {
   console.log(dim("The application continues these turns on its next resume()."))
 }
 
-const cancel = async (journal: Journal, id: string) => {
-  await journal.run(
-    Effect.gen(function* () {
-      const storage = yield* Storage
-      const submission = yield* storage.getSubmission(id)
-      if (!submission) return yield* Effect.fail(new Error(`no submission ${id}`))
-      yield* storage.updateSubmission(id, { cancelRequested: true }, new Date())
-    })
-  )
+const cancel = ({ storage }: Journal, id: string) => {
+  if (!storage.getSubmission(id)) throw new Error(`no submission ${id}`)
+  storage.updateSubmission(id, { cancelRequested: true }, new Date())
   console.log(`cancellation requested for ${id}; the owning process stops at the next task boundary`)
 }
 
@@ -240,22 +210,22 @@ const main = async () => {
   try {
     switch (command) {
       case "agents":
-        await agents(journal)
+        agents(journal)
         break
       case "inspect":
-        await inspect(journal, args[0] ?? "")
+        inspect(journal, args[0] ?? "")
         break
       case "events":
         await events(journal, args[0] ?? "")
         break
       case "trace":
-        await trace(journal, args[0] ?? "")
+        trace(journal, args[0] ?? "")
         break
       case "recover":
-        await recover(journal)
+        recover(journal)
         break
       case "cancel":
-        await cancel(journal, args[0] ?? "")
+        cancel(journal, args[0] ?? "")
         break
       default:
         console.error(`unknown command: ${command}\n`)
@@ -263,7 +233,7 @@ const main = async () => {
         process.exitCode = 1
     }
   } finally {
-    await journal.close()
+    journal.storage.close()
   }
 }
 

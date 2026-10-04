@@ -1,10 +1,8 @@
 import { DatabaseSync } from "node:sqlite"
-import { Effect } from "effect"
 import { describe, expect, it } from "vitest"
-import { EventLog } from "../../src/core/events.js"
-import { Storage } from "../../src/core/storage.js"
+import { InvalidTransitionError, StorageError } from "../../src/core/errors.js"
 import { decodePayloadSync, encodePayload } from "../../src/core/schema.js"
-import { journalRuntime, tempDb } from "../helpers.js"
+import { openTestJournal, tempDb } from "../helpers.js"
 
 const agent = (id: string) => ({
   id,
@@ -17,115 +15,103 @@ const agent = (id: string) => ({
   updatedAt: new Date(1)
 })
 
-describe("SQLite storage", () => {
-  it("opens in WAL mode with migrations applied", async () => {
+const submission = (id: string) => ({
+  id,
+  agentId: "a",
+  requestId: "same",
+  content: "x",
+  state: "queued" as const,
+  result: null,
+  error: null,
+  cancelRequested: false,
+  createdAt: new Date(1),
+  updatedAt: new Date(1)
+})
+
+describe("SQLite storage (plain synchronous code)", () => {
+  it("opens in WAL mode with migrations applied", () => {
     const db = tempDb()
-    const j = journalRuntime(db)
-    await j.storage()
+    openTestJournal(db).storage.close()
     const raw = new DatabaseSync(db)
     expect(raw.prepare("PRAGMA journal_mode").get()?.journal_mode).toBe("wal")
     expect(raw.prepare("SELECT version FROM schema_migrations").all()).toEqual([{ version: 1 }])
     raw.close()
-    await j.runtime.dispose()
   })
 
-  it("transactions are atomic: a failure rolls back every write and its events", async () => {
-    const j = journalRuntime(tempDb())
-    const result = await j.run(
-      Effect.gen(function* () {
-        const storage = yield* Storage
-        const events = yield* EventLog
-        yield* storage.insertAgent(agent("a"))
-        const exit = yield* storage
-          .transaction(
-            Effect.gen(function* () {
-              yield* storage.updateAgent("a", { state: "running" }, new Date(2))
-              yield* events.append({ agentId: "a", type: "agent.updated" })
-              return yield* Effect.fail("boom" as const)
-            })
-          )
-          .pipe(Effect.exit)
-        const after = yield* storage.getAgent("a")
-        const history = yield* events.history("a")
-        return { failed: exit._tag === "Failure", state: after?.state, events: history.length }
+  it("transactions are atomic: a throw rolls back every write and its events", () => {
+    const j = openTestJournal(tempDb())
+    j.storage.insertAgent(agent("a"))
+    expect(() =>
+      j.transaction(() => {
+        j.storage.updateAgent("a", { state: "running" }, new Date(2))
+        j.appendEvent({ agentId: "a", type: "agent.updated" })
+        throw new Error("boom")
       })
-    )
-    expect(result).toEqual({ failed: true, state: "idle", events: 0 })
-    await j.runtime.dispose()
+    ).toThrow("boom")
+    expect(j.storage.getAgent("a")?.state).toBe("idle")
+    expect(j.storage.eventsAfter("a", 0, 10)).toEqual([])
+    j.storage.close()
   })
 
-  it("defects inside a transaction also roll back", async () => {
-    const j = journalRuntime(tempDb())
-    const state = await j.run(
-      Effect.gen(function* () {
-        const storage = yield* Storage
-        yield* storage.insertAgent(agent("a"))
-        yield* storage
-          .transaction(
-            Effect.gen(function* () {
-              yield* storage.updateAgent("a", { state: "running" }, new Date(2))
-              return yield* Effect.die(new Error("programmer error"))
-            })
-          )
-          .pipe(Effect.exit)
-        return (yield* storage.getAgent("a"))?.state
+  it("invalid state transitions throw and roll back", () => {
+    const j = openTestJournal(tempDb())
+    j.storage.insertAgent(agent("a"))
+    expect(() =>
+      j.transaction(() => {
+        j.storage.updateAgent("a", { stateReason: "half-written" }, new Date(2))
+        j.transitionAgent("a", "needs_input")
+        j.transitionAgent("a", "failed") // needs_input → failed is not allowed
       })
-    )
-    expect(state).toBe("idle")
-    await j.runtime.dispose()
+    ).toThrow(InvalidTransitionError)
+    expect(j.storage.getAgent("a")).toMatchObject({ state: "idle", stateReason: null })
+    j.storage.close()
   })
 
-  it("afterCommit hooks run only after a successful commit", async () => {
-    const j = journalRuntime(tempDb())
+  it("nested transactions flatten into the outer one", () => {
+    const j = openTestJournal(tempDb())
+    j.storage.insertAgent(agent("a"))
+    expect(() =>
+      j.transaction(() => {
+        j.transaction(() => j.transitionAgent("a", "running"))
+        throw new Error("outer fails")
+      })
+    ).toThrow("outer fails")
+    expect(j.storage.getAgent("a")?.state).toBe("idle")
+    j.storage.close()
+  })
+
+  it("rejects asynchronous transaction bodies", () => {
+    const j = openTestJournal(tempDb())
+    expect(() => j.transaction(async () => undefined)).toThrow(/must be synchronous/)
+    j.storage.close()
+  })
+
+  it("committed-event listeners run only after a successful commit", () => {
+    const j = openTestJournal(tempDb())
     const seen: Array<string> = []
-    await j.run(
-      Effect.gen(function* () {
-        const storage = yield* Storage
-        yield* storage.transaction(storage.afterCommit(Effect.sync(() => seen.push("committed"))))
-        yield* storage
-          .transaction(
-            Effect.gen(function* () {
-              yield* storage.afterCommit(Effect.sync(() => seen.push("rolled-back")))
-              return yield* Effect.fail("no")
-            })
-          )
-          .pipe(Effect.exit)
+    j.onCommitted((event) => seen.push(event.type))
+    j.transaction(() => j.appendEvent({ agentId: "a", type: "agent.idle" }))
+    expect(() =>
+      j.transaction(() => {
+        j.appendEvent({ agentId: "a", type: "agent.updated" })
+        throw new Error("no")
       })
-    )
-    expect(seen).toEqual(["committed"])
-    await j.runtime.dispose()
+    ).toThrow()
+    expect(seen).toEqual(["agent.idle"])
+    j.storage.close()
   })
 
-  it("enforces UNIQUE(agent_id, request_id) at the database level", async () => {
-    const j = journalRuntime(tempDb())
-    const exit = await j.run(
-      Effect.gen(function* () {
-        const storage = yield* Storage
-        yield* storage.insertAgent(agent("a"))
-        const sub = (id: string) => ({
-          id,
-          agentId: "a",
-          requestId: "same",
-          content: "x",
-          state: "queued" as const,
-          result: null,
-          error: null,
-          cancelRequested: false,
-          createdAt: new Date(1),
-          updatedAt: new Date(1)
-        })
-        yield* storage.insertSubmission(sub("s1"))
-        return yield* storage.insertSubmission(sub("s2")).pipe(Effect.exit)
-      })
-    )
-    expect(exit._tag).toBe("Failure")
-    await j.runtime.dispose()
+  it("enforces UNIQUE(agent_id, request_id) at the database level", () => {
+    const j = openTestJournal(tempDb())
+    j.storage.insertAgent(agent("a"))
+    j.storage.insertSubmission(submission("s1"))
+    expect(() => j.storage.insertSubmission(submission("s2"))).toThrow(StorageError)
+    j.storage.close()
   })
 
-  it("enforces one active turn per agent at the database level", async () => {
+  it("enforces one active turn per agent at the database level", () => {
     const db = tempDb()
-    const j = journalRuntime(db)
-    await j.storage()
+    openTestJournal(db).storage.close()
     const raw = new DatabaseSync(db)
     raw.exec("INSERT INTO agents VALUES ('a','coding','m',NULL,'idle',NULL,1,1)")
     raw.exec("INSERT INTO submissions (id, agent_id, content, state, created_at, updated_at) VALUES ('s1','a','{}','running',1,1)")
@@ -133,25 +119,17 @@ describe("SQLite storage", () => {
     expect(() => raw.exec("INSERT INTO turns (id, agent_id, submission_id, state) VALUES ('t2','a','s1','interrupted')")).toThrow(/UNIQUE/)
     raw.exec("INSERT INTO turns (id, agent_id, submission_id, state) VALUES ('t3','a','s1','completed')")
     raw.close()
-    await j.runtime.dispose()
   })
 
-  it("event sequences are per-agent and gap-free", async () => {
-    const j = journalRuntime(tempDb())
-    const seqs = await j.run(
-      Effect.gen(function* () {
-        const events = yield* EventLog
-        for (let i = 0; i < 3; i++) {
-          yield* events.append({ agentId: "a", type: "agent.idle" })
-          yield* events.append({ agentId: "b", type: "agent.idle" })
-        }
-        const a = yield* events.history("a")
-        const b = yield* events.history("b", 1)
-        return { a: a.map((e) => e.sequence), b: b.map((e) => e.sequence) }
-      })
-    )
-    expect(seqs).toEqual({ a: [1, 2, 3], b: [2, 3] })
-    await j.runtime.dispose()
+  it("event sequences are per-agent and gap-free", () => {
+    const j = openTestJournal(tempDb())
+    for (let i = 0; i < 3; i++) {
+      j.appendEvent({ agentId: "a", type: "agent.idle" })
+      j.appendEvent({ agentId: "b", type: "agent.idle" })
+    }
+    expect(j.storage.eventsAfter("a", 0, 10).map((e) => e.sequence)).toEqual([1, 2, 3])
+    expect(j.storage.eventsAfter("b", 1, 10).map((e) => e.sequence)).toEqual([2, 3])
+    j.storage.close()
   })
 })
 
@@ -168,15 +146,13 @@ describe("persisted payload envelopes", () => {
     expect(() => decodePayloadSync(JSON.stringify({ x: 1 }), "t")).toThrow(/envelope/)
   })
 
-  it("rejects persisted rows with invalid states", async () => {
+  it("rejects persisted rows with invalid states", () => {
     const db = tempDb()
-    const j = journalRuntime(db)
-    await j.storage()
+    const j = openTestJournal(db)
     const raw = new DatabaseSync(db)
     raw.exec("INSERT INTO agents VALUES ('bad','coding','m',NULL,'exploded',NULL,1,1)")
     raw.close()
-    const exit = await j.run(Effect.flatMap(Storage, (s) => s.getAgent("bad")).pipe(Effect.exit))
-    expect(exit._tag).toBe("Failure")
-    await j.runtime.dispose()
+    expect(() => j.storage.getAgent("bad")).toThrow(StorageError)
+    j.storage.close()
   })
 })

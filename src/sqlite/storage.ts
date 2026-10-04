@@ -1,7 +1,6 @@
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue, type StatementSync } from "node:sqlite"
 import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
-import { Context, Effect, Exit, Layer, Semaphore, Stream } from "effect"
 import { StorageError } from "../core/errors.js"
 import {
   AgentCheckpoint,
@@ -14,7 +13,7 @@ import {
   decodeSync,
   encodePayload
 } from "../core/schema.js"
-import { Storage, type ExecutorRecord, type StorageInterface } from "../core/storage.js"
+import type { ExecutorRecord, Storage } from "../core/storage.js"
 import { applyMigrations } from "./schema.js"
 
 export interface SqliteOptions {
@@ -25,14 +24,6 @@ export interface SqliteOptions {
    */
   readonly synchronous?: "FULL" | "NORMAL"
 }
-
-interface TxState {
-  readonly hooks: Array<Effect.Effect<void>>
-}
-
-const TxRef = Context.Reference<TxState | null>("fx-durable/sqlite/Transaction", {
-  defaultValue: () => null
-})
 
 const decodeAgent = decodeSync(DurableAgentRecord, "agent row")
 const decodeSubmission = decodeSync(SubmissionRecord, "submission row")
@@ -172,335 +163,304 @@ export const openDatabase = (options: SqliteOptions): DatabaseSync => {
   return db
 }
 
-export const makeSqliteStorage = (options: SqliteOptions): Effect.Effect<StorageInterface, StorageError> =>
-  Effect.gen(function* () {
-    const db = yield* Effect.try({
-      try: () => openDatabase(options),
-      catch: (cause) => new StorageError({ operation: "open", message: String(cause), cause })
-    })
-    const lock = Semaphore.makeUnsafe(1)
-    const statements = new Map<string, StatementSync>()
-    const stmt = (sql: string): StatementSync => {
-      let s = statements.get(sql)
-      if (!s) {
-        s = db.prepare(sql)
-        statements.set(sql, s)
+const message = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause))
+
+/** Open SQLite storage. Plain synchronous code: no Effect runtime involved. */
+export const openSqliteStorage = (options: SqliteOptions): Storage => {
+  let db: DatabaseSync
+  try {
+    db = openDatabase(options)
+  } catch (cause) {
+    throw new StorageError({ operation: "open", message: message(cause), cause })
+  }
+  const statements = new Map<string, StatementSync>()
+  const stmt = (sql: string): StatementSync => {
+    let s = statements.get(sql)
+    if (!s) {
+      s = db.prepare(sql)
+      statements.set(sql, s)
+    }
+    return s
+  }
+
+  /** Run one operation, reporting driver and decode failures as `StorageError`. */
+  const op = <A>(operation: string, f: () => A): A => {
+    try {
+      return f()
+    } catch (cause) {
+      if (cause instanceof StorageError) throw cause
+      throw new StorageError({ operation, message: message(cause), cause })
+    }
+  }
+
+  let depth = 0
+  let hooks: Array<() => void> = []
+
+  const transaction = <A>(fn: () => A): A => {
+    if (depth > 0) return fn()
+    op("begin", () => db.exec("BEGIN IMMEDIATE"))
+    depth = 1
+    hooks = []
+    let result: A
+    try {
+      result = fn()
+      if (result instanceof Promise) {
+        throw new TypeError("transaction bodies must be synchronous; got a Promise")
       }
-      return s
+      op("commit", () => db.exec("COMMIT"))
+    } catch (error) {
+      if (db.isTransaction) db.exec("ROLLBACK")
+      throw error
+    } finally {
+      depth = 0
     }
+    const committed = hooks
+    hooks = []
+    for (const hook of committed) hook()
+    return result
+  }
 
-    /** Serialize an operation unless it is already inside a transaction. */
-    const op = <A>(operation: string, f: () => A): Effect.Effect<A, StorageError> => {
-      const run = Effect.try({
-        try: f,
-        catch: (cause) =>
-          new StorageError({
-            operation,
-            message: cause instanceof Error ? cause.message : String(cause),
-            cause
-          })
-      })
-      return Effect.flatMap(TxRef, (tx) => (tx ? run : lock.withPermits(1)(run)))
-    }
+  const afterCommit = (fn: () => void): void => {
+    if (depth > 0) hooks.push(fn)
+    else fn()
+  }
 
-    const transaction = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E | StorageError, R> =>
-      Effect.flatMap(TxRef, (current) => {
-        if (current) return effect
-        const tx: TxState = { hooks: [] }
-        const body = Effect.gen(function* () {
-          yield* Effect.try({
-            try: () => db.exec("BEGIN IMMEDIATE"),
-            catch: (cause) => new StorageError({ operation: "begin", message: String(cause), cause })
-          })
-          const exit = yield* Effect.exit(Effect.provideService(effect, TxRef, tx))
-          if (Exit.isSuccess(exit)) {
-            const committed = yield* Effect.exit(
-              Effect.try({
-                try: () => db.exec("COMMIT"),
-                catch: (cause) => new StorageError({ operation: "commit", message: String(cause), cause })
-              })
-            )
-            if (Exit.isFailure(committed)) {
-              try {
-                db.exec("ROLLBACK")
-              } catch {
-                // already rolled back
-              }
-              return yield* Effect.failCause(committed.cause)
-            }
-          } else {
-            try {
-              db.exec("ROLLBACK")
-            } catch {
-              // already rolled back
-            }
-          }
-          return yield* exit
+  const all = <A>(sql: string, map: (r: Row) => A, ...params: Array<SQLInputValue>): Array<A> =>
+    stmt(sql).all(...params).map(map)
+  const one = <A>(sql: string, map: (r: Row) => A, ...params: Array<SQLInputValue>): A | null => {
+    const row = stmt(sql).get(...params)
+    return row ? map(row) : null
+  }
+
+  const service: Storage = {
+    transaction,
+    afterCommit,
+
+    getAgent: (id) => op("getAgent", () => one("SELECT * FROM agents WHERE id = ?", agentFromRow, id)),
+    listAgents: () => op("listAgents", () => all("SELECT * FROM agents ORDER BY id", agentFromRow)),
+    insertAgent: (a) =>
+      op("insertAgent", () => {
+        stmt(
+          "INSERT INTO agents (id, runtime_id, model, cwd, state, state_reason, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        ).run(a.id, a.runtimeId, a.model, a.cwd, a.state, a.stateReason, ms(a.createdAt), ms(a.updatedAt))
+      }),
+    updateAgent: (id, patch, now) =>
+      op("updateAgent", () => {
+        const [set, vals] = setClause({
+          state: patch.state,
+          state_reason: patch.stateReason,
+          runtime_id: patch.runtimeId,
+          model: patch.model,
+          cwd: patch.cwd,
+          updated_at: now.getTime()
         })
-        return Effect.uninterruptible(lock.withPermits(1)(body)).pipe(
-          Effect.tap(() => Effect.forEach(tx.hooks, (hook) => hook, { discard: true }))
-        )
-      })
+        db.prepare(`UPDATE agents SET ${set} WHERE id = ?`).run(...vals, id)
+      }),
 
-    const afterCommit = (effect: Effect.Effect<void>): Effect.Effect<void> =>
-      Effect.flatMap(TxRef, (tx) => {
-        if (tx) {
-          tx.hooks.push(effect)
-          return Effect.void
+    getSubmission: (id) =>
+      op("getSubmission", () => one("SELECT * FROM submissions WHERE id = ?", submissionFromRow, id)),
+    findSubmissionByRequest: (agentId, requestId) =>
+      op("findSubmissionByRequest", () =>
+        one("SELECT * FROM submissions WHERE agent_id = ? AND request_id = ?", submissionFromRow, agentId, requestId)
+      ),
+    nextQueuedSubmission: (agentId) =>
+      op("nextQueuedSubmission", () =>
+        one(
+          "SELECT * FROM submissions WHERE agent_id = ? AND state = 'queued' ORDER BY created_at, rowid LIMIT 1",
+          submissionFromRow,
+          agentId
+        )
+      ),
+    listSubmissions: (agentId, limit) =>
+      op("listSubmissions", () =>
+        all(
+          "SELECT * FROM submissions WHERE agent_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+          submissionFromRow,
+          agentId,
+          limit
+        )
+      ),
+    insertSubmission: (s) =>
+      op("insertSubmission", () => {
+        stmt(
+          "INSERT INTO submissions (id, agent_id, request_id, content, state, result, error, cancel_requested, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ).run(
+          s.id,
+          s.agentId,
+          s.requestId,
+          encodePayload(s.content),
+          s.state,
+          s.result === null ? null : encodePayload(s.result),
+          s.error,
+          s.cancelRequested ? 1 : 0,
+          ms(s.createdAt),
+          ms(s.updatedAt)
+        )
+      }),
+    updateSubmission: (id, patch, now) =>
+      op("updateSubmission", () => {
+        const [set, vals] = setClause({
+          state: patch.state,
+          result: patch.result === undefined ? undefined : encodePayload(patch.result),
+          error: patch.error,
+          cancel_requested: patch.cancelRequested === undefined ? undefined : patch.cancelRequested ? 1 : 0,
+          updated_at: now.getTime()
+        })
+        db.prepare(`UPDATE submissions SET ${set} WHERE id = ?`).run(...vals, id)
+      }),
+
+    getTurn: (id) => op("getTurn", () => one("SELECT * FROM turns WHERE id = ?", turnFromRow, id)),
+    activeTurn: (agentId) =>
+      op("activeTurn", () =>
+        one("SELECT * FROM turns WHERE agent_id = ? AND state IN ('running', 'interrupted')", turnFromRow, agentId)
+      ),
+    unfinishedTurns: () =>
+      op("unfinishedTurns", () =>
+        all("SELECT * FROM turns WHERE state IN ('running', 'interrupted') ORDER BY started_at, rowid", turnFromRow)
+      ),
+    listTurns: (agentId, limit) =>
+      op("listTurns", () =>
+        all("SELECT * FROM turns WHERE agent_id = ? ORDER BY started_at DESC, rowid DESC LIMIT ?", turnFromRow, agentId, limit)
+      ),
+    turnForSubmission: (submissionId) =>
+      op("turnForSubmission", () =>
+        one("SELECT * FROM turns WHERE submission_id = ? ORDER BY rowid DESC LIMIT 1", turnFromRow, submissionId)
+      ),
+    insertTurn: (t) =>
+      op("insertTurn", () => {
+        stmt(
+          "INSERT INTO turns (id, agent_id, submission_id, state, attempt, executor_id, base_checkpoint_seq, started_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ).run(
+          t.id,
+          t.agentId,
+          t.submissionId,
+          t.state,
+          t.attempt,
+          t.executorId,
+          t.baseCheckpointSeq,
+          ms(t.startedAt),
+          ms(t.completedAt)
+        )
+      }),
+    updateTurn: (id, patch) =>
+      op("updateTurn", () => {
+        const [set, vals] = setClause({
+          state: patch.state,
+          attempt: patch.attempt,
+          executor_id: patch.executorId,
+          completed_at: patch.completedAt === undefined ? undefined : ms(patch.completedAt)
+        })
+        if (set) db.prepare(`UPDATE turns SET ${set} WHERE id = ?`).run(...vals, id)
+      }),
+
+    getTask: (id) => op("getTask", () => one("SELECT * FROM tasks WHERE id = ?", taskFromRow, id)),
+    tasksForTurn: (turnId) =>
+      op("tasksForTurn", () => all("SELECT * FROM tasks WHERE turn_id = ? ORDER BY rowid", taskFromRow, turnId)),
+    unfinishedTasks: () =>
+      op("unfinishedTasks", () =>
+        all("SELECT * FROM tasks WHERE state IN ('pending', 'running') ORDER BY rowid", taskFromRow)
+      ),
+    insertTask: (t) =>
+      op("insertTask", () => {
+        stmt(
+          "INSERT INTO tasks (id, turn_id, agent_id, parent_task_id, type, state, name, input, input_hash, replay_policy, idempotency_key, attempt, metadata, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ).run(
+          t.id,
+          t.turnId,
+          t.agentId,
+          t.parentTaskId,
+          t.type,
+          t.state,
+          t.name,
+          t.input === null ? null : encodePayload(t.input),
+          t.inputHash,
+          t.replayPolicy,
+          t.idempotencyKey,
+          t.attempt,
+          t.metadata === null ? null : encodePayload(t.metadata),
+          ms(t.startedAt)
+        )
+      }),
+    updateTask: (id, patch) =>
+      op("updateTask", () => {
+        const [set, vals] = setClause({
+          state: patch.state,
+          output: patch.output === undefined ? undefined : encodePayload(patch.output),
+          error: patch.error,
+          acknowledged: patch.acknowledged === undefined ? undefined : patch.acknowledged ? 1 : 0,
+          metadata: patch.metadata === undefined ? undefined : encodePayload(patch.metadata),
+          completed_at: patch.completedAt === undefined ? undefined : ms(patch.completedAt)
+        })
+        if (set) db.prepare(`UPDATE tasks SET ${set} WHERE id = ?`).run(...vals, id)
+      }),
+
+    latestCheckpoint: (agentId) =>
+      op("latestCheckpoint", () =>
+        one(
+          "SELECT * FROM checkpoints WHERE agent_id = ? ORDER BY sequence DESC LIMIT 1",
+          checkpointFromRow,
+          agentId
+        )
+      ),
+    insertCheckpoint: (c) =>
+      op("insertCheckpoint", () => {
+        stmt(
+          "INSERT INTO checkpoints (id, agent_id, sequence, runtime_id, model, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        ).run(c.id, c.agentId, c.sequence, c.runtimeId, c.model, c.fxCheckpoint, ms(c.createdAt))
+      }),
+
+    appendEvent: (e) =>
+      op("appendEvent", () => {
+        const row = stmt("SELECT COALESCE(MAX(sequence), 0) AS seq FROM events WHERE agent_id = ?").get(e.agentId)
+        const sequence = Number(row?.seq ?? 0) + 1
+        stmt(
+          "INSERT INTO events (id, agent_id, submission_id, turn_id, task_id, sequence, type, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ).run(e.id, e.agentId, e.submissionId, e.turnId, e.taskId, sequence, e.type, encodePayload(e.payload), ms(e.createdAt))
+        return {
+          id: e.id,
+          agentId: e.agentId,
+          submissionId: e.submissionId,
+          turnId: e.turnId,
+          taskId: e.taskId,
+          sequence,
+          type: e.type,
+          payload: e.payload,
+          createdAt: e.createdAt
         }
-        return effect
-      })
-
-    const all = <A>(sql: string, map: (r: Row) => A, ...params: Array<SQLInputValue>): Array<A> =>
-      stmt(sql).all(...params).map(map)
-    const one = <A>(sql: string, map: (r: Row) => A, ...params: Array<SQLInputValue>): A | null => {
-      const row = stmt(sql).get(...params)
-      return row ? map(row) : null
-    }
-
-    const service: StorageInterface = {
-      transaction,
-      afterCommit,
-
-      getAgent: (id) => op("getAgent", () => one("SELECT * FROM agents WHERE id = ?", agentFromRow, id)),
-      listAgents: () => op("listAgents", () => all("SELECT * FROM agents ORDER BY id", agentFromRow)),
-      insertAgent: (a) =>
-        op("insertAgent", () => {
-          stmt(
-            "INSERT INTO agents (id, runtime_id, model, cwd, state, state_reason, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-          ).run(a.id, a.runtimeId, a.model, a.cwd, a.state, a.stateReason, ms(a.createdAt), ms(a.updatedAt))
-        }),
-      updateAgent: (id, patch, now) =>
-        op("updateAgent", () => {
-          const [set, vals] = setClause({
-            state: patch.state,
-            state_reason: patch.stateReason,
-            runtime_id: patch.runtimeId,
-            model: patch.model,
-            cwd: patch.cwd,
-            updated_at: now.getTime()
-          })
-          db.prepare(`UPDATE agents SET ${set} WHERE id = ?`).run(...vals, id)
-        }),
-
-      getSubmission: (id) =>
-        op("getSubmission", () => one("SELECT * FROM submissions WHERE id = ?", submissionFromRow, id)),
-      findSubmissionByRequest: (agentId, requestId) =>
-        op("findSubmissionByRequest", () =>
-          one("SELECT * FROM submissions WHERE agent_id = ? AND request_id = ?", submissionFromRow, agentId, requestId)
-        ),
-      nextQueuedSubmission: (agentId) =>
-        op("nextQueuedSubmission", () =>
-          one(
-            "SELECT * FROM submissions WHERE agent_id = ? AND state = 'queued' ORDER BY created_at, rowid LIMIT 1",
-            submissionFromRow,
-            agentId
-          )
-        ),
-      listSubmissions: (agentId, limit) =>
-        op("listSubmissions", () =>
-          all(
-            "SELECT * FROM submissions WHERE agent_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
-            submissionFromRow,
-            agentId,
-            limit
-          )
-        ),
-      insertSubmission: (s) =>
-        op("insertSubmission", () => {
-          stmt(
-            "INSERT INTO submissions (id, agent_id, request_id, content, state, result, error, cancel_requested, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-          ).run(
-            s.id,
-            s.agentId,
-            s.requestId,
-            encodePayload(s.content),
-            s.state,
-            s.result === null ? null : encodePayload(s.result),
-            s.error,
-            s.cancelRequested ? 1 : 0,
-            ms(s.createdAt),
-            ms(s.updatedAt)
-          )
-        }),
-      updateSubmission: (id, patch, now) =>
-        op("updateSubmission", () => {
-          const [set, vals] = setClause({
-            state: patch.state,
-            result: patch.result === undefined ? undefined : encodePayload(patch.result),
-            error: patch.error,
-            cancel_requested: patch.cancelRequested === undefined ? undefined : patch.cancelRequested ? 1 : 0,
-            updated_at: now.getTime()
-          })
-          db.prepare(`UPDATE submissions SET ${set} WHERE id = ?`).run(...vals, id)
-        }),
-
-      getTurn: (id) => op("getTurn", () => one("SELECT * FROM turns WHERE id = ?", turnFromRow, id)),
-      activeTurn: (agentId) =>
-        op("activeTurn", () =>
-          one("SELECT * FROM turns WHERE agent_id = ? AND state IN ('running', 'interrupted')", turnFromRow, agentId)
-        ),
-      unfinishedTurns: () =>
-        op("unfinishedTurns", () =>
-          all("SELECT * FROM turns WHERE state IN ('running', 'interrupted') ORDER BY started_at, rowid", turnFromRow)
-        ),
-      listTurns: (agentId, limit) =>
-        op("listTurns", () =>
-          all("SELECT * FROM turns WHERE agent_id = ? ORDER BY started_at DESC, rowid DESC LIMIT ?", turnFromRow, agentId, limit)
-        ),
-      turnForSubmission: (submissionId) =>
-        op("turnForSubmission", () =>
-          one("SELECT * FROM turns WHERE submission_id = ? ORDER BY rowid DESC LIMIT 1", turnFromRow, submissionId)
-        ),
-      insertTurn: (t) =>
-        op("insertTurn", () => {
-          stmt(
-            "INSERT INTO turns (id, agent_id, submission_id, state, attempt, executor_id, base_checkpoint_seq, started_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-          ).run(
-            t.id,
-            t.agentId,
-            t.submissionId,
-            t.state,
-            t.attempt,
-            t.executorId,
-            t.baseCheckpointSeq,
-            ms(t.startedAt),
-            ms(t.completedAt)
-          )
-        }),
-      updateTurn: (id, patch) =>
-        op("updateTurn", () => {
-          const [set, vals] = setClause({
-            state: patch.state,
-            attempt: patch.attempt,
-            executor_id: patch.executorId,
-            completed_at: patch.completedAt === undefined ? undefined : ms(patch.completedAt)
-          })
-          if (set) db.prepare(`UPDATE turns SET ${set} WHERE id = ?`).run(...vals, id)
-        }),
-
-      getTask: (id) => op("getTask", () => one("SELECT * FROM tasks WHERE id = ?", taskFromRow, id)),
-      tasksForTurn: (turnId) =>
-        op("tasksForTurn", () => all("SELECT * FROM tasks WHERE turn_id = ? ORDER BY rowid", taskFromRow, turnId)),
-      unfinishedTasks: () =>
-        Stream.unwrap(
-          op("unfinishedTasks", () =>
-            Stream.fromIterable(
-              all("SELECT * FROM tasks WHERE state IN ('pending', 'running') ORDER BY rowid", taskFromRow)
-            )
-          )
-        ),
-      insertTask: (t) =>
-        op("insertTask", () => {
-          stmt(
-            "INSERT INTO tasks (id, turn_id, agent_id, parent_task_id, type, state, name, input, input_hash, replay_policy, idempotency_key, attempt, metadata, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-          ).run(
-            t.id,
-            t.turnId,
-            t.agentId,
-            t.parentTaskId,
-            t.type,
-            t.state,
-            t.name,
-            t.input === null ? null : encodePayload(t.input),
-            t.inputHash,
-            t.replayPolicy,
-            t.idempotencyKey,
-            t.attempt,
-            t.metadata === null ? null : encodePayload(t.metadata),
-            ms(t.startedAt)
-          )
-        }),
-      updateTask: (id, patch) =>
-        op("updateTask", () => {
-          const [set, vals] = setClause({
-            state: patch.state,
-            output: patch.output === undefined ? undefined : encodePayload(patch.output),
-            error: patch.error,
-            acknowledged: patch.acknowledged === undefined ? undefined : patch.acknowledged ? 1 : 0,
-            metadata: patch.metadata === undefined ? undefined : encodePayload(patch.metadata),
-            completed_at: patch.completedAt === undefined ? undefined : ms(patch.completedAt)
-          })
-          if (set) db.prepare(`UPDATE tasks SET ${set} WHERE id = ?`).run(...vals, id)
-        }),
-
-      latestCheckpoint: (agentId) =>
-        op("latestCheckpoint", () =>
-          one(
-            "SELECT * FROM checkpoints WHERE agent_id = ? ORDER BY sequence DESC LIMIT 1",
-            checkpointFromRow,
-            agentId
-          )
-        ),
-      insertCheckpoint: (c) =>
-        op("insertCheckpoint", () => {
-          stmt(
-            "INSERT INTO checkpoints (id, agent_id, sequence, runtime_id, model, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-          ).run(c.id, c.agentId, c.sequence, c.runtimeId, c.model, c.fxCheckpoint, ms(c.createdAt))
-        }),
-
-      appendEvent: (e) =>
-        op("appendEvent", () => {
-          const row = stmt("SELECT COALESCE(MAX(sequence), 0) AS seq FROM events WHERE agent_id = ?").get(e.agentId)
-          const sequence = Number(row?.seq ?? 0) + 1
-          stmt(
-            "INSERT INTO events (id, agent_id, submission_id, turn_id, task_id, sequence, type, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-          ).run(e.id, e.agentId, e.submissionId, e.turnId, e.taskId, sequence, e.type, encodePayload(e.payload), ms(e.createdAt))
-          return {
-            id: e.id,
-            agentId: e.agentId,
-            submissionId: e.submissionId,
-            turnId: e.turnId,
-            taskId: e.taskId,
-            sequence,
-            type: e.type,
-            payload: e.payload,
-            createdAt: e.createdAt
-          }
-        }),
-      eventsAfter: (agentId, after, limit) =>
-        op("eventsAfter", () =>
-          all(
-            "SELECT * FROM events WHERE agent_id = ? AND sequence > ? ORDER BY sequence LIMIT ?",
-            eventFromRow,
-            agentId,
-            after,
-            limit
-          )
-        ),
-
-      registerExecutor: (x) =>
-        op("registerExecutor", () => {
-          stmt(
-            "INSERT INTO executors (id, pid, hostname, started_at, heartbeat_at, stopped_at) VALUES (?, ?, ?, ?, ?, ?)"
-          ).run(x.id, x.pid, x.hostname, ms(x.startedAt), ms(x.heartbeatAt), ms(x.stoppedAt))
-        }),
-      heartbeatExecutor: (id, now) =>
-        op("heartbeatExecutor", () => {
-          stmt("UPDATE executors SET heartbeat_at = ? WHERE id = ?").run(now.getTime(), id)
-        }),
-      stopExecutor: (id, now) =>
-        op("stopExecutor", () => {
-          stmt("UPDATE executors SET stopped_at = ? WHERE id = ?").run(now.getTime(), id)
-        }),
-      getExecutor: (id) => op("getExecutor", () => one("SELECT * FROM executors WHERE id = ?", executorFromRow, id)),
-
-      close: () =>
-        lock.withPermits(1)(
-          Effect.sync(() => {
-            if (db.isOpen) db.close()
-          })
+      }),
+    eventsAfter: (agentId, after, limit) =>
+      op("eventsAfter", () =>
+        all(
+          "SELECT * FROM events WHERE agent_id = ? AND sequence > ? ORDER BY sequence LIMIT ?",
+          eventFromRow,
+          agentId,
+          after,
+          limit
         )
-    }
-    return service
-  })
+      ),
 
-/** A scoped Storage layer backed by SQLite in WAL mode. */
-export const layer = (options: SqliteOptions): Layer.Layer<Storage, StorageError> =>
-  Layer.effect(
-    Storage,
-    Effect.acquireRelease(makeSqliteStorage(options), (storage) => storage.close())
-  )
+    registerExecutor: (x) =>
+      op("registerExecutor", () => {
+        stmt(
+          "INSERT INTO executors (id, pid, hostname, started_at, heartbeat_at, stopped_at) VALUES (?, ?, ?, ?, ?, ?)"
+        ).run(x.id, x.pid, x.hostname, ms(x.startedAt), ms(x.heartbeatAt), ms(x.stoppedAt))
+      }),
+    heartbeatExecutor: (id, now) =>
+      op("heartbeatExecutor", () => {
+        stmt("UPDATE executors SET heartbeat_at = ? WHERE id = ?").run(now.getTime(), id)
+      }),
+    stopExecutor: (id, now) =>
+      op("stopExecutor", () => {
+        stmt("UPDATE executors SET stopped_at = ? WHERE id = ?").run(now.getTime(), id)
+      }),
+    getExecutor: (id) => op("getExecutor", () => one("SELECT * FROM executors WHERE id = ?", executorFromRow, id)),
+
+    close: () => {
+      if (db.isOpen) db.close()
+    }
+  }
+  return service
+}
 
 /** Storage configuration accepted by `DurableFx.open({ storage })`. Plain data. */
 export interface SqliteStorageConfig {

@@ -22,8 +22,8 @@ export type { McpClientSpec, RuntimeDefinition } from "./core/runtime.js"
 export type { RecoveryReport } from "./core/recovery.js"
 export { CRASH_POINTS, crashPoint } from "./core/crash.js"
 export type { CrashPoint, CrashPlan } from "./core/crash.js"
-export { EVENT_TYPES } from "./core/events.js"
-export type { EventType } from "./core/events.js"
+export { EVENT_TYPES } from "./core/journal.js"
+export type { EventType } from "./core/journal.js"
 export * from "./core/errors.js"
 export type {
   AgentCheckpoint,
@@ -41,5 +41,7 @@ export type {
   TurnState,
   UnknownOutcome
 } from "./core/schema.js"
-export { sqlite } from "./sqlite/storage.js"
+export { openSqliteStorage, sqlite } from "./sqlite/storage.js"
 export type { SqliteOptions, SqliteStorageConfig } from "./sqlite/storage.js"
+export { Journal } from "./core/journal.js"
+export type { ExecutorRecord, NewEvent, NewTask, Storage, TaskPatch } from "./core/storage.js"

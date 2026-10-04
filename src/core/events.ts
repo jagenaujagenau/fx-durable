@@ -1,61 +1,15 @@
-import { Context, Effect, Layer, Option, PubSub, Stream } from "effect"
+import { Context, Effect, Layer, PubSub, Stream } from "effect"
 import type { StorageError } from "./errors.js"
-import { IdGenerator, now } from "./ids.js"
-import type { JsonObject } from "./json.js"
+import { JournalService, read } from "./journal-service.js"
 import type { DurableEvent } from "./schema.js"
-import { Storage } from "./storage.js"
 
 /**
- * Durable event taxonomy. The database event log is authoritative; the
- * in-memory PubSub only distributes committed events to live consumers.
+ * Live event distribution. The database event log is authoritative and is
+ * written by the journal; this service only fans committed events out to live
+ * consumers and reads history back for reconnects.
  */
-export const EVENT_TYPES = [
-  "agent.created",
-  "agent.updated",
-  "agent.idle",
-  "agent.configuration_error",
-  "agent.needs_input",
-  "submission.created",
-  "submission.started",
-  "submission.completed",
-  "submission.failed",
-  "submission.cancelled",
-  "submission.needs_input",
-  "turn.started",
-  "turn.completed",
-  "turn.failed",
-  "turn.cancelled",
-  "turn.interrupted",
-  "turn.recovered",
-  "model.started",
-  "model.completed",
-  "model.failed",
-  "model.interrupted",
-  "tool.started",
-  "tool.completed",
-  "tool.failed",
-  "tool.cancelled",
-  "tool.interrupted",
-  "tool.replayed",
-  "tool.reused",
-  "tool.outcome_unknown",
-  "tool.outcome_unknown_refused",
-  "checkpoint.created",
-  "recovery.started",
-  "recovery.completed",
-  "recovery.failed"
-] as const
-
-export type EventType = (typeof EVENT_TYPES)[number]
-
-export interface AppendEvent {
-  readonly agentId: string
-  readonly type: EventType
-  readonly submissionId?: string | null
-  readonly turnId?: string | null
-  readonly taskId?: string | null
-  readonly payload?: JsonObject
-}
+export { EVENT_TYPES } from "./journal.js"
+export type { AppendEvent, EventType } from "./journal.js"
 
 export interface SubscribeOptions {
   /** Deliver events with `sequence > after`. Defaults to 0 (everything). */
@@ -69,8 +23,6 @@ export interface SubscribeOptions {
 }
 
 export interface EventLogInterface {
-  /** Append an event. Must run inside the transaction of the state change it describes. */
-  readonly append: (event: AppendEvent) => Effect.Effect<DurableEvent, StorageError>
   /** Persisted events after the cursor, then live events, with no gaps and no duplicates. */
   readonly subscribe: (agentId: string, options?: SubscribeOptions) => Stream.Stream<DurableEvent, StorageError>
   readonly history: (agentId: string, after?: number) => Effect.Effect<ReadonlyArray<DurableEvent>, StorageError>
@@ -84,35 +36,21 @@ const LIVE_CAPACITY = 1024
 export const layer = Layer.effect(
   EventLog,
   Effect.gen(function* () {
-    const storage = yield* Storage
-    const ids = yield* IdGenerator
+    const journal = yield* JournalService
     // Sliding: a lagging subscriber loses live messages, never blocks
     // publishers, and catches up from the durable log by detecting the gap.
     const live = yield* Effect.acquireRelease(PubSub.sliding<DurableEvent>(LIVE_CAPACITY), PubSub.shutdown)
-
-    const append = Effect.fn("EventLog.append")(function* (event: AppendEvent) {
-      const id = yield* ids.next("evt")
-      const createdAt = yield* now
-      const persisted = yield* storage.appendEvent({
-        id,
-        agentId: event.agentId,
-        submissionId: event.submissionId ?? null,
-        turnId: event.turnId ?? null,
-        taskId: event.taskId ?? null,
-        type: event.type,
-        payload: event.payload ?? {},
-        createdAt
-      })
-      yield* storage.afterCommit(PubSub.publish(live, persisted).pipe(Effect.asVoid))
-      return persisted
+    const unsubscribe = journal.onCommitted((event) => {
+      PubSub.publishUnsafe(live, event)
     })
+    yield* Effect.addFinalizer(() => Effect.sync(unsubscribe))
 
     const history = (agentId: string, after = 0) =>
       Effect.gen(function* () {
         const out: Array<DurableEvent> = []
         let cursor = after
         while (true) {
-          const page = yield* storage.eventsAfter(agentId, cursor, PAGE)
+          const page = yield* read(() => journal.storage.eventsAfter(agentId, cursor, PAGE))
           out.push(...page)
           if (page.length < PAGE) return out
           cursor = page[page.length - 1]!.sequence
@@ -160,9 +98,6 @@ export const layer = Layer.effect(
         })
       )
 
-    return EventLog.of({ append, subscribe, history })
+    return EventLog.of({ subscribe, history })
   })
 )
-
-export const lastSequence = (events: ReadonlyArray<DurableEvent>): Option.Option<number> =>
-  events.length === 0 ? Option.none() : Option.some(events[events.length - 1]!.sequence)

@@ -1,27 +1,10 @@
-import { Effect, Layer, ManagedRuntime } from "effect"
-import { CrashInjector } from "../core/crash.js"
-import { EventLog, layer as eventLogLayer } from "../core/events.js"
-import { IdGenerator } from "../core/ids.js"
-import type { Storage } from "../core/storage.js"
-import { TaskEngine, layer as taskEngineLayer } from "../core/task.js"
-import { layer as sqliteLayer } from "../sqlite/storage.js"
+import { randomUUID } from "node:crypto"
+import { Journal } from "../core/journal.js"
+import { openSqliteStorage } from "../sqlite/storage.js"
 
 /**
  * The CLI is an observer/controller of the same durable state, not a
- * separate execution model: it opens the journal services only.
+ * separate execution model: it opens the plain synchronous journal only.
  */
-export const openJournal = (db: string) => {
-  const base = Layer.mergeAll(sqliteLayer({ path: db }), IdGenerator.layer, CrashInjector.noop)
-  const events = eventLogLayer.pipe(Layer.provideMerge(base))
-  const layer = taskEngineLayer.pipe(Layer.provideMerge(events))
-  const runtime = ManagedRuntime.make(layer)
-  return {
-    run: <A, E>(effect: Effect.Effect<A, E, Storage | EventLog | IdGenerator | TaskEngine | CrashInjector>) =>
-      runtime.runPromise(effect),
-    runtime,
-    close: () => runtime.dispose()
-  }
-}
-
-export type Journal = ReturnType<typeof openJournal>
-export { EventLog, TaskEngine }
+export const openJournal = (db: string): Journal =>
+  new Journal({ storage: openSqliteStorage({ path: db }), nextId: (prefix) => `${prefix}_${randomUUID().replaceAll("-", "")}` })

@@ -3,11 +3,11 @@ import * as Sqlite from "../sqlite/storage.js"
 import * as Executor from "../tools/executor.js"
 import * as Registry from "../tools/registry.js"
 import { AgentSupervisor, layer as supervisorLayer } from "./agent.js"
-import * as Checkpoints from "./checkpoint.js"
 import { CrashInjector, type CrashPlan } from "./crash.js"
-import { NotFoundError, SubmissionError, type StorageError } from "./errors.js"
+import { NotFoundError, SubmissionError } from "./errors.js"
 import { EventLog, layer as eventLogLayer } from "./events.js"
-import { IdGenerator, now } from "./ids.js"
+import { IdGenerator } from "./ids.js"
+import { JournalService, db, journalLayer, read } from "./journal-service.js"
 import * as LibFxModule from "./libfx.js"
 import { RecoveryManager, layer as recoveryLayer, type RecoveryReport } from "./recovery.js"
 import { RuntimeRegistry, type RuntimeDefinition } from "./runtime.js"
@@ -21,9 +21,8 @@ import {
   type TaskRecord,
   type TurnRecord
 } from "./schema.js"
-import { Storage } from "./storage.js"
+import type { Storage } from "./storage.js"
 import type { Transport } from "./transport.js"
-import * as Task from "./task.js"
 
 /**
  * Promise/AsyncIterable façade over the Effect-native runtime, so adopting
@@ -31,7 +30,11 @@ import * as Task from "./task.js"
  */
 
 export interface DurableFxOptions {
-  readonly storage: Sqlite.SqliteStorageConfig
+  /**
+   * `sqlite(path)`, or any object implementing the synchronous `Storage`
+   * interface. fx-durable closes the storage when it closes.
+   */
+  readonly storage: Sqlite.SqliteStorageConfig | Storage
   readonly runtimes?: Readonly<Record<string, RuntimeDefinition>>
   /** AI Gateway key. Defaults to `AI_GATEWAY_API_KEY`. */
   readonly apiKey?: string
@@ -67,27 +70,22 @@ export interface EventsOptions {
 
 const TERMINAL_EVENTS = new Set(["submission.completed", "submission.failed", "submission.cancelled"])
 
-type Services =
-  | Storage
-  | EventLog
-  | IdGenerator
-  | RuntimeRegistry
-  | Task.TaskEngine
-  | AgentSupervisor
-  | RecoveryManager
-  | CrashInjector
+type Services = JournalService | EventLog | IdGenerator | RuntimeRegistry | AgentSupervisor | RecoveryManager | CrashInjector
 
 const decodeContent = decodeWith(SubmissionContent, "submission content")
 
 /** Effect-native overrides, available from `fx-durable/effect`. */
 export interface DurableFxLayers {
-  readonly storage?: Layer.Layer<Storage, StorageError>
   readonly ids?: Layer.Layer<IdGenerator>
 }
 
+const isSqliteConfig = (storage: Sqlite.SqliteStorageConfig | Storage): storage is Sqlite.SqliteStorageConfig =>
+  "_tag" in storage && storage._tag === "SqliteStorageConfig"
+
 /** The complete fx-durable service graph as one Effect `Layer`. */
 export const buildLayer = (options: DurableFxOptions, layers: DurableFxLayers = {}) => {
-  const storage = layers.storage ?? Sqlite.layer(options.storage.options)
+  const configured = options.storage
+  const openStorage = isSqliteConfig(configured) ? () => Sqlite.openSqliteStorage(configured.options) : () => configured
   const crash =
     options.crash === "off"
       ? CrashInjector.noop
@@ -99,17 +97,16 @@ export const buildLayer = (options: DurableFxOptions, layers: DurableFxLayers = 
               throw new Error(`crash injected at ${point}`)
             })
           })
+  const ids = layers.ids ?? IdGenerator.layer
   const base = Layer.mergeAll(
-    storage,
-    layers.ids ?? IdGenerator.layer,
+    journalLayer(openStorage).pipe(Layer.provideMerge(ids)),
     crash,
     RuntimeRegistry.layer(options.runtimes ?? {}),
     Registry.layer,
     LibFxModule.layer({ apiKey: options.apiKey, fetch: options.fetch, backend: options.backend })
   )
   const events = eventLogLayer.pipe(Layer.provideMerge(base))
-  const engine = Task.layer.pipe(Layer.provideMerge(events))
-  const journal = Layer.mergeAll(Checkpoints.layer, Executor.layer).pipe(Layer.provideMerge(engine))
+  const journal = Executor.layer.pipe(Layer.provideMerge(events))
   const supervisor = supervisorLayer({
     heartbeatMillis: options.heartbeatMillis,
     idlePollMillis: options.idlePollMillis
@@ -192,17 +189,17 @@ export class DurableFx {
   async agent(id: string, options: AgentOptions): Promise<DurableAgent> {
     await this.run(
       Effect.gen(function* () {
-        const storage = yield* Storage
-        const events = yield* EventLog
+        const journal = yield* JournalService
+        const storage = journal.storage
         const registry = yield* RuntimeRegistry
         const supervisor = yield* AgentSupervisor
         yield* registry.resolve(options.runtime)
-        yield* storage.transaction(
-          Effect.gen(function* () {
-            const existing = yield* storage.getAgent(id)
-            const at = yield* now
+        yield* db(() =>
+          journal.transaction(() => {
+            const existing = storage.getAgent(id)
+            const at = journal.now()
             if (!existing) {
-              yield* storage.insertAgent({
+              storage.insertAgent({
                 id,
                 runtimeId: options.runtime,
                 model: options.model,
@@ -212,7 +209,7 @@ export class DurableFx {
                 createdAt: at,
                 updatedAt: at
               })
-              yield* events.append({
+              journal.appendEvent({
                 agentId: id,
                 type: "agent.created",
                 payload: { runtime: options.runtime, model: options.model, cwd: options.cwd ?? null }
@@ -221,8 +218,8 @@ export class DurableFx {
             }
             const cwd = options.cwd === undefined ? existing.cwd : options.cwd
             if (existing.runtimeId !== options.runtime || existing.model !== options.model || existing.cwd !== cwd) {
-              yield* storage.updateAgent(id, { runtimeId: options.runtime, model: options.model, cwd }, at)
-              yield* events.append({
+              storage.updateAgent(id, { runtimeId: options.runtime, model: options.model, cwd }, at)
+              journal.appendEvent({
                 agentId: id,
                 type: "agent.updated",
                 payload: { runtime: options.runtime, model: options.model, cwd }
@@ -240,8 +237,8 @@ export class DurableFx {
   async attach(id: string): Promise<DurableAgent> {
     await this.run(
       Effect.gen(function* () {
-        const storage = yield* Storage
-        const agent = yield* storage.getAgent(id)
+        const storage = (yield* JournalService).storage
+        const agent = yield* db(() => storage.getAgent(id))
         if (!agent) return yield* new NotFoundError({ entity: "agent", id })
       })
     )
@@ -249,7 +246,7 @@ export class DurableFx {
   }
 
   listAgents(): Promise<ReadonlyArray<DurableAgentRecord>> {
-    return this.run(Effect.flatMap(Storage, (s) => s.listAgents()))
+    return this.run(Effect.flatMap(JournalService, (journal) => read(() => journal.storage.listAgents())))
   }
 
   /** Stop executing. In-flight turns are left interrupted and recover on the next open. */
@@ -273,21 +270,20 @@ export class DurableAgent {
     const { record, created } = await runOn(
       this.fx,
       Effect.gen(function* () {
-        const storage = yield* Storage
-        const events = yield* EventLog
-        const ids = yield* IdGenerator
+        const journal = yield* JournalService
+        const storage = journal.storage
         const supervisor = yield* AgentSupervisor
         const crash = yield* CrashInjector
         const decoded = yield* decodeContent(content)
-        const insert = storage.transaction(
-          Effect.gen(function* () {
+        const insert = () =>
+          journal.transaction(() => {
             if (requestId !== null) {
-              const existing = yield* storage.findSubmissionByRequest(agentId, requestId)
+              const existing = storage.findSubmissionByRequest(agentId, requestId)
               if (existing) return { record: existing, created: false }
             }
-            const at = yield* now
+            const at = journal.now()
             const record: SubmissionRecord = {
-              id: yield* ids.next("sub"),
+              id: journal.nextId("sub"),
               agentId,
               requestId,
               content: decoded,
@@ -298,8 +294,8 @@ export class DurableAgent {
               createdAt: at,
               updatedAt: at
             }
-            yield* storage.insertSubmission(record)
-            yield* events.append({
+            storage.insertSubmission(record)
+            journal.appendEvent({
               agentId,
               submissionId: record.id,
               type: "submission.created",
@@ -307,12 +303,11 @@ export class DurableAgent {
             })
             return { record, created: true }
           })
-        )
-        const result = yield* insert.pipe(
+        const result = yield* db(insert).pipe(
           // Another process may have won the UNIQUE(agent_id, request_id) race.
           Effect.catchTag("StorageError", (error) =>
             requestId !== null && /UNIQUE/i.test(error.message)
-              ? Effect.flatMap(storage.findSubmissionByRequest(agentId, requestId), (existing) =>
+              ? Effect.flatMap(db(() => storage.findSubmissionByRequest(agentId, requestId)), (existing) =>
                   existing ? Effect.succeed({ record: existing, created: false }) : Effect.fail(error)
                 )
               : Effect.fail(error)
@@ -348,8 +343,8 @@ export class DurableAgent {
     return runOn(
       this.fx,
       Effect.gen(function* () {
-        const storage = yield* Storage
-        const agent = yield* storage.getAgent(id)
+        const storage = (yield* JournalService).storage
+        const agent = yield* db(() => storage.getAgent(id))
         if (!agent) return yield* new NotFoundError({ entity: "agent", id })
         return agent
       })
@@ -357,7 +352,7 @@ export class DurableAgent {
   }
 
   submissions(limit = 20): Promise<ReadonlyArray<SubmissionRecord>> {
-    return runOn(this.fx, Effect.flatMap(Storage, (s) => s.listSubmissions(this.id, limit)))
+    return runOn(this.fx, Effect.flatMap(JournalService, (journal) => read(() => journal.storage.listSubmissions(this.id, limit))))
   }
 
   /** Current turn and its task journal, if any. */
@@ -366,10 +361,10 @@ export class DurableAgent {
     return runOn(
       this.fx,
       Effect.gen(function* () {
-        const storage = yield* Storage
-        const turn = yield* storage.activeTurn(id)
+        const storage = (yield* JournalService).storage
+        const turn = yield* db(() => storage.activeTurn(id))
         if (!turn) return null
-        return { turn, tasks: yield* storage.tasksForTurn(turn.id) }
+        return { turn, tasks: yield* db(() => storage.tasksForTurn(turn.id)) }
       })
     )
   }
@@ -390,8 +385,8 @@ export class Submission {
     return runOn(
       this.fx,
       Effect.gen(function* () {
-        const storage = yield* Storage
-        const record = yield* storage.getSubmission(id)
+        const storage = (yield* JournalService).storage
+        const record = yield* db(() => storage.getSubmission(id))
         if (!record) return yield* new NotFoundError({ entity: "submission", id })
         return record
       })
@@ -422,11 +417,11 @@ export class Submission {
     return runOn(
       this.fx,
       Effect.gen(function* () {
-        const storage = yield* Storage
+        const storage = (yield* JournalService).storage
         const log = yield* EventLog
         const settled = (record: SubmissionRecord | null) =>
           record !== null && (record.state === "completed" || record.state === "failed" || record.state === "cancelled")
-        let record = yield* storage.getSubmission(id)
+        let record = yield* db(() => storage.getSubmission(id))
         if (!record) return yield* new NotFoundError({ entity: "submission", id })
         if (!settled(record)) {
           yield* log.subscribe(agentId).pipe(
@@ -434,7 +429,7 @@ export class Submission {
             Stream.runHead,
             Effect.map(Option.getOrUndefined)
           )
-          record = yield* storage.getSubmission(id)
+          record = yield* db(() => storage.getSubmission(id))
         }
         if (record?.state === "completed" && record.result) return record.result
         return yield* new SubmissionError({

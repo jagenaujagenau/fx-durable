@@ -1,9 +1,8 @@
-import { Effect, Exit, Option, Schema } from "effect"
-import { CrashInjector } from "./crash.js"
+import { Option, Schema } from "effect"
+import type { CrashInjectorInterface } from "./crash.js"
 import { InterruptedError } from "./errors.js"
 import type { Transport } from "./transport.js"
-import { Storage } from "./storage.js"
-import { TaskEngine } from "./task.js"
+import type { Journal } from "./journal.js"
 import type { TurnContext } from "./turn-context.js"
 
 /**
@@ -94,105 +93,88 @@ export interface ModelTransportHolder {
   current: TurnContext | null
 }
 
-type Services = Storage | TaskEngine | CrashInjector
-
-/** Build the journaling transport handed to libfx for one agent session. */
-export const makeDurableFetch = Effect.fnUntraced(function* (
+/**
+ * Build the journaling transport handed to libfx for one agent session.
+ * Plain code: it runs inside libfx's fetch callback and writes to the
+ * synchronous journal directly.
+ */
+export const makeDurableFetch = (
   holder: ModelTransportHolder,
-  transport: Transport
-) {
-  const context = yield* Effect.context<Services>()
-  const run = <A, E>(effect: Effect.Effect<A, E, Services>) => Effect.runPromiseWith(context)(effect)
-  const runSync = <A, E>(effect: Effect.Effect<A, E, Services>) => Effect.runSyncWith(context)(effect)
-
-  const begin = (ctx: TurnContext) =>
-    Effect.gen(function* () {
-      const storage = yield* Storage
-      const engine = yield* TaskEngine
-      const crash = yield* CrashInjector
-      const submission = yield* storage.getSubmission(ctx.submissionId)
-      if (submission?.cancelRequested) {
-        return yield* new InterruptedError({ message: "submission cancellation requested" })
-      }
-      const task = yield* engine.startTask({
-        turnId: ctx.turnId,
-        agentId: ctx.agentId,
-        type: "model",
-        name: ctx.model,
-        attempt: ctx.attempt,
-        replayPolicy: "safe",
-        event: { type: "model.started", submissionId: ctx.submissionId, payload: { model: ctx.model } }
-      })
-      yield* crash.hit("model.before-request", { name: ctx.model })
-      return task.id
+  transport: Transport,
+  journal: Journal,
+  crash: CrashInjectorInterface
+): Transport => {
+  const begin = (ctx: TurnContext): string => {
+    if (journal.storage.getSubmission(ctx.submissionId)?.cancelRequested) {
+      throw new InterruptedError({ message: "model request refused: submission cancellation requested" })
+    }
+    const task = journal.startTask({
+      turnId: ctx.turnId,
+      agentId: ctx.agentId,
+      type: "model",
+      name: ctx.model,
+      attempt: ctx.attempt,
+      replayPolicy: "safe",
+      event: { type: "model.started", submissionId: ctx.submissionId, payload: { model: ctx.model } }
     })
+    crash.hitSync("model.before-request", { name: ctx.model })
+    return task.id
+  }
 
-  const complete = (ctx: TurnContext, taskId: string, summary: StreamSummary, startedAt: number) =>
-    Effect.gen(function* () {
-      const engine = yield* TaskEngine
-      const crash = yield* CrashInjector
-      const durationMs = Date.now() - startedAt
-      yield* engine.transitionTask(
-        taskId,
-        "completed",
-        {
-          output: { text: summary.text, toolCalls: summary.toolCalls, finishReason: summary.finishReason },
-          metadata: { durationMs, inputTokens: summary.inputTokens, outputTokens: summary.outputTokens }
-        },
-        {
-          type: "model.completed",
-          submissionId: ctx.submissionId,
-          payload: {
-            model: ctx.model,
-            durationMs,
-            text: summary.text,
-            toolCalls: summary.toolCalls,
-            finishReason: summary.finishReason,
-            usage: { inputTokens: summary.inputTokens, outputTokens: summary.outputTokens }
-          }
+  const complete = (ctx: TurnContext, taskId: string, summary: StreamSummary, startedAt: number): void => {
+    const durationMs = Date.now() - startedAt
+    journal.transitionTask(
+      taskId,
+      "completed",
+      {
+        output: { text: summary.text, toolCalls: summary.toolCalls, finishReason: summary.finishReason },
+        metadata: { durationMs, inputTokens: summary.inputTokens, outputTokens: summary.outputTokens }
+      },
+      {
+        type: "model.completed",
+        submissionId: ctx.submissionId,
+        payload: {
+          model: ctx.model,
+          durationMs,
+          text: summary.text,
+          toolCalls: summary.toolCalls,
+          finishReason: summary.finishReason,
+          usage: { inputTokens: summary.inputTokens, outputTokens: summary.outputTokens }
         }
-      )
-      yield* crash.hit("model.after-response", { name: ctx.model })
-    })
+      }
+    )
+    crash.hitSync("model.after-response", { name: ctx.model })
+  }
 
-  const fail = (ctx: TurnContext, taskId: string, error: string) =>
-    Effect.gen(function* () {
-      const storage = yield* Storage
-      const engine = yield* TaskEngine
-      const task = yield* storage.getTask(taskId)
-      if (!task || task.state !== "running") return
-      yield* engine.transitionTask(
-        taskId,
-        "failed",
-        { error },
-        { type: "model.failed", submissionId: ctx.submissionId, payload: { model: ctx.model, error } }
-      )
-    })
+  const fail = (ctx: TurnContext, taskId: string, error: string): void => {
+    const task = journal.storage.getTask(taskId)
+    if (!task || task.state !== "running") return
+    journal.transitionTask(
+      taskId,
+      "failed",
+      { error },
+      { type: "model.failed", submissionId: ctx.submissionId, payload: { model: ctx.model, error } }
+    )
+  }
 
   const durableFetch: Transport = async (input, init) => {
     const ctx = holder.current
     const url = input instanceof Request ? input.url : input instanceof URL ? input.href : input
     if (!ctx || !MODEL_ENDPOINT.test(new URL(url).pathname)) return transport(input, init)
 
-    const begun = await Effect.runPromiseExitWith(context)(begin(ctx))
-    if (Exit.isFailure(begun)) throw new Error("model request refused: turn is being cancelled")
-    const taskId = begun.value
+    // Journal writes are synchronous: each is committed before the next step.
+    const taskId = begin(ctx)
     const startedAt = Date.now()
-    const track = <A>(p: Promise<A>) => {
-      ctx.inflight.add(p)
-      p.finally(() => ctx.inflight.delete(p)).catch(() => undefined)
-      return p
-    }
 
     let response: Response
     try {
       response = await transport(input, init)
     } catch (error) {
-      await track(run(fail(ctx, taskId, error instanceof Error ? error.message : String(error))))
+      fail(ctx, taskId, error instanceof Error ? error.message : String(error))
       throw error
     }
     if (!response.ok || !response.body) {
-      await track(run(fail(ctx, taskId, `HTTP ${response.status}`)))
+      fail(ctx, taskId, `HTTP ${response.status}`)
       return response
     }
 
@@ -203,14 +185,14 @@ export const makeDurableFetch = Effect.fnUntraced(function* (
         transform(chunk, controller) {
           if (first) {
             first = false
-            runSync(Effect.flatMap(CrashInjector, (crash) => crash.hit("model.during-stream", { name: ctx.model })))
+            crash.hitSync("model.during-stream", { name: ctx.model })
           }
           observer.push(chunk)
           controller.enqueue(chunk)
         },
-        async flush() {
+        flush() {
           observer.end()
-          await track(run(complete(ctx, taskId, observer.summary, startedAt)))
+          complete(ctx, taskId, observer.summary, startedAt)
         }
       })
     )
@@ -218,5 +200,5 @@ export const makeDurableFetch = Effect.fnUntraced(function* (
   }
 
   return durableFetch
-})
+}
 

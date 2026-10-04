@@ -1,5 +1,3 @@
-import { Context, type Effect, type Stream } from "effect"
-import type { StorageError } from "./errors.js"
 import type { Json, JsonObject } from "./json.js"
 import type {
   AgentCheckpoint,
@@ -18,13 +16,16 @@ import type {
 } from "./schema.js"
 
 /**
- * The narrow persistence boundary. SQLite is the only v1 implementation, but
- * nothing here depends on SQLite- or Effect-SQL-specific types.
+ * The narrow persistence boundary: plain synchronous code, no Effect runtime.
+ * SQLite is the only v1 implementation, but nothing here depends on SQLite.
  *
  * Rules:
- * - every operation is serialized with every other operation;
- * - inside `transaction`, operations join the open transaction;
- * - transactions are uninterruptible and must never contain external I/O.
+ * - every method is synchronous and throws `StorageError` on failure;
+ * - `transaction(fn)` runs `fn` atomically; calls inside it join the open
+ *   transaction, and nested transactions flatten into the outer one;
+ * - a transaction body must be synchronous. JavaScript cannot interleave
+ *   other work into it, which is exactly what makes it atomic in-process.
+ *   Never perform external I/O inside one.
  */
 
 export interface ExecutorRecord {
@@ -73,15 +74,15 @@ export interface NewEvent {
   readonly createdAt: Date
 }
 
-export interface StorageInterface {
-  readonly transaction: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E | StorageError, R>
-  /** Run `effect` after the current transaction commits (immediately when outside one). */
-  readonly afterCommit: (effect: Effect.Effect<void>) => Effect.Effect<void>
+export interface Storage {
+  readonly transaction: <A>(fn: () => A) => A
+  /** Run `fn` after the current transaction commits (immediately when outside one). */
+  readonly afterCommit: (fn: () => void) => void
 
   // agents
-  readonly getAgent: (id: string) => Effect.Effect<DurableAgentRecord | null, StorageError>
-  readonly listAgents: () => Effect.Effect<ReadonlyArray<DurableAgentRecord>, StorageError>
-  readonly insertAgent: (agent: DurableAgentRecord) => Effect.Effect<void, StorageError>
+  readonly getAgent: (id: string) => DurableAgentRecord | null
+  readonly listAgents: () => ReadonlyArray<DurableAgentRecord>
+  readonly insertAgent: (agent: DurableAgentRecord) => void
   readonly updateAgent: (
     id: string,
     patch: {
@@ -92,17 +93,17 @@ export interface StorageInterface {
       readonly cwd?: string | null
     },
     now: Date
-  ) => Effect.Effect<void, StorageError>
+  ) => void
 
   // submissions
-  readonly getSubmission: (id: string) => Effect.Effect<SubmissionRecord | null, StorageError>
+  readonly getSubmission: (id: string) => SubmissionRecord | null
   readonly findSubmissionByRequest: (
     agentId: string,
     requestId: string
-  ) => Effect.Effect<SubmissionRecord | null, StorageError>
-  readonly nextQueuedSubmission: (agentId: string) => Effect.Effect<SubmissionRecord | null, StorageError>
-  readonly listSubmissions: (agentId: string, limit: number) => Effect.Effect<ReadonlyArray<SubmissionRecord>, StorageError>
-  readonly insertSubmission: (submission: SubmissionRecord) => Effect.Effect<void, StorageError>
+  ) => SubmissionRecord | null
+  readonly nextQueuedSubmission: (agentId: string) => SubmissionRecord | null
+  readonly listSubmissions: (agentId: string, limit: number) => ReadonlyArray<SubmissionRecord>
+  readonly insertSubmission: (submission: SubmissionRecord) => void
   readonly updateSubmission: (
     id: string,
     patch: {
@@ -112,15 +113,15 @@ export interface StorageInterface {
       readonly cancelRequested?: boolean
     },
     now: Date
-  ) => Effect.Effect<void, StorageError>
+  ) => void
 
   // turns
-  readonly getTurn: (id: string) => Effect.Effect<TurnRecord | null, StorageError>
-  readonly activeTurn: (agentId: string) => Effect.Effect<TurnRecord | null, StorageError>
-  readonly unfinishedTurns: () => Effect.Effect<ReadonlyArray<TurnRecord>, StorageError>
-  readonly listTurns: (agentId: string, limit: number) => Effect.Effect<ReadonlyArray<TurnRecord>, StorageError>
-  readonly turnForSubmission: (submissionId: string) => Effect.Effect<TurnRecord | null, StorageError>
-  readonly insertTurn: (turn: TurnRecord) => Effect.Effect<void, StorageError>
+  readonly getTurn: (id: string) => TurnRecord | null
+  readonly activeTurn: (agentId: string) => TurnRecord | null
+  readonly unfinishedTurns: () => ReadonlyArray<TurnRecord>
+  readonly listTurns: (agentId: string, limit: number) => ReadonlyArray<TurnRecord>
+  readonly turnForSubmission: (submissionId: string) => TurnRecord | null
+  readonly insertTurn: (turn: TurnRecord) => void
   readonly updateTurn: (
     id: string,
     patch: {
@@ -129,34 +130,33 @@ export interface StorageInterface {
       readonly executorId?: string | null
       readonly completedAt?: Date | null
     }
-  ) => Effect.Effect<void, StorageError>
+  ) => void
 
   // tasks
-  readonly getTask: (id: string) => Effect.Effect<TaskRecord | null, StorageError>
-  readonly tasksForTurn: (turnId: string) => Effect.Effect<ReadonlyArray<TaskRecord>, StorageError>
-  readonly unfinishedTasks: () => Stream.Stream<TaskRecord, StorageError>
-  readonly insertTask: (task: NewTask) => Effect.Effect<void, StorageError>
-  readonly updateTask: (id: string, patch: TaskPatch) => Effect.Effect<void, StorageError>
+  readonly getTask: (id: string) => TaskRecord | null
+  readonly tasksForTurn: (turnId: string) => ReadonlyArray<TaskRecord>
+  readonly unfinishedTasks: () => ReadonlyArray<TaskRecord>
+  readonly insertTask: (task: NewTask) => void
+  readonly updateTask: (id: string, patch: TaskPatch) => void
 
   // checkpoints
-  readonly latestCheckpoint: (agentId: string) => Effect.Effect<AgentCheckpoint | null, StorageError>
-  readonly insertCheckpoint: (checkpoint: AgentCheckpoint) => Effect.Effect<void, StorageError>
+  readonly latestCheckpoint: (agentId: string) => AgentCheckpoint | null
+  readonly insertCheckpoint: (checkpoint: AgentCheckpoint) => void
 
   // events
-  readonly appendEvent: (event: NewEvent) => Effect.Effect<DurableEvent, StorageError>
+  readonly appendEvent: (event: NewEvent) => DurableEvent
   readonly eventsAfter: (
     agentId: string,
     after: number,
     limit: number
-  ) => Effect.Effect<ReadonlyArray<DurableEvent>, StorageError>
+  ) => ReadonlyArray<DurableEvent>
 
   // executors
-  readonly registerExecutor: (executor: ExecutorRecord) => Effect.Effect<void, StorageError>
-  readonly heartbeatExecutor: (id: string, now: Date) => Effect.Effect<void, StorageError>
-  readonly stopExecutor: (id: string, now: Date) => Effect.Effect<void, StorageError>
-  readonly getExecutor: (id: string) => Effect.Effect<ExecutorRecord | null, StorageError>
+  readonly registerExecutor: (executor: ExecutorRecord) => void
+  readonly heartbeatExecutor: (id: string, now: Date) => void
+  readonly stopExecutor: (id: string, now: Date) => void
+  readonly getExecutor: (id: string) => ExecutorRecord | null
 
-  readonly close: () => Effect.Effect<void>
+  readonly close: () => void
 }
 
-export class Storage extends Context.Service<Storage, StorageInterface>()("fx-durable/Storage") {}

@@ -2,27 +2,16 @@ import { hostname } from "node:os"
 import { Cause, Context, Effect, Exit, Fiber, FiberMap, Layer, Queue, Schedule, Scope } from "effect"
 import { ToolExecutor } from "../tools/executor.js"
 import { ToolRegistry } from "../tools/registry.js"
-import { CheckpointStore } from "./checkpoint.js"
 import { CrashInjector } from "./crash.js"
 import { NotFoundError, type StorageError } from "./errors.js"
-import { EventLog } from "./events.js"
-import { IdGenerator, now } from "./ids.js"
+import { IdGenerator } from "./ids.js"
+import { JournalService, db } from "./journal-service.js"
 import { LibFx, type FxSession, type LibfxTool } from "./libfx.js"
 import { makeDurableFetch, type ModelTransportHolder } from "./model.js"
 import { RuntimeRegistry } from "./runtime.js"
 import type { DurableAgentRecord, SubmissionContent, TurnRecord } from "./schema.js"
 import { isTerminalSubmission } from "./state-machine.js"
-import { Storage } from "./storage.js"
-import { TaskEngine } from "./task.js"
-import {
-  buildRecoveryPrompt,
-  cancelTurn,
-  closeTurnTask,
-  failTurn,
-  interruptTurn,
-  settleRunningTasks,
-  startTurn
-} from "./turn.js"
+import { buildRecoveryPrompt } from "./tool-outcomes.js"
 import { makeTurnContext, type TurnContext } from "./turn-context.js"
 
 /**
@@ -69,30 +58,26 @@ export const layer = (options: SupervisorOptions = {}) =>
   Layer.effect(
     AgentSupervisor,
     Effect.gen(function* () {
-      const storage = yield* Storage
-      const engine = yield* TaskEngine
+      const journal = yield* JournalService
+      const storage = journal.storage
       const ids = yield* IdGenerator
       const registry = yield* RuntimeRegistry
       const toolRegistry = yield* ToolRegistry
       const executor = yield* ToolExecutor
       const libfx = yield* LibFx
-      const checkpoints = yield* CheckpointStore
       const crash = yield* CrashInjector
-      const context = yield* Effect.context<
-        Storage | TaskEngine | IdGenerator | EventLog | CrashInjector | ToolExecutor
-      >()
 
-      const executorId = yield* ids.next("exec")
-      const startedAt = yield* now
-      yield* storage.registerExecutor({
+      const executorId = ids.next("exec")
+      const startedAt = journal.now()
+      yield* db(() => storage.registerExecutor({
         id: executorId,
         pid: process.pid,
         hostname: hostname(),
         startedAt,
         heartbeatAt: startedAt,
         stoppedAt: null
-      })
-      yield* Effect.flatMap(now, (t) => storage.heartbeatExecutor(executorId, t)).pipe(
+      }))
+      yield* db(() => storage.heartbeatExecutor(executorId, journal.now())).pipe(
         Effect.ignore,
         Effect.repeat(Schedule.spaced(options.heartbeatMillis ?? 5000)),
         Effect.forkScoped
@@ -141,9 +126,9 @@ export const layer = (options: SupervisorOptions = {}) =>
           const scope = yield* Scope.make()
           const built = yield* Effect.gen(function* () {
             const resolved = yield* toolRegistry.resolve(agent, runtime).pipe(Scope.provide(scope))
-            const checkpoint = yield* checkpoints.latest(agent.id)
+            const checkpoint = yield* db(() => storage.latestCheckpoint(agent.id))
             const holder: ModelTransportHolder = { current: null }
-            const fetch = yield* makeDurableFetch(holder, libfx.transport)
+            const fetch = makeDurableFetch(holder, libfx.transport, journal, crash)
             const tools: Array<LibfxTool> = resolved.tools.map((tool) => ({
               name: tool.name,
               description: tool.description,
@@ -151,7 +136,7 @@ export const layer = (options: SupervisorOptions = {}) =>
               execute: (input, { signal }) => {
                 const ctx = holder.current
                 if (!ctx) return Promise.reject(new Error(`tool ${tool.name} called outside of a turn`))
-                const promise = Effect.runPromiseExitWith(context)(executor.execute(ctx, tool, input), { signal }).then(
+                const promise = Effect.runPromiseExit(executor.execute(ctx, tool, input), { signal }).then(
                   (exit) => {
                     if (Exit.isSuccess(exit)) return exit.value
                     const failure = exit.cause.reasons.find((r) => r._tag === "Fail")
@@ -190,13 +175,17 @@ export const layer = (options: SupervisorOptions = {}) =>
       /** Run one attempt of an active turn owned by this executor. */
       const runAttempt = (turn: TurnRecord, ctx: TurnContext) =>
         Effect.gen(function* () {
-          const submission = yield* storage.getSubmission(turn.submissionId)
-          const agent = yield* storage.getAgent(turn.agentId)
+          const submission = yield* db(() => storage.getSubmission(turn.submissionId))
+          const agent = yield* db(() => storage.getAgent(turn.agentId))
           if (!submission || !agent) return yield* new NotFoundError({ entity: "turn", id: turn.id })
 
           if (submission.cancelRequested) {
-            yield* settleRunningTasks(turn.id, "cancelled")
-            yield* cancelTurn(turn)
+            yield* db(() =>
+              journal.transaction(() => {
+                journal.classifyTurnTasks(turn.id, "cancelled")
+                journal.cancelTurn(turn)
+              })
+            )
             return
           }
 
@@ -206,10 +195,10 @@ export const layer = (options: SupervisorOptions = {}) =>
             const error = failure && failure._tag === "Fail" ? failure.error : null
             if (error && error._tag === "RuntimeConfigurationError") {
               // Do not discard work: park the turn until the runtime is registered again.
-              yield* storage.transaction(
-                Effect.gen(function* () {
-                  yield* interruptTurn(turn, "runtime unavailable")
-                  yield* engine.transitionAgent(agent.id, "configuration_error", error.message, {
+              yield* db(() =>
+                journal.transaction(() => {
+                  journal.interruptTurn(turn, "runtime unavailable")
+                  journal.transitionAgent(agent.id, "configuration_error", error.message, {
                     type: "agent.configuration_error",
                     payload: { runtimeId: agent.runtimeId, error: error.message }
                   })
@@ -218,19 +207,19 @@ export const layer = (options: SupervisorOptions = {}) =>
               return
             }
             const message = error ? error.message : Cause.pretty(sessionExit.cause)
-            yield* failTurn(turn, message)
+            yield* db(() => journal.failTurn(turn, message))
             return
           }
           const session = sessionExit.value
           if (session.checkpointSeq !== turn.baseCheckpointSeq) {
-            yield* failTurn(turn, `checkpoint mismatch: turn started from ${turn.baseCheckpointSeq}, latest is ${session.checkpointSeq}`)
+            yield* db(() => journal.failTurn(turn, `checkpoint mismatch: turn started from ${turn.baseCheckpointSeq}, latest is ${session.checkpointSeq}`))
             return
           }
 
           const content: SubmissionContent =
             turn.attempt === 1
               ? submission.content
-              : buildRecoveryPrompt(submission, turn, yield* storage.tasksForTurn(turn.id))
+              : buildRecoveryPrompt(submission, turn, yield* db(() => storage.tasksForTurn(turn.id)))
 
           const settleInflight = Effect.promise(() => Promise.allSettled(ctx.inflight))
 
@@ -243,17 +232,17 @@ export const layer = (options: SupervisorOptions = {}) =>
 
             // Checkpoint + turn completion commit in ONE transaction: a
             // checkpoint never exists for an unfinished turn.
-            const checkpointTask = yield* engine.startTask({
+            const checkpointTask = yield* db(() => journal.startTask({
               turnId: turn.id,
               agentId: agent.id,
               type: "checkpoint",
               attempt: turn.attempt
-            })
+            }))
             yield* crash.hit("checkpoint.before-write")
             const bytes = yield* session.fx.checkpoint()
-            const written = yield* storage.transaction(
-              Effect.gen(function* () {
-                const checkpoint = yield* checkpoints.write({
+            const written = yield* db(() =>
+              journal.transaction(() => {
+                const checkpoint = journal.writeCheckpoint({
                   agentId: agent.id,
                   turnId: turn.id,
                   submissionId: submission.id,
@@ -263,14 +252,14 @@ export const layer = (options: SupervisorOptions = {}) =>
                   data: bytes,
                   expectedPrevious: turn.baseCheckpointSeq
                 })
-                yield* crash.hit("checkpoint.during-write")
-                yield* engine.transitionTask(checkpointTask.id, "completed", { output: { sequence: checkpoint.sequence } })
-                yield* closeTurnTask(turn.id, "completed")
-                yield* engine.transitionTurn(turn.id, "completed", undefined, {
+                crash.hitSync("checkpoint.during-write")
+                journal.transitionTask(checkpointTask.id, "completed", { output: { sequence: checkpoint.sequence } })
+                journal.closeTurnTask(turn.id, "completed")
+                journal.transitionTurn(turn.id, "completed", {}, {
                   type: "turn.completed",
                   payload: { attempt: turn.attempt, stopReason: result.stopReason, usage: result.usage }
                 })
-                yield* engine.transitionSubmission(
+                journal.transitionSubmission(
                   submission.id,
                   "completed",
                   { result: { text: result.text, stopReason: result.stopReason, usage: result.usage } },
@@ -293,10 +282,11 @@ export const layer = (options: SupervisorOptions = {}) =>
                 Effect.gen(function* () {
                   yield* settleInflight
                   const reason = ctx.interruptReason ?? "executor_lost"
-                  yield* settleRunningTasks(turn.id, reason)
+                  yield* db(() => journal.classifyTurnTasks(turn.id, reason))
                   yield* closeSession(agent.id)
-                  if (reason === "cancelled") yield* cancelTurn(turn)
-                  else yield* interruptTurn(turn, "executor stopped")
+                  yield* db(() =>
+                    reason === "cancelled" ? journal.cancelTurn(turn) : journal.interruptTurn(turn, "executor stopped")
+                  )
                 }).pipe(Effect.orDie)
               )
             )
@@ -305,24 +295,24 @@ export const layer = (options: SupervisorOptions = {}) =>
 
           // The attempt failed in-process (model/transport/checkpoint error).
           yield* settleInflight
-          const latest = yield* storage.getSubmission(submission.id)
-          yield* settleRunningTasks(turn.id, latest?.cancelRequested ? "cancelled" : "executor_lost")
+          const latest = yield* db(() => storage.getSubmission(submission.id))
+          yield* db(() => journal.classifyTurnTasks(turn.id, latest?.cancelRequested ? "cancelled" : "executor_lost"))
           yield* closeSession(agent.id)
           if (latest?.cancelRequested) {
-            yield* cancelTurn(turn)
+            yield* db(() => journal.cancelTurn(turn))
             return
           }
           const failure = exit.cause.reasons.find((r) => r._tag === "Fail")
           const message = failure && failure._tag === "Fail" ? errorMessage(failure.error) : Cause.pretty(exit.cause)
-          yield* failTurn(turn, message)
+          yield* db(() => journal.failTurn(turn, message))
         })
 
       /** One scheduling step. Returns true if it did work. */
       const step = (agentId: string) =>
         Effect.gen(function* () {
-          const agent = yield* storage.getAgent(agentId)
+          const agent = yield* db(() => storage.getAgent(agentId))
           if (!agent) return false
-          const active = yield* storage.activeTurn(agentId)
+          const active = yield* db(() => storage.activeTurn(agentId))
           if (active) {
             if (active.state !== "running" || active.executorId !== executorId) return false // awaiting recovery
             const ctx = makeTurnContext({
@@ -340,14 +330,14 @@ export const layer = (options: SupervisorOptions = {}) =>
           }
           if (agent.state === "configuration_error" && !(yield* registry.has(agent.runtimeId))) return false
           if (agent.state === "recovering") return false
-          const next = yield* storage.nextQueuedSubmission(agentId)
+          const next = yield* db(() => storage.nextQueuedSubmission(agentId))
           if (next) {
-            const turn = yield* startTurn(next, executorId)
+            const turn = yield* db(() => journal.startTurn(next, executorId))
             if (turn) yield* crash.hit("turn.after-start")
             return true
           }
           if (agent.state === "running") {
-            yield* engine.transitionAgent(agentId, "idle", null, { type: "agent.idle" })
+            yield* db(() => journal.transitionAgent(agentId, "idle", null, { type: "agent.idle" }))
           }
           return false
         })
@@ -369,7 +359,7 @@ export const layer = (options: SupervisorOptions = {}) =>
         Effect.gen(function* () {
           if (stopping) return
           if (yield* FiberMap.has(workers, agentId)) return
-          yield* FiberMap.run(workers, agentId, workerLoop(agentId).pipe(Effect.provide(context)), {
+          yield* FiberMap.run(workers, agentId, workerLoop(agentId), {
             onlyIfMissing: true
           })
         })
@@ -381,14 +371,14 @@ export const layer = (options: SupervisorOptions = {}) =>
         })
 
       const cancel = Effect.fn("AgentSupervisor.cancel")(function* (submissionId: string) {
-        const submission = yield* storage.getSubmission(submissionId)
+        const submission = yield* db(() => storage.getSubmission(submissionId))
         if (!submission) return yield* new NotFoundError({ entity: "submission", id: submissionId })
         if (isTerminalSubmission(submission.state)) return
-        yield* storage.transaction(
-          Effect.gen(function* () {
-            yield* storage.updateSubmission(submissionId, { cancelRequested: true }, yield* now)
+        yield* db(() =>
+          journal.transaction(() => {
+            storage.updateSubmission(submissionId, { cancelRequested: true }, journal.now())
             if (submission.state === "queued") {
-              yield* engine.transitionSubmission(submissionId, "cancelled", { error: "cancelled" }, {
+              journal.transitionSubmission(submissionId, "cancelled", { error: "cancelled" }, {
                 type: "submission.cancelled"
               })
             }
@@ -410,7 +400,7 @@ export const layer = (options: SupervisorOptions = {}) =>
           yield* Effect.forEach([...attempts.values()], ({ fiber }) => Fiber.interrupt(fiber), { discard: true })
           yield* FiberMap.clear(workers)
           yield* Effect.forEach([...sessions.keys()], closeSession, { discard: true })
-          yield* Effect.flatMap(now, (t) => storage.stopExecutor(executorId, t)).pipe(Effect.ignore)
+          yield* db(() => storage.stopExecutor(executorId, journal.now())).pipe(Effect.ignore)
         })
 
       yield* Effect.addFinalizer(() => shutdown())

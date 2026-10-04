@@ -4,10 +4,11 @@ import { join } from "node:path"
 import { Effect, Layer, ManagedRuntime } from "effect"
 import { DurableFx, sqlite, type DurableFxOptions } from "../src/index.js"
 import { scriptedModel, type Script } from "../src/testing/index.js"
-import { Storage, type StorageInterface } from "../src/core/storage.js"
-import { layer as sqliteLayer } from "../src/sqlite/storage.js"
-import { IdGenerator } from "../src/core/ids.js"
 import { EventLog, layer as eventLogLayer } from "../src/core/events.js"
+import { IdGenerator } from "../src/core/ids.js"
+import { Journal } from "../src/core/journal.js"
+import { JournalService, journalLayer } from "../src/core/journal-service.js"
+import { openSqliteStorage } from "../src/sqlite/storage.js"
 
 export const tempDb = (name = "fx.db") => join(mkdtempSync(join(tmpdir(), "fxd-test-")), name)
 
@@ -20,15 +21,26 @@ export const openFx = (db: string, script: Script, options: Partial<DurableFxOpt
     ...options
   })
 
-/** A raw Storage + EventLog runtime for journal-level tests (no libfx). */
-export const journalRuntime = (db: string) => {
-  const base = Layer.mergeAll(sqliteLayer({ path: db }), IdGenerator.layer)
-  const layer = eventLogLayer.pipe(Layer.provideMerge(base))
+/** The plain synchronous journal over a fresh SQLite database (no Effect). */
+export const openTestJournal = (db: string): Journal =>
+  new Journal({ storage: openSqliteStorage({ path: db }), nextId: sequentialIds() })
+
+const sequentialIds = () => {
+  let n = 0
+  return (prefix: string) => `${prefix}_${String(++n).padStart(6, "0")}`
+}
+
+/** Journal + EventLog in an Effect runtime, for live-subscription tests. */
+export const eventRuntime = (db: string) => {
+  const layer = eventLogLayer.pipe(
+    Layer.provideMerge(journalLayer(() => openSqliteStorage({ path: db }))),
+    Layer.provideMerge(IdGenerator.layer)
+  )
   const runtime = ManagedRuntime.make(layer)
   return {
     runtime,
-    run: <A, E>(effect: Effect.Effect<A, E, Storage | EventLog | IdGenerator>) => runtime.runPromise(effect),
-    storage: () => runtime.runPromise(Effect.flatMap(Storage, (s) => Effect.succeed<StorageInterface>(s)))
+    journal: () => runtime.runPromise(Effect.map(JournalService, (journal) => journal)),
+    run: <A, E>(effect: Effect.Effect<A, E, JournalService | EventLog | IdGenerator>) => runtime.runPromise(effect)
   }
 }
 

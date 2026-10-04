@@ -7,10 +7,10 @@ import {
   type NotFoundError,
   type StorageError
 } from "../core/errors.js"
-import { IdGenerator, now } from "../core/ids.js"
+import { IdGenerator } from "../core/ids.js"
+import { JournalService, db } from "../core/journal-service.js"
 import type { TaskRecord, UnknownOutcomeReason } from "../core/schema.js"
-import { Storage } from "../core/storage.js"
-import { TaskEngine } from "../core/task.js"
+import { effectiveTask, unknownOutcomeNotice } from "../core/tool-outcomes.js"
 import type { Json } from "../core/json.js"
 import { hashInput, type TurnContext } from "../core/turn-context.js"
 import { OutcomeUnknown, type DurableTool } from "./define-tool.js"
@@ -38,31 +38,13 @@ export class ToolExecutor extends Context.Service<ToolExecutor, ToolExecutorInte
 
 const errorMessage = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause))
 
-export const unknownOutcomeNotice = (tool: string, input: Json): string =>
-  [
-    `The previous \`${tool}\` operation was interrupted.`,
-    `Input: ${JSON.stringify(input)}`,
-    "It may or may not have completed successfully.",
-    "Do not repeat it blindly.",
-    "Inspect the current system state before deciding what to do."
-  ].join("\n")
-
-/** Follow replay/re-execution children to the task that currently decides a call's outcome. */
-export const effectiveTask = (task: TaskRecord, all: ReadonlyArray<TaskRecord>): TaskRecord => {
-  let current = task
-  while (true) {
-    const children = all.filter((t) => t.parentTaskId === current.id && t.type === "tool")
-    const latest = children[children.length - 1]
-    if (!latest) return current
-    current = latest
-  }
-}
+export { effectiveTask, unknownOutcomeNotice }
 
 export const layer = Layer.effect(
   ToolExecutor,
   Effect.gen(function* () {
-    const storage = yield* Storage
-    const engine = yield* TaskEngine
+    const journal = yield* JournalService
+    const storage = journal.storage
     const ids = yield* IdGenerator
     const crash = yield* CrashInjector
 
@@ -74,7 +56,7 @@ export const layer = Layer.effect(
       options: { readonly replay: boolean; readonly interruptReason: () => UnknownOutcomeReason }
     ): Effect.Effect<Json, ToolExecutionError | UnknownOutcomeError | StorageError | NotFoundError> =>
       Effect.gen(function* () {
-        const startedAt = yield* now
+        const startedAt = journal.now()
         const controller = new AbortController()
         const settled = { done: false }
 
@@ -100,14 +82,14 @@ export const layer = Layer.effect(
             Effect.gen(function* () {
               if (settled.done) return
               controller.abort()
-              const current = yield* storage.getTask(task.id)
+              const current = yield* db(() => storage.getTask(task.id))
               if (!current || current.state !== "running") return
               // Local cancellation does not prove an external unsafe effect was cancelled.
               if (task.replayPolicy === "safe") {
-                yield* engine.transitionTask(task.id, "cancelled", { error: "cancelled" }, { type: "tool.cancelled", payload: { tool: tool.name } })
+                yield* db(() => journal.transitionTask(task.id, "cancelled", { error: "cancelled" }, { type: "tool.cancelled", payload: { tool: tool.name } }))
               } else {
                 const reason = options.interruptReason()
-                yield* engine.transitionTask(
+                yield* db(() => journal.transitionTask(
                   task.id,
                   "outcome_unknown",
                   { error: `interrupted: ${reason}` },
@@ -115,7 +97,7 @@ export const layer = Layer.effect(
                     type: "tool.outcome_unknown",
                     payload: { tool: tool.name, input, startedAt: startedAt.toISOString(), reason }
                   }
-                )
+                ))
               }
             }).pipe(Effect.orDie)
           )
@@ -125,13 +107,13 @@ export const layer = Layer.effect(
         if (Exit.isSuccess(exit)) {
           yield* crash.hit("tool.after-execute", { name: tool.name })
           const output = exit.value
-          const durationMs = (yield* now).getTime() - startedAt.getTime()
-          yield* engine.transitionTask(
+          const durationMs = journal.now().getTime() - startedAt.getTime()
+          yield* db(() => journal.transitionTask(
             task.id,
             "completed",
             { output, metadata: { durationMs, replay: options.replay } },
             { type: "tool.completed", payload: { tool: tool.name, input, durationMs, replay: options.replay } }
-          )
+          ))
           yield* crash.hit("tool.after-result-persist", { name: tool.name })
           return output
         }
@@ -140,7 +122,7 @@ export const layer = Layer.effect(
         const failure = cause.reasons.find((r) => r._tag === "Fail")
         const error = failure && failure._tag === "Fail" ? failure.error : cause
         if (error instanceof OutcomeUnknown) {
-          yield* engine.transitionTask(
+          yield* db(() => journal.transitionTask(
             task.id,
             "outcome_unknown",
             { error: error.message },
@@ -148,7 +130,7 @@ export const layer = Layer.effect(
               type: "tool.outcome_unknown",
               payload: { tool: tool.name, input, startedAt: startedAt.toISOString(), reason: error.reason }
             }
-          )
+          ))
           return yield* new UnknownOutcomeError({
             taskId: task.id,
             tool: tool.name,
@@ -156,25 +138,25 @@ export const layer = Layer.effect(
           })
         }
         const message = errorMessage(error)
-        yield* engine.transitionTask(
+        yield* db(() => journal.transitionTask(
           task.id,
           "failed",
           { error: message },
           { type: "tool.failed", payload: { tool: tool.name, error: message } }
-        )
+        ))
         return yield* new ToolExecutionError({ taskId: task.id, tool: tool.name, message })
       })
 
     const runFresh = (ctx: TurnContext, tool: DurableTool, input: Json, inputHash: string, parentTaskId: string | null) =>
       Effect.gen(function* () {
-        const submission = yield* storage.getSubmission(ctx.submissionId)
+        const submission = yield* db(() => storage.getSubmission(ctx.submissionId))
         if (submission?.cancelRequested) {
           return yield* new InterruptedError({ message: "submission cancellation requested" })
         }
         yield* crash.hit("tool.before-persist", { name: tool.name })
-        const id = yield* ids.next("task")
+        const id = ids.next("task")
         const policy = policyName(tool.replay)
-        const task = yield* engine.startTask({
+        const task = yield* db(() => journal.startTask({
           id,
           turnId: ctx.turnId,
           agentId: ctx.agentId,
@@ -187,7 +169,7 @@ export const layer = Layer.effect(
           idempotencyKey: idempotencyKeyFor(tool.replay, id, input),
           attempt: ctx.attempt,
           event: { type: "tool.started", payload: { tool: tool.name, input, replay: policy } }
-        })
+        }))
         yield* crash.hit("tool.after-persist", { name: tool.name })
         return yield* runTask(task, tool, input, {
           replay: false,
@@ -202,7 +184,7 @@ export const layer = Layer.effect(
       ctx.ordinals.set(key, ordinal + 1)
 
       // Map this call onto work journaled by earlier attempts of the same turn.
-      const tasks = yield* storage.tasksForTurn(ctx.turnId)
+      const tasks = yield* db(() => storage.tasksForTurn(ctx.turnId))
       const slots = tasks.filter(
         (t) =>
           t.type === "tool" &&
@@ -217,25 +199,25 @@ export const layer = Layer.effect(
       const effective = effectiveTask(slot, tasks)
       switch (effective.state) {
         case "completed": {
-          yield* engine.emit({
+          yield* db(() => journal.appendEvent({
             agentId: ctx.agentId,
             submissionId: ctx.submissionId,
             turnId: ctx.turnId,
             taskId: effective.id,
             type: "tool.reused",
             payload: { tool: tool.name, input, state: "completed" }
-          })
+          }))
           return effective.output
         }
         case "failed": {
-          yield* engine.emit({
+          yield* db(() => journal.appendEvent({
             agentId: ctx.agentId,
             submissionId: ctx.submissionId,
             turnId: ctx.turnId,
             taskId: effective.id,
             type: "tool.reused",
             payload: { tool: tool.name, input, state: "failed" }
-          })
+          }))
           return yield* new ToolExecutionError({
             taskId: effective.id,
             tool: tool.name,
@@ -246,10 +228,10 @@ export const layer = Layer.effect(
           if (!effective.acknowledged) {
             // Unsafe effects are never blindly replayed. Refuse once, explicitly;
             // a deliberate second call after inspection executes normally.
-            yield* storage.transaction(
-              Effect.gen(function* () {
-                yield* storage.updateTask(effective.id, { acknowledged: true })
-                yield* engine.emit({
+            yield* db(() =>
+              journal.transaction(() => {
+                storage.updateTask(effective.id, { acknowledged: true })
+                journal.appendEvent({
                   agentId: ctx.agentId,
                   submissionId: ctx.submissionId,
                   turnId: ctx.turnId,
@@ -282,7 +264,7 @@ export const layer = Layer.effect(
     })
 
     const replay = Effect.fn("ToolExecutor.replay")(function* (original: TaskRecord, tool: DurableTool) {
-      const task = yield* engine.startTask({
+      const task = yield* db(() => journal.startTask({
         turnId: original.turnId,
         agentId: original.agentId,
         type: "tool",
@@ -298,13 +280,13 @@ export const layer = Layer.effect(
           type: "tool.replayed",
           payload: { tool: original.name, input: original.input, replayOf: original.id, replay: original.replayPolicy }
         }
-      })
+      }))
       yield* crash.hit("recovery.during-replay", { name: tool.name })
       const input = original.input
       yield* runTask(task, tool, input, { replay: true, interruptReason: () => "executor_lost" }).pipe(
         Effect.catchTags({ ToolExecutionError: () => Effect.void, UnknownOutcomeError: () => Effect.void })
       )
-      const updated = yield* storage.getTask(task.id)
+      const updated = yield* db(() => storage.getTask(task.id))
       return updated ?? task
     })
 

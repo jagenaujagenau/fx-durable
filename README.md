@@ -129,7 +129,8 @@ Otherwise pass `jsonSchema` yourself. A plain JSON Schema object works as `input
 
 `fx-durable/effect` exposes the Effect-native side:
 - `durableFxLayer(options)`: the whole service graph as one `Layer`.
-- The service tags: `Storage`, `EventLog`, `TaskEngine`, `AgentSupervisor`, `RecoveryManager` and others.
+- The service tags: `JournalService`, `EventLog`, `AgentSupervisor`, `RecoveryManager` and others, plus `db()`, which
+  runs a synchronous journal call inside an Effect with typed storage errors.
 - `sqliteLayer`.
 - `openDurableFx(options, { storage, ids })`: open with your own layers.
 
@@ -192,7 +193,7 @@ graph TD
     Sup --> Lib[libfx agent]
     Lib -->|tool calls| Exec[ToolExecutor: write-ahead]
     Lib -->|model requests| Journal[Model journaling transport]
-    Exec --> Engine[TaskEngine]
+    Exec --> Engine[Journal: plain sync code]
     Journal --> Engine
     Engine --> DB[(SQLite WAL: agents, submissions, turns, tasks, checkpoints, events)]
     Rec[RecoveryManager] -->|on startup| DB
@@ -209,8 +210,16 @@ recovery:
 3. restores the checkpoint from before the turn into a fresh libfx agent, and
 4. re-prompts with the original request, every saved call and its outcome, and a warning for each unknown outcome.
 
-Model calls are recorded by wrapping the `fetch` that libfx uses. Storage sits behind an interface that doesn't depend
-on SQLite or Effect SQL. The only implementation uses Node's built-in `node:sqlite` with `synchronous=FULL`.
+Model calls are recorded by wrapping the `fetch` that libfx uses.
+
+**Storage and the journal are plain synchronous code.** Effect runs the execution core: Fibers, cancellation,
+resource scopes. Persistence doesn't use it. `Storage` is a synchronous interface; the only implementation uses
+Node's built-in `node:sqlite` in WAL mode with `synchronous=FULL`. A transaction is a function:
+`storage.transaction(() => { … })`. Its body must be synchronous (a Promise is rejected), so JavaScript can't
+interleave other work into it, and nested transactions join the outer one. `Journal` holds every durable
+transition on top of storage: validated state changes, events, checkpoints, turn bookkeeping. Effect code calls it
+through `db(() => journal.…)`, which keeps `StorageError` typed and turns programmer errors into defects. You can
+pass your own `Storage` implementation to `DurableFx.open({ storage })`.
 
 ## CLI
 

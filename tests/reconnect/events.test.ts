@@ -2,7 +2,8 @@ import { Effect, Fiber, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import { EventLog } from "../../src/core/events.js"
 import type { DurableEvent } from "../../src/index.js"
-import { journalRuntime, openFx, tempDb } from "../helpers.js"
+import { JournalService } from "../../src/core/journal-service.js"
+import { eventRuntime, openFx, tempDb } from "../helpers.js"
 
 const take = async (iterable: AsyncIterable<DurableEvent>, n: number) => {
   const out: Array<DurableEvent> = []
@@ -15,15 +16,16 @@ const take = async (iterable: AsyncIterable<DurableEvent>, n: number) => {
 
 describe("reconnect from an event cursor", () => {
   it("replays persisted events after the cursor, then continues live without gaps", async () => {
-    const j = journalRuntime(tempDb())
+    const j = eventRuntime(tempDb())
     const result = await j.run(
       Effect.gen(function* () {
         const log = yield* EventLog
-        for (let i = 0; i < 10; i++) yield* log.append({ agentId: "a", type: "agent.idle", payload: { i } })
+        const journal = yield* JournalService
+        for (let i = 0; i < 10; i++) journal.appendEvent({ agentId: "a", type: "agent.idle", payload: { i } })
         // Attach after seq 4, then keep appending concurrently.
         const producer = Effect.gen(function* () {
           for (let i = 10; i < 30; i++) {
-            yield* log.append({ agentId: "a", type: "agent.idle", payload: { i } })
+            journal.appendEvent({ agentId: "a", type: "agent.idle", payload: { i } })
             yield* Effect.yieldNow
           }
         })
@@ -37,10 +39,11 @@ describe("reconnect from an event cursor", () => {
   })
 
   it("a slow consumer falls behind the bounded live channel and still sees every event", async () => {
-    const j = journalRuntime(tempDb())
+    const j = eventRuntime(tempDb())
     const result = await j.run(
       Effect.gen(function* () {
         const log = yield* EventLog
+        const journal = yield* JournalService
         const total = 3000 // more than the live channel's capacity
         const fiber = yield* Effect.forkChild(
           log.subscribe("a", { pollInterval: 50 }).pipe(
@@ -50,7 +53,10 @@ describe("reconnect from an event cursor", () => {
           )
         )
         yield* Effect.sleep(10)
-        for (let i = 0; i < total; i++) yield* log.append({ agentId: "a", type: "agent.idle" })
+        for (let i = 0; i < total; i++) {
+          journal.appendEvent({ agentId: "a", type: "agent.idle" })
+          if (i % 100 === 0) yield* Effect.yieldNow
+        }
         const collected = yield* Fiber.join(fiber)
         return Array.from(collected).map((e) => e.sequence)
       })
