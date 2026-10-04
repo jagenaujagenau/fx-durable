@@ -19,6 +19,9 @@ import type { TurnContext } from "./turn-context.js"
 
 const MODEL_ENDPOINT = /\/ai\/language-model$/
 
+/** How often a running task's streamed progress is journaled. */
+export const PROGRESS_MS = 100
+
 interface StreamSummary {
   finished: boolean
   text: string
@@ -204,6 +207,9 @@ export const makeDurableFetch = (
     const observer = observeSse()
     const rewriter = lineRewriter()
     let first = true
+    // Partial text for viewers that attach mid-response, at most every PROGRESS_MS.
+    let progressAt = 0
+    let progressText = ""
     let completed = false
     const completeOnce = () => {
       if (completed) return
@@ -218,6 +224,12 @@ export const makeDurableFetch = (
             crash.hitSync("model.during-stream", { name: ctx.model })
           }
           observer.push(chunk)
+          const now = Date.now()
+          if (!completed && now - progressAt >= PROGRESS_MS && observer.summary.text !== progressText) {
+            progressAt = now
+            progressText = observer.summary.text
+            models.recordProgress(taskId, progressText)
+          }
           if (observer.summary.finished) completeOnce()
           const rewritten = rewriter.push(chunk)
           if (rewritten.byteLength > 0) controller.enqueue(rewritten)

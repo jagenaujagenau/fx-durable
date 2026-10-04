@@ -106,6 +106,8 @@ export const layer = (options: RecoveryOptions = {}) =>
                 for (const task of replays) {
                   const tool = resolved.byName.get(task.name ?? "")
                   if (!tool) continue // tool removed from runtime: the model sees it as interrupted
+                  // Waits on other durable work: retried when the recovered turn calls it, not here.
+                  if (tool.resumeOnCall) continue
                   const result = yield* executor.replay(task, tool)
                   replayed.push(result.id)
                 }

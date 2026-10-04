@@ -12,6 +12,7 @@ import { RuntimeRegistry } from "./runtime-registry.js"
 import type { DurableAgentRecord, SubmissionContent, TurnRecord } from "../domain/schema.js"
 import { isTerminalSubmission } from "../domain/state-machine.js"
 import { buildRecoveryPrompt } from "../domain/tool-outcomes.js"
+import { steeringFor } from "../domain/steering.js"
 import { makeTurnContext, type TurnContext } from "./turn-context.js"
 
 /**
@@ -28,9 +29,23 @@ export interface AgentSupervisorInterface {
   /** Nudge the agent's worker to look for new work. */
   readonly wake: (agentId: string) => Effect.Effect<void>
   readonly cancel: (submissionId: string) => Effect.Effect<void, StorageError | NotFoundError>
+  /** Journal guidance for the agent's active turn and deliver it if the turn runs here. */
+  readonly steer: (agentId: string, text: string) => Effect.Effect<SteerOutcome, StorageError | NotFoundError>
   /** Mark this executor as stopped and interrupt its turns (they stay recoverable). */
   readonly shutdown: () => Effect.Effect<void>
 }
+
+/**
+ * What happened to guidance:
+ * - `delivered`: the running turn accepted it;
+ * - `recorded`: journaled for a turn this process is not running right now
+ *   (it is recovering, or about to start); the next attempt receives it;
+ * - `idle`: no turn is active;
+ * - `missed`: the turn settled before the guidance reached it.
+ */
+export type SteerOutcome =
+  | { readonly kind: "delivered" | "recorded" | "missed"; readonly submissionId: string }
+  | { readonly kind: "idle" }
 
 export class AgentSupervisor extends Context.Service<AgentSupervisor, AgentSupervisorInterface>()(
   "fx-durable/AgentSupervisor"
@@ -127,7 +142,7 @@ export const layer = (options: SupervisorOptions = {}) =>
               execute: (input, { signal }) => {
                 const ctx = holder.current
                 if (!ctx) return Promise.reject(new Error(`tool ${tool.name} called outside of a turn`))
-                const promise = Effect.runPromiseExit(executor.execute(ctx, tool, input), { signal }).then(
+                const promise = Effect.runPromiseExit(executor.execute(ctx, tool, input, runtime.hooks), { signal }).then(
                   (exit) => {
                     if (Exit.isSuccess(exit)) return exit.value
                     const failure = exit.cause.reasons.find((r) => r._tag === "Fail")
@@ -199,18 +214,32 @@ export const layer = (options: SupervisorOptions = {}) =>
             return
           }
 
+          // Guidance journaled for this turn: the first attempt receives it once
+          // libfx starts; a recovery attempt gets it in its prompt.
+          const steering = yield* database.read((storage) => steeringFor(storage, turn.agentId, turn.id))
           const content: SubmissionContent =
             turn.attempt === 1
               ? submission.content
-              : buildRecoveryPrompt(submission, turn, yield* database.read((storage) => storage.tasksForTurn(turn.id)))
+              : buildRecoveryPrompt(submission, turn, yield* database.read((storage) => storage.tasksForTurn(turn.id)), steering)
+          if (turn.attempt === 1) ctx.pendingSteering.push(...steering)
 
           const settleInflight = Effect.promise(() => Promise.allSettled(ctx.inflight))
 
           const attempt = Effect.gen(function* () {
             session.holder.current = ctx
-            const result = yield* session.fx.prompt(content).pipe(
-              Effect.ensuring(Effect.sync(() => (session.holder.current = null)))
-            )
+            const result = yield* session.fx
+              .prompt(content, (live) => {
+                ctx.steer = live.steer
+                for (const text of ctx.pendingSteering.splice(0)) live.steer(text).catch(() => undefined)
+              })
+              .pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    session.holder.current = null
+                    ctx.steer = null
+                  })
+                )
+              )
             yield* settleInflight
 
             // Checkpoint + turn completion commit in ONE transaction: a
@@ -359,6 +388,23 @@ export const layer = (options: SupervisorOptions = {}) =>
 
       yield* Effect.addFinalizer(() => shutdown())
 
-      return AgentSupervisor.of({ executorId, ensureWorker, wake, cancel, shutdown })
+      const steer = Effect.fn("AgentSupervisor.steer")(function* (agentId: string, text: string) {
+        const recorded = yield* database.run((journal) => journal.recordSteering(agentId, text))
+        if (!recorded) return { kind: "idle" } satisfies SteerOutcome
+        const running = attempts.get(agentId)
+        if (!running || running.ctx.turnId !== recorded.turnId) {
+          return { kind: "recorded", submissionId: recorded.submissionId } satisfies SteerOutcome
+        }
+        const deliver = running.ctx.steer
+        if (!deliver) {
+          // The attempt runs here but libfx has not started the turn yet.
+          running.ctx.pendingSteering.push(text)
+          return { kind: "delivered", submissionId: recorded.submissionId } satisfies SteerOutcome
+        }
+        const accepted = yield* Effect.promise(() => deliver(text).then(() => true, () => false))
+        return { kind: accepted ? "delivered" : "missed", submissionId: recorded.submissionId } satisfies SteerOutcome
+      })
+
+      return AgentSupervisor.of({ executorId, ensureWorker, wake, cancel, steer, shutdown })
     })
   )

@@ -1,7 +1,7 @@
 import { Schema } from "effect"
 import type { Json, JsonObject } from "../domain/json.js"
-import type { ReplayPolicy } from "./replay-policy.js"
 import { formatIssues, type StandardSchemaV1 } from "./standard-schema.js"
+import { policyName, type ReplayPolicy } from "./replay-policy.js"
 
 export interface DurableToolContext {
   readonly agentId: string
@@ -13,6 +13,13 @@ export interface DurableToolContext {
   readonly signal: AbortSignal
   /** True when this execution is an automatic replay after a crash. */
   readonly replay: boolean
+  /**
+   * Report output while the tool runs (for example a command's stdout). The
+   * accumulated text is kept in the running task's `metadata.progress`, updated
+   * at most every 100 ms and capped to its last 64 KiB, so a viewer attaching
+   * mid-call can see it. It is not the result: return that as usual.
+   */
+  readonly progress: (chunk: string) => void
 }
 
 /**
@@ -35,6 +42,13 @@ interface ToolBase {
    * before the crash can mislead the model. Only allowed with `replay: "safe"`.
    */
   readonly reuse?: boolean
+  /**
+   * Do not replay an interrupted call during recovery; retry it, with the same
+   * idempotency key, when the recovered turn calls it again. For tools that
+   * wait on other durable work (a subagent's answer, a long job) and must not
+   * block recovery. Only allowed with the idempotent replay policy.
+   */
+  readonly resumeOnCall?: boolean
 }
 
 /** A tool whose input is decoded and validated with an Effect Schema. */
@@ -67,6 +81,8 @@ export interface DurableTool {
   readonly replay: ReplayPolicy
   /** Whether a completed call is answered from the journal when a recovered turn repeats it. */
   readonly reuse: boolean
+  /** Interrupted calls are retried when the turn calls them again, not replayed during recovery. */
+  readonly resumeOnCall: boolean
   readonly jsonSchema: JsonObject
   /** Validate the input and execute. Rejects on invalid input or tool failure. */
   readonly run: (input: Json, context: DurableToolContext) => Promise<Json>
@@ -129,12 +145,17 @@ export function defineDurableTool(definition: AnyDefinition): DurableTool {
   if (!reuse && definition.replay !== "safe") {
     throw new TypeError(`tool ${definition.name}: reuse: false requires replay: "safe" (running it again must be harmless)`)
   }
+  const resumeOnCall = definition.resumeOnCall ?? false
+  if (resumeOnCall && policyName(definition.replay) !== "idempotent") {
+    throw new TypeError(`tool ${definition.name}: resumeOnCall requires the idempotent replay policy (the retry reuses its key)`)
+  }
   const base = {
     _tag: "DurableTool" as const,
     name: definition.name,
     description: definition.description ?? definition.name,
     replay: definition.replay,
-    reuse
+    reuse,
+    resumeOnCall
   }
   if (isSchemaDefinition(definition)) {
     const decode = Schema.decodeUnknownSync(definition.inputSchema)

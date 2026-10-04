@@ -66,6 +66,47 @@ describe("crash matrix: reuse", () => {
   })
 })
 
+describe("crash matrix: subagents", () => {
+  it("a crash inside a subagent resumes the same subagent instead of starting another", () => {
+    const box = sandbox()
+    const crashed = box.run({ crash: crashAt("test.in-subagent-work", "work"), scenario: "subagent" })
+    expect(crashed.signal).toBe("SIGKILL")
+    const recovered = box.run({ scenario: "subagent" })
+    expect(recovered.output?.ok, recovered.stderr).toBe(true)
+    expect(recovered.output?.result?.text).toContain("work done")
+    assertInvariants(box, expect)
+    const children = box.query("SELECT id FROM agents WHERE id LIKE 'engineer/delegate/%'")
+    expect(children).toHaveLength(1)
+    expect(box.query("SELECT id FROM submissions WHERE agent_id LIKE 'engineer/delegate/%'")).toHaveLength(1)
+    // The child's safe work replayed once after the crash; nothing else repeated.
+    expect(box.count("work")).toBe(2)
+  })
+
+  it("without a crash, the parent gets the subagent's answer", () => {
+    const box = sandbox()
+    const run = box.run({ scenario: "subagent" })
+    expect(run.output?.ok, run.stderr).toBe(true)
+    expect(run.output?.result?.text).toContain("work done")
+    expect(box.count("work")).toBe(1)
+  })
+})
+
+describe("crash matrix: hooks", () => {
+  it("a crash while beforeTool decides leaves nothing unknown: the call never started", () => {
+    const box = sandbox()
+    const env = { FXD_TEST_HOOKS: "1" }
+    const crashed = box.run({ crash: crashAt("test.in-before-tool", "deploy"), env })
+    expect(crashed.signal).toBe("SIGKILL")
+    expect(box.count("deploy")).toBe(0)
+    const recovered = box.run({ env })
+    expect(recovered.output?.ok, recovered.stderr).toBe(true)
+    assertInvariants(box, expect)
+    expect(box.count("deploy")).toBe(1)
+    expect(unknownTasks(box, "deploy")).toEqual([])
+    expect(box.count("before_tool")).toBeGreaterThanOrEqual(2) // asked again after the crash
+  })
+})
+
 describe("crash matrix: tool boundaries", () => {
   it("before tool intent commit: the effect never started, so it runs once after recovery", () => {
     const box = sandbox()

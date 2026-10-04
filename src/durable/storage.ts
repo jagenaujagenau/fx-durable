@@ -158,6 +158,7 @@ export interface Storage {
 
   // checkpoints
   readonly latestCheckpoint: (agentId: string) => AgentCheckpoint | null
+  readonly getCheckpoint: (agentId: string, sequence: number) => AgentCheckpoint | null
   readonly insertCheckpoint: (checkpoint: AgentCheckpoint) => void
 
   // events
@@ -196,6 +197,7 @@ export type StorageReader = Pick<
   | "tasksForTurn"
   | "unfinishedTasks"
   | "latestCheckpoint"
+  | "getCheckpoint"
   | "eventsAfter"
   | "getExecutor"
 >
@@ -220,6 +222,7 @@ export const readerOf = (storage: Storage): StorageReader => ({
   tasksForTurn: (turnId) => storage.tasksForTurn(turnId),
   unfinishedTasks: () => storage.unfinishedTasks(),
   latestCheckpoint: (agentId) => storage.latestCheckpoint(agentId),
+  getCheckpoint: (agentId, sequence) => storage.getCheckpoint(agentId, sequence),
   eventsAfter: (agentId, after, limit) => storage.eventsAfter(agentId, after, limit),
   getExecutor: (id) => storage.getExecutor(id)
 })

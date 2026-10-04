@@ -8,7 +8,7 @@
  */
 import { appendFileSync } from "node:fs"
 import { Schema } from "effect"
-import { DurableFx, defineDurableTool, sqlite, crashPoint } from "../../src/index.js"
+import { DurableFx, defineDurableTool, defineSubagent, sqlite, crashPoint } from "../../src/index.js"
 import type { JsonObject } from "../../src/index.js"
 import { scriptedModel, type Script } from "../../src/testing/index.js"
 
@@ -23,6 +23,8 @@ const MODEL = process.env.FXD_TEST_MODEL ?? "anthropic/claude-sonnet-4.5"
 const INSTRUCTIONS = process.env.FXD_TEST_INSTRUCTIONS ?? "You are a test agent."
 // read_file opts out of result reuse: it observes state, so a recovered turn re-reads.
 const READ_REUSE = process.env.FXD_TEST_READ_REUSE !== "0"
+// A beforeTool hook (e.g. a permission prompt) with a crash point inside it.
+const HOOKS = process.env.FXD_TEST_HOOKS === "1"
 
 const record = (effect: string, detail: JsonObject = {}) =>
   appendFileSync(LEDGER, `${JSON.stringify({ effect, detail, pid: process.pid })}\n`)
@@ -88,6 +90,21 @@ const charge = defineDurableTool({
   }
 })
 
+// A subagent: the parent delegates, the child runs `work` in its own runtime.
+const work = defineDurableTool({
+  name: "work",
+  description: "Do the delegated work",
+  replay: "safe",
+  inputSchema: Schema.Struct({}),
+  execute: async () => {
+    record("work")
+    crashPoint("test.in-subagent-work", "work")
+    await new Promise((r) => setTimeout(r, 5))
+    return { done: true }
+  }
+})
+const delegate = defineSubagent({ name: "delegate", description: "Delegate work to a subagent", runtime: "worker" })
+
 const isRecovery = (text: string) => text.includes("[fx-durable recovery]")
 
 const scripts = new Map<string, Script>(Object.entries({
@@ -114,7 +131,16 @@ const scripts = new Map<string, Script>(Object.entries({
     if (req.toolResults.length === 0) return { toolCalls: [{ name: "charge", input: { amount: 42 } }] }
     return { text: "Charged." }
   },
-  chat: (req) => ({ text: `You said: ${req.userText.slice(0, 40)}` })
+  chat: (req) => ({ text: `You said: ${req.userText.slice(0, 40)}` }),
+  // The parent delegates; the child (offered `work`) does it.
+  subagent: (req) => {
+    if (req.tools.includes("work")) {
+      return req.toolResults.length === 0 ? { toolCalls: [{ name: "work", input: {} }] } : { text: "work done" }
+    }
+    const delegated = req.toolResults.find((r) => r.toolName === "delegate")
+    if (!delegated) return { toolCalls: [{ name: "delegate", input: { task: "do the work" } }] }
+    return { text: `Delegated: ${delegated.output}` }
+  }
 } satisfies Record<string, Script>))
 
 const main = async () => {
@@ -122,7 +148,22 @@ const main = async () => {
   if (!script) throw new Error(`unknown scenario: ${SCENARIO}`)
   const fx = await DurableFx.open({
     storage: sqlite(DB),
-    runtimes: { coding: { tools: [readFile, runTests, deploy, checkDeploy, charge], instructions: INSTRUCTIONS } },
+    runtimes: {
+      coding: {
+        tools: [readFile, runTests, deploy, checkDeploy, charge, delegate],
+        instructions: INSTRUCTIONS,
+        hooks: HOOKS
+          ? {
+              beforeTool: async (call) => {
+                record("before_tool", { tool: call.name })
+                crashPoint("test.in-before-tool", call.name)
+                return undefined
+              }
+            }
+          : undefined
+      },
+      worker: { tools: [work], instructions: INSTRUCTIONS }
+    },
     fetch: LIVE ? undefined : scriptedModel(script, { chunkDelayMs: CHUNK_DELAY }),
     idlePollMillis: 200
   })

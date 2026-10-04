@@ -201,6 +201,8 @@ export const storageContract: ReadonlyArray<StorageContractCase> = [
       assert.throws(() => storage.insertCheckpoint(checkpoint("c3", 2)), StorageError)
       assert.equal(storage.latestCheckpoint("a")?.id, "c2")
       assert.deepEqual(Array.from(storage.latestCheckpoint("a")?.fxCheckpoint ?? []), [2])
+      assert.equal(storage.getCheckpoint("a", 1)?.id, "c1")
+      assert.equal(storage.getCheckpoint("a", 3), null)
     }
   },
   {

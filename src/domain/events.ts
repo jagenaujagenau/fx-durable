@@ -3,6 +3,7 @@ import type { JsonObject } from "./json.js"
 /** The durable event taxonomy. Every meaningful state transition appends one of these. */
 export const EVENT_TYPES = [
   "agent.created",
+  "agent.forked",
   "agent.updated",
   "agent.idle",
   "agent.configuration_error",
@@ -20,6 +21,7 @@ export const EVENT_TYPES = [
   "turn.cancelled",
   "turn.interrupted",
   "turn.recovered",
+  "turn.steered",
   "model.started",
   "model.completed",
   "model.failed",
@@ -33,6 +35,7 @@ export const EVENT_TYPES = [
   "tool.reused",
   "tool.outcome_unknown",
   "tool.outcome_unknown_refused",
+  "tool.blocked",
   "checkpoint.created",
   "recovery.started",
   "recovery.completed",

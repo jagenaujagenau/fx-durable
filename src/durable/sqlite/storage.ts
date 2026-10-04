@@ -402,6 +402,10 @@ export const openSqliteStorage = (options: SqliteOptions): Storage => {
           agentId
         )
       ),
+    getCheckpoint: (agentId, sequence) =>
+      op("getCheckpoint", () =>
+        one("SELECT * FROM checkpoints WHERE agent_id = ? AND sequence = ?", checkpointFromRow, agentId, sequence)
+      ),
     insertCheckpoint: (c) =>
       op("insertCheckpoint", () => {
         stmt(

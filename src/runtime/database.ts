@@ -25,7 +25,7 @@ import { IdGenerator } from "./ids.js"
  * This module is the only runtime module allowed to import the journal; a lint
  * rule enforces it.
  */
-export type ModelJournal = Pick<Journal, "modelStarted" | "modelCompleted" | "modelFailed">
+export type ModelJournal = Pick<Journal, "modelStarted" | "modelCompleted" | "modelFailed" | "recordProgress">
 
 export interface DatabaseInterface {
   readonly run: <A>(f: (journal: Journal) => A) => Effect.Effect<A, StorageError | NotFoundError>
@@ -65,7 +65,8 @@ export const makeDatabase = (journal: Journal, registry: ExecutorRegistry): Data
   models: {
     modelStarted: (call) => journal.modelStarted(call),
     modelCompleted: (call, taskId, summary) => journal.modelCompleted(call, taskId, summary),
-    modelFailed: (call, taskId, error) => journal.modelFailed(call, taskId, error)
+    modelFailed: (call, taskId, error) => journal.modelFailed(call, taskId, error),
+    recordProgress: (taskId, progress) => journal.recordProgress(taskId, progress)
   },
   onCommitted: (listener) => journal.onCommitted(listener)
 })

@@ -31,8 +31,14 @@ export interface PromptResult {
   readonly usage: TurnUsage | null
 }
 
+/** The running libfx turn, for guidance while it runs. */
+export interface LiveTurn {
+  readonly steer: (text: string) => Promise<void>
+}
+
 export interface FxSession {
-  readonly prompt: (content: SubmissionContent) => Effect.Effect<PromptResult, ModelError>
+  /** `onTurn` receives the running turn as soon as libfx starts it. */
+  readonly prompt: (content: SubmissionContent, onTurn?: (turn: LiveTurn) => void) => Effect.Effect<PromptResult, ModelError>
   readonly checkpoint: () => Effect.Effect<Uint8Array, CheckpointError>
   readonly close: () => Effect.Effect<void>
 }
@@ -102,10 +108,11 @@ export const layer = (options: LibFxOptions = {}) =>
               : new ModelError({ agentId: session.agent.id, message: `failed to create libfx agent: ${message(cause)}`, cause })
         })
 
-        const prompt = (content: SubmissionContent) =>
+        const prompt = (content: SubmissionContent, onTurn?: (turn: LiveTurn) => void) =>
           Effect.tryPromise({
             try: async (signal) => {
               const turn = agent.prompt(content, { signal })
+              onTurn?.({ steer: (text) => turn.steer(text) })
               let text = ""
               for await (const event of turn) {
                 if (event.type === "text_delta") text += event.delta

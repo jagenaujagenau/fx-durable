@@ -180,6 +180,101 @@ process that's immediate. When another process asks (`fxd cancel`), it happens a
 call. An unsafe tool that was running is recorded as `outcome_unknown`, because stopping it locally doesn't prove
 the external effect was stopped.
 
+### Steering
+
+```ts
+const submission = await agent.submit("Fix the failing tests")
+// …while it works:
+await agent.steer("Use pnpm, not npm.")
+```
+
+`steer()` adds guidance to the turn that is running, the way you type to a coding agent while it works. fx-durable
+journals it first (`turn.steered`), then libfx hands it to the model at the next safe boundary without discarding
+work already done. If the process dies, the recovered attempt receives the guidance in its prompt. When no turn is
+running, or the turn finishes before the guidance reaches it, the text is submitted as a new request instead.
+
+When you'd rather refuse than queue, pass `whenBusy: "reject"`: if the agent is working or has requests queued,
+`submit()` submits nothing and rejects with `AgentBusyError`. The check and the insert are one transaction.
+
+```ts
+await agent.submit("Only if you're free", { whenBusy: "reject" })
+```
+
+### Subagents
+
+```ts
+import { defineSubagent } from "fx-durable"
+
+const research = defineSubagent({
+  name: "research",
+  description: "Investigate a question in the codebase and report back",
+  runtime: "researcher" // its own tools and instructions
+})
+
+const fx = await DurableFx.open({
+  storage: sqlite("./fx.db"),
+  runtimes: {
+    coding: { tools: [readFile, editFile, research] },
+    researcher: { tools: [readFile, grep], instructions: "Answer with evidence. Do not edit files." }
+  }
+})
+```
+
+A subagent is a tool that hands a task to a child durable agent and returns its answer. The child is an ordinary
+agent (`fx.attach(childId)` shows its events), named after the parent and the call's idempotency key, and it
+reports what it says as the call's progress. After a crash, the child's own work is recovered like any agent's, and
+the recovered parent calls the tool again and attaches to **the same child and the same request**. One task, one
+subagent, however many times the process dies.
+
+This uses a tool option you can use too: `resumeOnCall: true` (idempotent tools only). Such a call isn't replayed
+during recovery, which would block it while it waits on other durable work. When the recovered turn calls it again,
+it is retried with its original idempotency key.
+
+### Forks
+
+```ts
+const first = await agent.submit("Plan the migration")
+await first.result()
+// …later, try a different direction from that point:
+const alternative = await agent.fork("engineer-alt", { after: first.id, model: "anthropic/claude-opus-4.5" })
+```
+
+`fork()` starts a new agent from this one's conversation. By default it starts from the latest checkpoint; `after`
+picks the checkpoint written when that request completed, and `checkpoint` picks a sequence number. The fork keeps
+the runtime, model and working directory unless you override them, and the source agent is not touched. Forks
+start at turn boundaries, because libfx only checkpoints between turns.
+
+### Hooks
+
+```ts
+const fx = await DurableFx.open({
+  storage: sqlite("./fx.db"),
+  runtimes: {
+    coding: {
+      tools: [readFile, editFile, bash],
+      hooks: {
+        beforeTool: async (call, { signal }) =>
+          call.name === "bash" && !(await askUser(call.input, signal)) ? { block: "The user said no." } : undefined,
+        afterTool: (call, output) => redactSecrets(output)
+      }
+    }
+  }
+})
+```
+
+`beforeTool` runs before a call's intent is journaled. It can block the call (the model receives the message as the
+tool's error, and `tool.blocked` is recorded) or replace its input. Until it allows the call, nothing has started:
+a crash during a slow decision, such as a permission prompt, leaves no `outcome_unknown` behind, and the recovered
+turn asks again. `afterTool` can replace a result before it is journaled. Replays of interrupted calls and calls
+answered from the journal skip both hooks.
+
+### Progress
+
+Tools can report output while they run with `context.progress(chunk)`, and fx-durable records a model's partial text
+as it streams. Both are kept in the running task's `metadata.progress`, updated at most every 100 ms, so a viewer
+that attaches in the middle of a call can read them from `agent.currentTurn()`. Progress is not history: it is not
+an event, and the task's result replaces it.
+
 ## Guarantees
 
 The [crash suite](tests/crash/crash-matrix.test.ts) checks each of these by killing real processes with SIGKILL.

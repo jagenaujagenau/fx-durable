@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { defineDurableTool, NotFoundError, type DurableEvent } from "../../src/index.js"
+import { defineDurableTool, defineSubagent, NotFoundError, type DurableEvent } from "../../src/index.js"
 import { openFx, tempDb } from "../helpers.js"
 
 const echo = defineDurableTool({
@@ -37,3 +37,19 @@ describe("defineDurableTool reuse", () => {
     expect(() => defineDurableTool({ name: "ship", replay: "unsafe", reuse: false, inputSchema: { type: "object" }, execute: () => null })).toThrow(/reuse: false/)
   })
 })
+
+describe("resumeOnCall and subagents", () => {
+  it("allows resumeOnCall only with the idempotent policy", () => {
+    expect(() => defineDurableTool({ name: "wait", replay: "safe", resumeOnCall: true, inputSchema: { type: "object" }, execute: () => null })).toThrow(/resumeOnCall/)
+    const subagent = defineSubagent({ name: "research", description: "Research", runtime: "researcher" })
+    expect(subagent.resumeOnCall).toBe(true)
+    expect(subagent.replay).toEqual({ strategy: "idempotent" })
+  })
+
+  it("fails clearly when the subagent tool runs outside an open runtime", async () => {
+    const subagent = defineSubagent({ name: "research", description: "Research", runtime: "researcher" })
+    const context = { agentId: "a", turnId: "t", taskId: "k", idempotencyKey: "k", signal: new AbortController().signal, replay: false, progress: () => undefined }
+    await expect(subagent.run({ task: "x" }, context)).rejects.toThrow(/not part of an open DurableFx/)
+  })
+})
+

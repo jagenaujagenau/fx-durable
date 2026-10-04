@@ -120,11 +120,14 @@ export const assertInvariants = (box: Sandbox, expect: typeof import("vitest").e
     const events = box.query("SELECT id FROM events WHERE type = 'tool.outcome_unknown' AND task_id = ?", String(task.id))
     expect(events.length).toBe(1)
   }
-  // checkpoints are contiguous and one per completed turn
-  const seqs = box.query("SELECT sequence FROM checkpoints ORDER BY sequence").map((r) => Number(r.sequence))
-  expect(seqs).toEqual(seqs.map((_, i) => i + 1))
-  const completedTurns = box.query("SELECT COUNT(*) AS n FROM turns WHERE state = 'completed'")
-  expect(seqs.length).toBe(completedTurns[0]!.n)
+  // checkpoints are contiguous per agent and one per completed turn
+  for (const agent of box.query("SELECT id FROM agents")) {
+    const id = String(agent.id)
+    const seqs = box.query("SELECT sequence FROM checkpoints WHERE agent_id = ? ORDER BY sequence", id).map((r) => Number(r.sequence))
+    expect(seqs).toEqual(seqs.map((_, i) => i + 1))
+    const completedTurns = box.query("SELECT COUNT(*) AS n FROM turns WHERE agent_id = ? AND state = 'completed'", id)
+    expect(seqs.length).toBe(completedTurns[0]!.n)
+  }
   // event sequences are gap-free per agent
   const events = box.query("SELECT sequence FROM events WHERE agent_id = 'engineer' ORDER BY sequence")
   expect(events.map((e) => Number(e.sequence))).toEqual(events.map((_, i) => i + 1))

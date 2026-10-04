@@ -1,10 +1,12 @@
+import { bindTools } from "../tools/subagent.js"
+import type { ForkSpec } from "../durable/journal.js"
 import { Cause, Effect, Exit, Layer, ManagedRuntime, Option, Stream } from "effect"
 import type * as Sqlite from "../durable/sqlite/storage.js"
 import * as Executor from "./tool-executor.js"
 import * as Registry from "./tool-registry.js"
 import { AgentSupervisor, layer as supervisorLayer } from "./supervisor.js"
 import { CrashInjector, type CrashPlan } from "./crash.js"
-import { NotFoundError, SubmissionError } from "../domain/errors.js"
+import { AgentBusyError, AgentExistsError, NotFoundError, SubmissionError } from "../domain/errors.js"
 import { EventLog, layer as eventLogLayer } from "./events.js"
 import { IdGenerator } from "./ids.js"
 import { Database, databaseLayer } from "./database.js"
@@ -60,6 +62,12 @@ export interface AgentOptions {
 export interface SubmitOptions {
   /** External idempotency key: repeated submissions resolve to the same logical submission. */
   readonly requestId?: string
+  /**
+   * When the agent is already working: `"queue"` (default) runs this request
+   * after the current ones; `"reject"` submits nothing and rejects with
+   * `AgentBusyError`. To join the work in progress, use `agent.steer()`.
+   */
+  readonly whenBusy?: "queue" | "reject"
 }
 
 export interface EventsOptions {
@@ -68,6 +76,9 @@ export interface EventsOptions {
   readonly follow?: boolean
   readonly pollInterval?: number
 }
+
+/** libfx's limit for one steering message. */
+const MAX_STEERING_BYTES = 64 * 1024
 
 const TERMINAL_EVENTS = new Set(["submission.completed", "submission.failed", "submission.cancelled"])
 
@@ -150,6 +161,8 @@ export const openDurableFx = async (options: DurableFxOptions, layers: DurableFx
     stream: (stream) => Stream.toAsyncIterableWith(stream, context),
     dispose: () => runtime.dispose()
   })
+  // Before recovery: a recovered turn may call a subagent tool.
+  for (const definition of Object.values(options.runtimes ?? {})) bindTools(fx, definition.tools ?? [])
   if ((options.recovery ?? "auto") === "auto") await fx.resume()
   return fx
 }
@@ -167,6 +180,7 @@ export class DurableFx {
   }
 
   registerRuntime(id: string, definition: RuntimeDefinition): Promise<void> {
+    bindTools(this, definition.tools ?? [])
     return this.run(
       Effect.gen(function* () {
         const registry = yield* RuntimeRegistry
@@ -232,6 +246,7 @@ export class DurableAgent {
   async submit(content: SubmissionContent, options: SubmitOptions = {}): Promise<Submission> {
     const agentId = this.id
     const requestId = options.requestId ?? null
+    const reject = options.whenBusy === "reject"
     const { record, created } = await runOn(
       this.fx,
       Effect.gen(function* () {
@@ -239,16 +254,20 @@ export class DurableAgent {
         const supervisor = yield* AgentSupervisor
         const crash = yield* CrashInjector
         const decoded = yield* decodeContent(content)
-        const result = yield* database.run((journal) => journal.submit(agentId, requestId, decoded)).pipe(
-          // Another process may have won the UNIQUE(agent_id, request_id) race.
-          Effect.catchTag("StorageError", (error) =>
-            requestId !== null && /UNIQUE/i.test(error.message)
-              ? Effect.flatMap(database.read((storage) => storage.findSubmissionByRequest(agentId, requestId)), (existing) =>
-                  existing ? Effect.succeed({ record: existing, created: false }) : Effect.fail(error)
-                )
-              : Effect.fail(error)
+        const admitted = yield* database
+          .run((journal) => (reject ? journal.submitIfIdle(agentId, requestId, decoded) : journal.submit(agentId, requestId, decoded)))
+          .pipe(
+            // Another process may have won the UNIQUE(agent_id, request_id) race.
+            Effect.catchTag("StorageError", (error) =>
+              requestId !== null && /UNIQUE/i.test(error.message)
+                ? Effect.flatMap(database.read((storage) => storage.findSubmissionByRequest(agentId, requestId)), (existing) =>
+                    existing ? Effect.succeed({ record: existing, created: false }) : Effect.fail(error)
+                  )
+                : Effect.fail(error)
+            )
           )
-        )
+        if (admitted === null) return yield* new AgentBusyError({ agentId, message: `agent ${agentId} is busy` })
+        const result = admitted
         yield* crash.hit("submission.after-persist")
         yield* supervisor.ensureWorker(agentId)
         yield* supervisor.wake(agentId)
@@ -256,6 +275,41 @@ export class DurableAgent {
       })
     )
     return new Submission(this.fx, record.id, agentId, record.requestId, created)
+  }
+
+  /**
+   * Start a new agent from this one's conversation at a turn boundary: by
+   * default its latest checkpoint, or the one written when submission `after`
+   * completed, or checkpoint sequence `checkpoint`. The fork keeps the
+   * runtime, model and working directory unless overridden, then continues
+   * on its own; this agent is not touched. Rejects with `AgentExistsError` if
+   * `id` is taken.
+   */
+  async fork(id: string, options: ForkSpec = {}): Promise<DurableAgent> {
+    const sourceId = this.id
+    const created = await runOn(
+      this.fx,
+      Effect.flatMap(Database, (database) => database.run((journal) => journal.forkAgent(sourceId, id, options)))
+    )
+    if (!created) throw new AgentExistsError({ agentId: id, message: `agent ${id} already exists` })
+    return new DurableAgent(this.fx, id)
+  }
+
+  /**
+   * Add guidance to the turn that is running now, like typing while a coding
+   * agent works. It is journaled first and reaches the model at its next safe
+   * boundary; if the process dies, the recovered attempt receives it too.
+   * When no turn is running, or the turn finishes before the guidance reaches
+   * it, the text is submitted as a new request instead. Resolves with the
+   * submission that will act on it.
+   */
+  async steer(text: string): Promise<Submission> {
+    if (text.trim().length === 0) throw new TypeError("steering text cannot be empty")
+    if (Buffer.byteLength(text) > MAX_STEERING_BYTES) throw new RangeError(`steering text exceeds ${MAX_STEERING_BYTES} bytes`)
+    const agentId = this.id
+    const outcome = await runOn(this.fx, Effect.flatMap(AgentSupervisor, (supervisor) => supervisor.steer(agentId, text)))
+    if (outcome.kind === "idle" || outcome.kind === "missed") return this.submit(text)
+    return new Submission(this.fx, outcome.submissionId, agentId, null, false)
   }
 
   /** Persisted events after the cursor, then live events, without gaps. */

@@ -3,6 +3,7 @@
 import { Context, Effect, Layer } from "effect"
 import type { McpClient } from "libfx/mcp"
 import type { DurableTool } from "../tools/define-tool.js"
+import type { ToolHooks } from "../tools/hooks.js"
 import type { ReplayPolicy } from "../tools/replay-policy.js"
 import { RuntimeConfigurationError } from "../domain/errors.js"
 import type { DurableAgentRecord } from "../domain/schema.js"
@@ -28,6 +29,8 @@ export interface McpClientSpec {
 export interface RuntimeDefinition {
   readonly tools?: ReadonlyArray<DurableTool>
   readonly instructions?: string
+  /** Hooks around this runtime's tool calls, e.g. permission checks. */
+  readonly hooks?: ToolHooks
   readonly createMcpClients?: (agent: DurableAgentRecord) => Promise<ReadonlyArray<McpClientSpec>>
 }
 

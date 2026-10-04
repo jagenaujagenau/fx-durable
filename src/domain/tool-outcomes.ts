@@ -39,7 +39,8 @@ const preview = (value: Json, max = 2000): string => {
 export const buildRecoveryPrompt = (
   submission: SubmissionRecord,
   turn: TurnRecord,
-  tasks: ReadonlyArray<TaskRecord>
+  tasks: ReadonlyArray<TaskRecord>,
+  steering: ReadonlyArray<string> = []
 ): string => {
   const lines: Array<string> = [
     "[fx-durable recovery]",
@@ -50,6 +51,11 @@ export const buildRecoveryPrompt = (
     contentText(submission.content),
     ""
   ]
+  if (steering.length > 0) {
+    lines.push("Guidance the user added while the turn ran (still applies):")
+    for (const text of steering) lines.push(`- ${text}`)
+    lines.push("")
+  }
   const originals = tasks.filter((t) => t.type === "tool" && t.parentTaskId === null)
   const unknown: Array<string> = []
   if (originals.length > 0) {
@@ -73,7 +79,11 @@ export const buildRecoveryPrompt = (
           lines.push(`- ${call} → cancelled`)
           break
         default:
-          lines.push(`- ${call} → interrupted (not replayed)`)
+          lines.push(
+            effective.replayPolicy === "idempotent"
+              ? `- ${call} → interrupted. Call it again with the same input to resume it.`
+              : `- ${call} → interrupted (not replayed)`
+          )
       }
     }
     lines.push("")

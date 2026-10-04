@@ -46,6 +46,12 @@ declare module "libfx" {
   export interface FxTurn extends AsyncIterable<FxTurnEvent> {
     readonly result: Promise<FxTurnResult>
     cancel(): void
+    /**
+     * Add guidance to the running turn at the next safe model boundary. Accepted
+     * guidance appears as a `user_message` event. Rejects with
+     * "no prompt is running" once the turn has settled. 64 KiB per message.
+     */
+    steer(input: string | ReadonlyArray<{ readonly type: "text"; readonly text: string }>): Promise<void>
   }
 
   export interface FxAgent {

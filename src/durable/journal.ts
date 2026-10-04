@@ -83,6 +83,24 @@ export interface JournalOptions {
   readonly clock?: Clock
 }
 
+/** A submission, and whether this call created it (false for a retried request ID). */
+export interface Admission {
+  readonly record: SubmissionRecord
+  readonly created: boolean
+}
+
+/** Where a fork starts. Without `after` or `checkpoint`, it starts from the latest checkpoint. */
+export interface ForkSpec {
+  /** Start from the conversation as it was when this submission's turn completed. */
+  readonly after?: string
+  /** Start from this checkpoint sequence of the source agent. */
+  readonly checkpoint?: number
+  readonly runtime?: string
+  readonly model?: string
+  /** Working directory for the fork. The files are not copied: give it its own copy if both will edit. */
+  readonly cwd?: string | null
+}
+
 export interface AgentConfig {
   readonly runtime: string
   readonly model: string
@@ -299,6 +317,37 @@ export class Journal {
   }
 
   // -------------------------------------------------------------------------
+  // Steering and progress
+  // -------------------------------------------------------------------------
+
+  /**
+   * Journal guidance for the agent's active turn. Returns the turn it belongs
+   * to, or null when no turn is active (the caller submits it instead).
+   * Journaled guidance survives a crash: the recovered attempt receives it.
+   */
+  recordSteering(agentId: string, text: string): { readonly turnId: string; readonly submissionId: string } | null {
+    return this.transaction(() => {
+      const turn = this.#storage.activeTurn(agentId)
+      if (!turn) return null
+      this.appendEvent({ agentId, submissionId: turn.submissionId, turnId: turn.id, type: "turn.steered", payload: { text } })
+      return { turnId: turn.id, submissionId: turn.submissionId }
+    })
+  }
+
+  /**
+   * Store the latest streamed output of a running task (model text or tool
+   * output) in its metadata, for viewers that attach mid-task. No event: this
+   * is state to read, not history. Ignored once the task has settled.
+   */
+  recordProgress(taskId: string, progress: string): void {
+    this.transaction(() => {
+      const task = this.#storage.getTask(taskId)
+      if (task?.state !== "running") return
+      this.#storage.updateTask(taskId, { metadata: { progress } })
+    })
+  }
+
+  // -------------------------------------------------------------------------
   // Turns
   // -------------------------------------------------------------------------
 
@@ -480,35 +529,103 @@ export class Journal {
     })
   }
 
+  /**
+   * Create `newId` as a copy of `sourceId` at a checkpoint: same runtime,
+   * model and working directory (unless overridden), and the checkpoint as its
+   * first one, so it continues from that conversation. The source is not
+   * touched. Returns null when `newId` already exists. Forks start at turn
+   * boundaries, because libfx checkpoints only between turns.
+   */
+  forkAgent(sourceId: string, newId: string, spec: ForkSpec): DurableAgentRecord | null {
+    return this.transaction(() => {
+      const source = this.#storage.getAgent(sourceId)
+      if (!source) throw new NotFoundError({ entity: "agent", id: sourceId })
+      if (this.#storage.getAgent(newId)) return null
+
+      let sequence: number | null = spec.checkpoint ?? null
+      if (spec.after !== undefined) {
+        const turn = this.#storage.turnForSubmission(spec.after)
+        if (!turn || turn.agentId !== sourceId || turn.state !== "completed") {
+          throw new NotFoundError({ entity: "completed submission", id: spec.after })
+        }
+        sequence = (turn.baseCheckpointSeq ?? 0) + 1
+      }
+      const checkpoint = sequence === null ? this.#storage.latestCheckpoint(sourceId) : this.#storage.getCheckpoint(sourceId, sequence)
+      if (sequence !== null && !checkpoint) throw new NotFoundError({ entity: "checkpoint", id: `${sourceId}#${sequence}` })
+
+      this.upsertAgent(newId, {
+        runtime: spec.runtime ?? source.runtimeId,
+        model: spec.model ?? source.model,
+        cwd: spec.cwd === undefined ? source.cwd : spec.cwd
+      })
+      if (checkpoint) {
+        this.#storage.insertCheckpoint({ ...checkpoint, id: this.nextId("ckpt"), agentId: newId, sequence: 1, createdAt: this.now() })
+      }
+      this.appendEvent({
+        agentId: newId,
+        type: "agent.forked",
+        payload: { from: sourceId, checkpoint: checkpoint?.sequence ?? null }
+      })
+      return this.#storage.getAgent(newId)
+    })
+  }
+
   /** Accept a submission, or resolve to the existing one with the same `(agent, requestId)`. */
   submit(
     agentId: string,
     requestId: string | null,
     content: SubmissionContent
-  ): { readonly record: SubmissionRecord; readonly created: boolean } {
+  ): Admission {
+    return this.transaction(() => this.admit(agentId, requestId, content))
+  }
+
+  /**
+   * Like `submit`, but only when the agent has nothing running or queued.
+   * Returns null when it is busy, in the same transaction as the check. A
+   * retried request ID still resolves to its existing submission.
+   */
+  submitIfIdle(
+    agentId: string,
+    requestId: string | null,
+    content: SubmissionContent
+  ): Admission | null {
     return this.transaction(() => {
-      if (requestId !== null) {
-        const existing = this.#storage.findSubmissionByRequest(agentId, requestId)
-        if (existing) return { record: existing, created: false }
-      }
-      const at = this.now()
-      const record: SubmissionRecord = {
-        id: this.nextId("sub"),
-        agentId,
-        requestId,
-        content,
-        state: "queued",
-        result: null,
-        error: null,
-        cancelRequested: false,
-        createdAt: at,
-        updatedAt: at
-      }
-      this.#storage.insertSubmission(record)
-      this.appendEvent({ agentId, submissionId: record.id, type: "submission.created", payload: { requestId, content } })
-      return { record, created: true }
+      // A retried request ID resolves to its submission even while busy.
+      const existing = requestId === null ? null : this.#storage.findSubmissionByRequest(agentId, requestId)
+      if (existing) return { record: existing, created: false }
+      if (this.#storage.activeTurn(agentId) || this.#storage.nextQueuedSubmission(agentId)) return null
+      return this.admit(agentId, requestId, content)
     })
   }
+
+  /** Insert a queued submission (or return the existing one for a retried request ID). Callers hold a transaction. */
+  private admit(
+    agentId: string,
+    requestId: string | null,
+    content: SubmissionContent
+  ): Admission {
+    if (requestId !== null) {
+      const existing = this.#storage.findSubmissionByRequest(agentId, requestId)
+      if (existing) return { record: existing, created: false }
+    }
+    const at = this.now()
+    const record: SubmissionRecord = {
+      id: this.nextId("sub"),
+      agentId,
+      requestId,
+      content,
+      state: "queued",
+      result: null,
+      error: null,
+      cancelRequested: false,
+      createdAt: at,
+      updatedAt: at
+    }
+    this.#storage.insertSubmission(record)
+    this.appendEvent({ agentId, submissionId: record.id, type: "submission.created", payload: { requestId, content } })
+    return { record, created: true }
+  }
+
 
   /**
    * Record a cancellation request. "Cancel requested" and "cancelled" are

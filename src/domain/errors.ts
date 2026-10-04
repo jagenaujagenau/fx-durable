@@ -25,6 +25,12 @@ export class ModelError extends Schema.TaggedError<ModelError>()("ModelError", {
   cause: Schema.optional(Schema.Unknown)
 }) {}
 
+/** A `beforeTool` hook refused the call; it never started. */
+export class ToolBlockedError extends Schema.TaggedError<ToolBlockedError>()("ToolBlockedError", {
+  tool: Schema.String,
+  message: Schema.String
+}) {}
+
 export class ToolExecutionError extends Schema.TaggedError<ToolExecutionError>()("ToolExecutionError", {
   taskId: Schema.String,
   tool: Schema.String,
@@ -53,6 +59,18 @@ export class UnknownOutcomeError extends Schema.TaggedError<UnknownOutcomeError>
 export class SubmissionError extends Schema.TaggedError<SubmissionError>()("SubmissionError", {
   submissionId: Schema.String,
   state: Schema.String,
+  message: Schema.String
+}) {}
+
+/** `submit(…, { whenBusy: "reject" })` found a running or queued request. Nothing was submitted. */
+export class AgentBusyError extends Schema.TaggedError<AgentBusyError>()("AgentBusyError", {
+  agentId: Schema.String,
+  message: Schema.String
+}) {}
+
+/** `fork()` was given an agent id that is already taken. */
+export class AgentExistsError extends Schema.TaggedError<AgentExistsError>()("AgentExistsError", {
+  agentId: Schema.String,
   message: Schema.String
 }) {}
 
