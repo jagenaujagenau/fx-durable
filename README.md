@@ -149,6 +149,11 @@ Each tool declares what may happen to it after a crash.
 | `{ strategy: "idempotent", key }` | Retried with the same idempotency key | payment APIs that accept idempotency keys |
 | `"unsafe"` | Marked `outcome_unknown` and never replayed automatically | deploy, send email, git push |
 
+When a recovered turn repeats a call that already completed before the crash, fx-durable answers it from the journal
+instead of executing again. That is what keeps a finished deploy from running twice. For a replay-safe tool that
+observes changing state, such as reading a file the agent later edited, the journaled answer can be stale. Set
+`reuse: false` on such tools and they run again. It is only allowed with `replay: "safe"`.
+
 A tool that knows its request went out but can't tell whether it took effect can throw `new OutcomeUnknown(message)`.
 MCP tools plug in through a runtime's `createMcpClients`. They default to `"unsafe"`; you can change that per server
 with `replay` or per tool with `replayOverrides`.

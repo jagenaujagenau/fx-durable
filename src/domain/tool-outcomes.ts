@@ -77,7 +77,9 @@ export const buildRecoveryPrompt = (
       }
     }
     lines.push("")
-    lines.push("Calling a completed tool again with the same input returns the journaled result without re-executing it.")
+    lines.push(
+      "Calling a completed tool again with the same input returns the journaled result without re-executing it, except read-only tools that observe current state: those run again."
+    )
     lines.push("")
   }
   for (const notice of unknown) {

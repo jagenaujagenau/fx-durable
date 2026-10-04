@@ -21,6 +21,8 @@ const CHUNK_DELAY = Number(process.env.FXD_TEST_CHUNK_DELAY ?? "0")
 const LIVE = process.env.FXD_TEST_LIVE === "1"
 const MODEL = process.env.FXD_TEST_MODEL ?? "anthropic/claude-sonnet-4.5"
 const INSTRUCTIONS = process.env.FXD_TEST_INSTRUCTIONS ?? "You are a test agent."
+// read_file opts out of result reuse: it observes state, so a recovered turn re-reads.
+const READ_REUSE = process.env.FXD_TEST_READ_REUSE !== "0"
 
 const record = (effect: string, detail: JsonObject = {}) =>
   appendFileSync(LEDGER, `${JSON.stringify({ effect, detail, pid: process.pid })}\n`)
@@ -29,6 +31,7 @@ const readFile = defineDurableTool({
   name: "read_file",
   description: "Read a file",
   replay: "safe",
+  reuse: READ_REUSE,
   inputSchema: Schema.Struct({ path: Schema.String }),
   execute: ({ path }) => {
     record("read_file", { path })

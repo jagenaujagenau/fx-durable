@@ -291,6 +291,20 @@ export class DurableAgent {
     return runOn(this.fx, Effect.flatMap(Database, (database) => database.read((storage) => storage.listSubmissions(this.id, limit))))
   }
 
+  /** One journaled task (a tool or model call) of this agent, with its input and output. */
+  task(taskId: string): Promise<TaskRecord> {
+    const agentId = this.id
+    return runOn(
+      this.fx,
+      Effect.gen(function* () {
+        const database = yield* Database
+        const task = yield* database.read((storage) => storage.getTask(taskId))
+        if (!task || task.agentId !== agentId) return yield* new NotFoundError({ entity: "task", id: taskId })
+        return task
+      })
+    )
+  }
+
   /** Current turn and its task journal, if any. */
   currentTurn(): Promise<{ readonly turn: TurnRecord; readonly tasks: ReadonlyArray<TaskRecord> } | null> {
     const id = this.id

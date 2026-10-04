@@ -196,6 +196,10 @@ export const layer = Layer.effect(
       if (!slot) return yield* runFresh(ctx, tool, input, inputHash, null)
 
       const effective = effectiveTask(slot, tasks)
+      // Observation tools re-read current state rather than return what they saw before the crash.
+      if (!tool.reuse && (effective.state === "completed" || effective.state === "failed")) {
+        return yield* runFresh(ctx, tool, input, inputHash, null)
+      }
       switch (effective.state) {
         case "completed": {
           yield* database.run((journal) => journal.appendEvent({

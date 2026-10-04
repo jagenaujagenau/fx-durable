@@ -27,6 +27,14 @@ interface ToolBase {
   readonly name: string
   readonly description?: string
   readonly replay: ReplayPolicy
+  /**
+   * When a recovered turn repeats a call that already completed before the
+   * crash, return the journaled result instead of executing again (default
+   * `true`). Set `false` on replay-safe tools that observe changing state
+   * (reading files, listing, checking status): a stale observation from
+   * before the crash can mislead the model. Only allowed with `replay: "safe"`.
+   */
+  readonly reuse?: boolean
 }
 
 /** A tool whose input is decoded and validated with an Effect Schema. */
@@ -57,6 +65,8 @@ export interface DurableTool {
   readonly name: string
   readonly description: string
   readonly replay: ReplayPolicy
+  /** Whether a completed call is answered from the journal when a recovered turn repeats it. */
+  readonly reuse: boolean
   readonly jsonSchema: JsonObject
   /** Validate the input and execute. Rejects on invalid input or tool failure. */
   readonly run: (input: Json, context: DurableToolContext) => Promise<Json>
@@ -115,11 +125,16 @@ export function defineDurableTool<S extends StandardSchemaV1>(definition: Standa
 export function defineDurableTool(definition: JsonToolDefinition): DurableTool
 export function defineDurableTool(definition: AnyDefinition): DurableTool {
   validateName(definition.name)
+  const reuse = definition.reuse ?? true
+  if (!reuse && definition.replay !== "safe") {
+    throw new TypeError(`tool ${definition.name}: reuse: false requires replay: "safe" (running it again must be harmless)`)
+  }
   const base = {
     _tag: "DurableTool" as const,
     name: definition.name,
     description: definition.description ?? definition.name,
-    replay: definition.replay
+    replay: definition.replay,
+    reuse
   }
   if (isSchemaDefinition(definition)) {
     const decode = Schema.decodeUnknownSync(definition.inputSchema)

@@ -51,6 +51,21 @@ describe("crash matrix: model boundaries", () => {
   })
 })
 
+describe("crash matrix: reuse", () => {
+  it("a safe tool with reuse: false runs again after a crash instead of returning its old result", () => {
+    const box = sandbox()
+    const env = { FXD_TEST_READ_REUSE: "0" }
+    const crashed = box.run({ crash: crashAt("model.after-response", undefined, 2), env })
+    expect(crashed.signal).toBe("SIGKILL")
+    const recovered = box.run({ env })
+    expect(recovered.output?.ok, recovered.stderr).toBe(true)
+    assertInvariants(box, expect)
+    expect(box.count("read_file")).toBe(2)
+    expect(box.count("deploy")).toBe(1)
+    expect(box.query("SELECT id FROM events WHERE type = 'tool.reused' AND payload LIKE '%read_file%'")).toEqual([])
+  })
+})
+
 describe("crash matrix: tool boundaries", () => {
   it("before tool intent commit: the effect never started, so it runs once after recovery", () => {
     const box = sandbox()
