@@ -1,0 +1,52 @@
+{
+  "name": "fx-durable",
+  "version": "0.1.0",
+  "description": "Durable execution for libfx. Agents should outlive their processes.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "fxd": "./dist/cli/main.js",
+    "fx-durable": "./dist/cli/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "tsc --noEmit -p . && tsc -p tsconfig.check.json",
+    "test": "vitest run",
+    "demo": "node dist/cli/main.js demo",
+    "fxd": "node dist/cli/main.js",
+    "lint": "oxlint"
+  },
+  "dependencies": {
+    "effect": "4.0.0",
+    "libfx": "0.0.12"
+  },
+  "devDependencies": {
+    "@oxlint/plugins": "1.86.0",
+    "@types/node": "^26.6.4",
+    "oxlint": "1.86.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./sqlite": {
+      "types": "./dist/sqlite/index.d.ts",
+      "default": "./dist/sqlite/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "default": "./dist/testing/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ]
+}
