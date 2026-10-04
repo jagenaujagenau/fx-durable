@@ -16,7 +16,7 @@ export type {
 } from "./tools/define-tool.js"
 export type { StandardSchemaV1 } from "./tools/standard-schema.js"
 export type { Json, JsonArray, JsonObject } from "./domain/json.js"
-export type { Transport } from "./domain/transport.js"
+export type { Transport, TransportContext } from "./domain/transport.js"
 export type { ReplayPolicy } from "./tools/replay-policy.js"
 export type { McpClientSpec, RuntimeDefinition } from "./runtime/runtime-registry.js"
 export type { RecoveryReport } from "./runtime/recovery.js"
