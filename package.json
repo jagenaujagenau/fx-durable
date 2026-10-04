@@ -1,6 +1,6 @@
 {
   "name": "fx-durable",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Durable execution for libfx. Agents should outlive their processes.",
   "keywords": [
     "libfx",
@@ -49,6 +49,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "engines": {
