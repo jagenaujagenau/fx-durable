@@ -37,6 +37,14 @@ export const SubmissionState = Schema.Literals([
 ])
 export type SubmissionState = typeof SubmissionState.Type
 
+/**
+ * What a submission asks for: `input` is a request for the model; `reset`
+ * starts a new context (optionally with a summary); `compaction` asks the
+ * model to summarize the context, then starts a new one from that summary.
+ */
+export const SubmissionKind = Schema.Literals(["input", "reset", "compaction"])
+export type SubmissionKind = typeof SubmissionKind.Type
+
 export const TurnState = Schema.Literals(["running", "completed", "failed", "cancelled", "interrupted"])
 export type TurnState = typeof TurnState.Type
 
@@ -109,6 +117,7 @@ export const SubmissionRecord = Schema.Struct({
   id: Schema.String,
   agentId: Schema.String,
   requestId: Schema.NullOr(Schema.String),
+  kind: SubmissionKind,
   content: SubmissionContent,
   state: SubmissionState,
   result: Schema.NullOr(SubmissionResult),
@@ -158,7 +167,14 @@ export const AgentCheckpoint = Schema.Struct({
   id: Schema.String,
   agentId: Schema.String,
   sequence: Schema.Number,
+  /** libfx's checkpoint. Empty: a new context, with no history. */
   fxCheckpoint: Schema.Uint8Array,
+  /**
+   * The summary of earlier context the model sees in its instructions from
+   * this checkpoint on (a handoff, or a compaction's result). Each checkpoint
+   * carries over the previous one's until a reset replaces it.
+   */
+  summary: Schema.NullOr(Schema.String),
   runtimeId: Schema.String,
   model: Schema.String,
   createdAt: Schema.Date

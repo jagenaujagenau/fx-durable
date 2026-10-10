@@ -7,6 +7,7 @@ import type { ToolHooks } from "../tools/hooks.js"
 import type { ReplayPolicy } from "../tools/replay-policy.js"
 import { RuntimeConfigurationError } from "../domain/errors.js"
 import type { DurableAgentRecord } from "../domain/schema.js"
+import type { CompactionOptions } from "../domain/context.js"
 
 /**
  * A checkpoint cannot serialize executable TypeScript, so agents persist a
@@ -31,6 +32,8 @@ export interface RuntimeDefinition {
   readonly instructions?: string
   /** Hooks around this runtime's tool calls, e.g. permission checks. */
   readonly hooks?: ToolHooks
+  /** Compact automatically once the context reaches a size (see `agent.compact()`). */
+  readonly compaction?: CompactionOptions
   readonly createMcpClients?: (agent: DurableAgentRecord) => Promise<ReadonlyArray<McpClientSpec>>
 }
 

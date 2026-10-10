@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Breaking
+
+- Custom `Storage` implementations must persist two new fields: `SubmissionRecord.kind` (`"input"`, `"reset"` or
+  `"compaction"`) and `AgentCheckpoint.summary` (string or null). SQLite storage migrates itself (migration 2), and
+  the storage contract checks both.
+
 ### Changed
 
 - **A storage error now closes fx-durable** instead of being logged and retried. The call that hit it rejects with
@@ -11,6 +17,14 @@
   storage error.
 
 ### Added
+
+- **Reset and handoff:** `agent.reset({ summary? })` starts a new context. With a summary, the model sees it in its
+  instructions until the next reset. Queued like a request; recorded as `context.reset`.
+- **Compaction:** `agent.compact({ instructions? })` asks the model for a summary and continues from it. It is a
+  journaled turn (crash-safe, counted in `usage()`), with the agent's tools visible but not runnable.
+  `RuntimeDefinition.compaction: { maxContextTokens, instructions? }` compacts automatically, before the next queued
+  request.
+- Steering sent during a reset or compaction is submitted as a new request instead of joining it.
 
 - `fx.closed`: settles with `{ reason: "closed" }` after `close()`, or `{ reason: "failed", error }` after a storage
   error. `DatabaseInterface.onFailure` (`fx-durable/effect`) reports the first storage error.

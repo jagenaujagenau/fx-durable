@@ -94,7 +94,8 @@ export const layer = (options: LibFxOptions = {}) =>
         }
         if (session.instructions) createOptions.instructions = session.instructions
         if (session.tools.length > 0) createOptions.tools = session.tools
-        if (session.checkpoint) createOptions.checkpoint = session.checkpoint
+        // An empty checkpoint marks a new context: nothing to restore.
+        if (session.checkpoint && session.checkpoint.byteLength > 0) createOptions.checkpoint = session.checkpoint
 
         const agent = yield* Effect.tryPromise({
           try: () => createFxAgent(createOptions),

@@ -1,13 +1,14 @@
 import { hostname } from "node:os"
-import { Cause, Context, Effect, Exit, Fiber, FiberMap, Layer, Queue, Schedule, Scope } from "effect"
+import { Cause, Context, Effect, Exit, Fiber, FiberMap, Layer, Option, Queue, Schedule, Scope } from "effect"
 import { ToolExecutor } from "./tool-executor.js"
 import { ToolRegistry } from "./tool-registry.js"
 import { CrashInjector } from "./crash.js"
-import { NotFoundError, type StorageError } from "../domain/errors.js"
+import { ModelError, NotFoundError, type StorageError } from "../domain/errors.js"
 import { IdGenerator } from "./ids.js"
 import { Database } from "./database.js"
-import { LibFx, type FxSession, type LibfxTool } from "./libfx.js"
-import { makeDurableFetch, type ModelTransportHolder } from "./model.js"
+import { LibFx, type FxSession, type LibfxTool, type PromptResult } from "./libfx.js"
+import { decodeModelTaskMetadata, makeDurableFetch, type ModelTransportHolder } from "./model.js"
+import { compactionPrompt, contentText, instructionsWithSummary } from "../domain/context.js"
 import { RuntimeRegistry } from "./runtime-registry.js"
 import type { DurableAgentRecord, SubmissionContent, TurnRecord } from "../domain/schema.js"
 import { isTerminalSubmission } from "../domain/state-machine.js"
@@ -159,7 +160,7 @@ export const layer = (options: SupervisorOptions = {}) =>
             const fx = yield* libfx.create({
               agent,
               checkpoint: checkpoint?.fxCheckpoint ?? null,
-              instructions: resolved.instructions,
+              instructions: instructionsWithSummary(resolved.instructions, checkpoint?.summary),
               tools,
               fetch
             })
@@ -178,6 +179,64 @@ export const layer = (options: SupervisorOptions = {}) =>
           return built
         })
 
+      /** What an attempt produced, before it is committed with the turn. */
+      interface Outcome {
+        readonly result: PromptResult
+        /** Continue from this session's checkpoint, or start a new context with a summary. */
+        readonly next: { readonly kind: "continue"; readonly session: AgentSession } | { readonly kind: "new-context"; readonly summary: string | null }
+        /** Compact before the next request (the context reached `compaction.maxContextTokens`). */
+        readonly compactNext: string | null
+      }
+
+      /** Ask the model to summarize the context the turn started from, in a session of its own without working tools. */
+      const summarize = (agent: DurableAgentRecord, turn: TurnRecord, ctx: TurnContext, extra: string) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const base =
+              turn.baseCheckpointSeq === null ? null : yield* database.read((storage) => storage.getCheckpoint(agent.id, turn.baseCheckpointSeq ?? 0))
+            if (!base || base.fxCheckpoint.byteLength === 0) {
+              // Nothing beyond the current summary (if any) to fold in.
+              const summary = base?.summary ?? null
+              return { text: summary ?? "", stopReason: "empty", usage: null, summary } as const
+            }
+            const runtime = yield* registry.resolve(agent.runtimeId)
+            const resolved = yield* toolRegistry.resolve(agent, runtime)
+            const holder: ModelTransportHolder = { current: ctx }
+            // The same tool definitions (providers reject tool calls in history without them), none of them callable.
+            const tools: Array<LibfxTool> = resolved.tools.map((tool) => ({
+              name: tool.name,
+              description: tool.description,
+              inputSchema: tool.jsonSchema,
+              execute: () => Promise.reject(new Error("Tools are disabled while the conversation is being summarized."))
+            }))
+            const fx = yield* Effect.acquireRelease(
+              libfx.create({
+                agent,
+                checkpoint: base.fxCheckpoint,
+                instructions: instructionsWithSummary(resolved.instructions, base.summary),
+                tools,
+                fetch: makeDurableFetch(holder, libfx.transport, database.models, crash)
+              }),
+              (session) => session.close()
+            )
+            const result = yield* fx.prompt(compactionPrompt(extra))
+            const summary = result.text.trim()
+            if (!summary) return yield* new ModelError({ agentId: agent.id, message: "compaction produced an empty summary" })
+            return { ...result, text: summary, summary } as const
+          })
+        )
+
+      /** The input-tokens-plus-output of the turn's last model request, if it reported usage. */
+      const contextTokens = (turnId: string) =>
+        Effect.map(
+          database.read((storage) => storage.tasksForTurn(turnId)),
+          (tasks) => {
+            const last = tasks.filter((t) => t.type === "model" && t.state === "completed").at(-1)
+            const meta = last ? Option.getOrNull(decodeModelTaskMetadata(last.metadata)) : null
+            return meta?.inputTokens == null ? null : meta.inputTokens + (meta.outputTokens ?? 0)
+          }
+        )
+
       /** Run one attempt of an active turn owned by this executor. */
       const runAttempt = (turn: TurnRecord, ctx: TurnContext) =>
         Effect.gen(function* () {
@@ -195,51 +254,95 @@ export const layer = (options: SupervisorOptions = {}) =>
             return
           }
 
-          const sessionExit = yield* Effect.exit(getSession(agent, turn.baseCheckpointSeq))
-          if (Exit.isFailure(sessionExit)) {
-            const failure = sessionExit.cause.reasons.find((r) => r._tag === "Fail")
-            const error = failure && failure._tag === "Fail" ? failure.error : null
-            if (error && error._tag === "RuntimeConfigurationError") {
-              // Do not discard work: park the turn until the runtime is registered again.
-              yield* database.run((journal) => journal.parkTurn(turn, agent.runtimeId, error.message))
-              return
-            }
-            const message = error ? error.message : Cause.pretty(sessionExit.cause)
-            yield* database.run((journal) => journal.failTurn(turn, message))
-            return
-          }
-          const session = sessionExit.value
-          if (session.checkpointSeq !== turn.baseCheckpointSeq) {
-            yield* database.run((journal) => journal.failTurn(turn, `checkpoint mismatch: turn started from ${turn.baseCheckpointSeq}, latest is ${session.checkpointSeq}`))
-            return
-          }
-
-          // Guidance journaled for this turn: the first attempt receives it once
-          // libfx starts; a recovery attempt gets it in its prompt.
-          const steering = yield* database.read((storage) => steeringFor(storage, turn.agentId, turn.id))
-          const content: SubmissionContent =
-            turn.attempt === 1
-              ? submission.content
-              : buildRecoveryPrompt(submission, turn, yield* database.read((storage) => storage.tasksForTurn(turn.id)), steering)
-          if (turn.attempt === 1) ctx.pendingSteering.push(...steering)
-
           const settleInflight = Effect.promise(() => Promise.allSettled(ctx.inflight))
 
-          const attempt = Effect.gen(function* () {
-            session.holder.current = ctx
-            const result = yield* session.fx
-              .prompt(content, (live) => {
-                ctx.steer = live.steer
-                for (const text of ctx.pendingSteering.splice(0)) live.steer(text).catch(() => undefined)
-              })
-              .pipe(
-                Effect.ensuring(
-                  Effect.sync(() => {
-                    session.holder.current = null
-                    ctx.steer = null
-                  })
+          /** A request for the model: prompt the agent's session, continuing its conversation. */
+          const answer = Effect.gen(function* () {
+            const sessionExit = yield* Effect.exit(getSession(agent, turn.baseCheckpointSeq))
+            if (Exit.isFailure(sessionExit)) {
+              const failure = sessionExit.cause.reasons.find((r) => r._tag === "Fail")
+              const error = failure && failure._tag === "Fail" ? failure.error : null
+              if (error && error._tag === "RuntimeConfigurationError") {
+                // Do not discard work: park the turn until the runtime is registered again.
+                yield* database.run((journal) => journal.parkTurn(turn, agent.runtimeId, error.message))
+                return null
+              }
+              const message = error ? error.message : Cause.pretty(sessionExit.cause)
+              yield* database.run((journal) => journal.failTurn(turn, message))
+              return null
+            }
+            const session = sessionExit.value
+            if (session.checkpointSeq !== turn.baseCheckpointSeq) {
+              yield* database.run((journal) => journal.failTurn(turn, `checkpoint mismatch: turn started from ${turn.baseCheckpointSeq}, latest is ${session.checkpointSeq}`))
+              return null
+            }
+
+            // Guidance journaled for this turn: the first attempt receives it once
+            // libfx starts; a recovery attempt gets it in its prompt.
+            const steering = yield* database.read((storage) => steeringFor(storage, turn.agentId, turn.id))
+            const content: SubmissionContent =
+              turn.attempt === 1
+                ? submission.content
+                : buildRecoveryPrompt(submission, turn, yield* database.read((storage) => storage.tasksForTurn(turn.id)), steering)
+            if (turn.attempt === 1) ctx.pendingSteering.push(...steering)
+
+            return Effect.gen(function* () {
+              session.holder.current = ctx
+              const result = yield* session.fx
+                .prompt(content, (live) => {
+                  ctx.steer = live.steer
+                  for (const text of ctx.pendingSteering.splice(0)) live.steer(text).catch(() => undefined)
+                })
+                .pipe(
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      session.holder.current = null
+                      ctx.steer = null
+                    })
+                  )
                 )
-              )
+              const runtime = yield* registry.resolve(agent.runtimeId)
+              const limit = runtime.compaction?.maxContextTokens
+              const tokens = limit === undefined ? null : yield* contextTokens(turn.id)
+              const full = tokens !== null && limit !== undefined && tokens >= limit
+              const outcome: Outcome = {
+                result,
+                next: { kind: "continue", session },
+                compactNext: full ? (runtime.compaction?.instructions ?? "") : null
+              }
+              return outcome
+            })
+          })
+
+          let produce: Effect.Effect<Outcome, unknown>
+          switch (submission.kind) {
+            case "reset": {
+              const summary = contentText(submission.content).trim() || null
+              produce = Effect.succeed({
+                result: { text: summary ?? "", stopReason: "reset", usage: null },
+                next: { kind: "new-context", summary },
+                compactNext: null
+              })
+              break
+            }
+            case "compaction":
+              // Replay-safe: an interrupted compaction is simply summarized again.
+              produce = Effect.map(summarize(agent, turn, ctx, contentText(submission.content)), (summary) => ({
+                result: { text: summary.text, stopReason: summary.stopReason, usage: summary.usage },
+                next: { kind: "new-context", summary: summary.summary },
+                compactNext: null
+              }))
+              break
+            case "input": {
+              const prompted = yield* answer
+              if (prompted === null) return
+              produce = prompted
+              break
+            }
+          }
+
+          const attempt = Effect.gen(function* () {
+            const outcome = yield* produce
             yield* settleInflight
 
             // Checkpoint + turn completion commit in ONE transaction: a
@@ -251,7 +354,8 @@ export const layer = (options: SupervisorOptions = {}) =>
               attempt: turn.attempt
             }))
             yield* crash.hit("checkpoint.before-write")
-            const bytes = yield* session.fx.checkpoint()
+            const next = outcome.next
+            const bytes = next.kind === "continue" ? yield* next.session.fx.checkpoint() : new Uint8Array()
             const written = yield* database.run((journal) =>
               journal.completeTurn(
                 {
@@ -259,12 +363,16 @@ export const layer = (options: SupervisorOptions = {}) =>
                   agent,
                   checkpointTaskId: checkpointTask.id,
                   checkpoint: bytes,
-                  result: { text: result.text, stopReason: result.stopReason, usage: result.usage }
+                  result: { text: outcome.result.text, stopReason: outcome.result.stopReason, usage: outcome.result.usage },
+                  newContext: next.kind === "new-context" ? { summary: next.summary } : null,
+                  compactNext: outcome.compactNext
                 },
                 () => crash.hitSync("checkpoint.during-write")
               )
             )
-            session.checkpointSeq = written.sequence
+            if (next.kind === "continue") next.session.checkpointSeq = written.sequence
+            // The live session holds the old context; the next turn builds a fresh one.
+            else yield* closeSession(agent.id)
             yield* crash.hit("checkpoint.after-write")
           })
 

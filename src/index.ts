@@ -4,7 +4,17 @@
  * Effect models execution. SQLite models durability. libfx models the agent.
  */
 export { DurableFx, DurableAgent, Submission } from "./runtime/durable-fx.js"
-export type { AgentOptions, CloseReason, DurableFxOptions, EventsOptions, SubmitOptions, UsageOptions } from "./runtime/durable-fx.js"
+export type {
+  AgentOptions,
+  CloseReason,
+  CompactOptions,
+  DurableFxOptions,
+  EventsOptions,
+  ResetOptions,
+  SubmitOptions,
+  UsageOptions
+} from "./runtime/durable-fx.js"
+export type { CompactionOptions } from "./domain/context.js"
 export { usageOf } from "./domain/usage.js"
 export type { ModelPrice, ModelPrices, UsageReport, UsageTotals } from "./domain/usage.js"
 export { defineDurableTool, OutcomeUnknown } from "./tools/define-tool.js"
@@ -36,6 +46,7 @@ export type {
   DurableAgentRecord,
   DurableEvent,
   SubmissionContent,
+  SubmissionKind,
   SubmissionRecord,
   SubmissionResult,
   SubmissionState,

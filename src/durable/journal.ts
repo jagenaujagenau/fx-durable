@@ -10,6 +10,7 @@ import type {
   DurableEvent,
   ReplayPolicyName,
   SubmissionContent,
+  SubmissionKind,
   SubmissionRecord,
   SubmissionResult,
   SubmissionState,
@@ -73,6 +74,8 @@ export interface WriteCheckpoint {
   readonly runtimeId: string
   readonly model: string
   readonly data: Uint8Array
+  /** The context summary from this checkpoint on. Default: the previous checkpoint's. */
+  readonly summary?: string | null
   /** The checkpoint the turn started from; anything else is a programmer error. */
   readonly expectedPrevious: number | null
 }
@@ -136,6 +139,14 @@ export interface TurnCompletion {
   readonly checkpointTaskId: string
   readonly checkpoint: Uint8Array
   readonly result: SubmissionResult
+  /**
+   * Start a new context with this summary (null: none) instead of continuing
+   * the conversation: for reset and compaction turns, whose `checkpoint` is
+   * empty.
+   */
+  readonly newContext?: { readonly summary: string | null } | null
+  /** Queue a compaction to run before anything else queued (automatic compaction). */
+  readonly compactNext?: SubmissionContent | null
 }
 
 const isTerminal = (state: string) => ["completed", "failed", "cancelled", "outcome_unknown"].includes(state)
@@ -293,7 +304,8 @@ export class Journal {
    */
   writeCheckpoint(fields: WriteCheckpoint): AgentCheckpoint {
     return this.transaction(() => {
-      const previousSeq = this.#storage.latestCheckpoint(fields.agentId)?.sequence ?? null
+      const previous = this.#storage.latestCheckpoint(fields.agentId)
+      const previousSeq = previous?.sequence ?? null
       if (previousSeq !== fields.expectedPrevious) {
         throw new Error(
           `checkpoint sequence conflict for ${fields.agentId}: expected ${fields.expectedPrevious}, found ${previousSeq}`
@@ -304,6 +316,7 @@ export class Journal {
         agentId: fields.agentId,
         sequence: (previousSeq ?? 0) + 1,
         fxCheckpoint: fields.data,
+        summary: fields.summary === undefined ? (previous?.summary ?? null) : fields.summary,
         runtimeId: fields.runtimeId,
         model: fields.model,
         createdAt: this.now()
@@ -333,7 +346,8 @@ export class Journal {
   recordSteering(agentId: string, text: string): { readonly turnId: string; readonly submissionId: string } | null {
     return this.transaction(() => {
       const turn = this.#storage.activeTurn(agentId)
-      if (!turn) return null
+      // Guidance is for the model's work; during a reset or compaction it waits as a new request.
+      if (!turn || this.#storage.getSubmission(turn.submissionId)?.kind !== "input") return null
       this.appendEvent({ agentId, submissionId: turn.submissionId, turnId: turn.id, type: "turn.steered", payload: { text } })
       return { turnId: turn.id, submissionId: turn.submissionId }
     })
@@ -579,9 +593,10 @@ export class Journal {
   submit(
     agentId: string,
     requestId: string | null,
-    content: SubmissionContent
+    content: SubmissionContent,
+    kind: SubmissionKind = "input"
   ): Admission {
-    return this.admitOnce(agentId, requestId, () => this.transaction(() => this.admit(agentId, requestId, content)))
+    return this.admitOnce(agentId, requestId, () => this.transaction(() => this.admit(agentId, requestId, content, kind)))
   }
 
   /**
@@ -623,7 +638,9 @@ export class Journal {
   private admit(
     agentId: string,
     requestId: string | null,
-    content: SubmissionContent
+    content: SubmissionContent,
+    kind: SubmissionKind = "input",
+    createdAt?: Date
   ): Admission {
     if (requestId !== null) {
       const existing = this.#storage.findSubmissionByRequest(agentId, requestId)
@@ -634,16 +651,17 @@ export class Journal {
       id: this.nextId("sub"),
       agentId,
       requestId,
+      kind,
       content,
       state: "queued",
       result: null,
       error: null,
       cancelRequested: false,
-      createdAt: at,
+      createdAt: createdAt ?? at,
       updatedAt: at
     }
     this.#storage.insertSubmission(record)
-    this.appendEvent({ agentId, submissionId: record.id, type: "submission.created", payload: { requestId, content } })
+    this.appendEvent({ agentId, submissionId: record.id, type: "submission.created", payload: { requestId, kind, content } })
     return { record, created: true }
   }
 
@@ -781,8 +799,27 @@ export class Journal {
         runtimeId: agent.runtimeId,
         model: agent.model,
         data: completion.checkpoint,
+        summary: completion.newContext ? completion.newContext.summary : undefined,
         expectedPrevious: turn.baseCheckpointSeq
       })
+      if (completion.newContext) {
+        const submission = this.#storage.getSubmission(turn.submissionId)
+        this.appendEvent({
+          agentId: agent.id,
+          submissionId: turn.submissionId,
+          turnId: turn.id,
+          type: "context.reset",
+          payload: { sequence: checkpoint.sequence, kind: submission?.kind ?? "reset", summary: completion.newContext.summary }
+        })
+      }
+      if (completion.compactNext != null) {
+        // Queued work runs oldest first, and everything older than the submission that just
+        // completed has run. Dated just before it, the compaction runs before anything queued
+        // since, even within the same millisecond.
+        const submission = this.#storage.getSubmission(turn.submissionId)
+        const before = submission ? new Date(submission.createdAt.getTime() - 1) : undefined
+        this.admit(agent.id, null, completion.compactNext, "compaction", before)
+      }
       beforeCommit?.()
       this.transitionTask(completion.checkpointTaskId, "completed", { output: { sequence: checkpoint.sequence } })
       this.closeTurnTask(turn.id, "completed")

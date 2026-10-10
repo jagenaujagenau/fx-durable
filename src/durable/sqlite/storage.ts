@@ -63,6 +63,7 @@ const submissionFromRow = (r: Row): SubmissionRecord =>
     id: r.id,
     agentId: r.agent_id,
     requestId: str(r.request_id),
+    kind: r.kind,
     content: decodePayloadSync(blobText(r.content), "submission.content"),
     state: r.state,
     result: decodePayloadSync(blobText(r.result), "submission.result"),
@@ -113,6 +114,7 @@ const checkpointFromRow = (r: Row): AgentCheckpoint =>
     agentId: r.agent_id,
     sequence: Number(r.sequence),
     fxCheckpoint: r.data instanceof Uint8Array ? new Uint8Array(r.data) : r.data,
+    summary: str(r.summary),
     runtimeId: r.runtime_id,
     model: r.model,
     createdAt: date(r.created_at)
@@ -283,11 +285,12 @@ export const openSqliteStorage = (options: SqliteOptions): Storage => {
     insertSubmission: (s) =>
       op("insertSubmission", () => {
         stmt(
-          "INSERT INTO submissions (id, agent_id, request_id, content, state, result, error, cancel_requested, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO submissions (id, agent_id, request_id, kind, content, state, result, error, cancel_requested, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ).run(
           s.id,
           s.agentId,
           s.requestId,
+          s.kind,
           encodePayload(s.content),
           s.state,
           s.result === null ? null : encodePayload(s.result),
@@ -409,8 +412,8 @@ export const openSqliteStorage = (options: SqliteOptions): Storage => {
     insertCheckpoint: (c) =>
       op("insertCheckpoint", () => {
         stmt(
-          "INSERT INTO checkpoints (id, agent_id, sequence, runtime_id, model, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-        ).run(c.id, c.agentId, c.sequence, c.runtimeId, c.model, c.fxCheckpoint, ms(c.createdAt))
+          "INSERT INTO checkpoints (id, agent_id, sequence, runtime_id, model, data, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        ).run(c.id, c.agentId, c.sequence, c.runtimeId, c.model, c.fxCheckpoint, c.summary, ms(c.createdAt))
       }),
 
     appendEvent: (e) =>

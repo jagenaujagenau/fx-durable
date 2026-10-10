@@ -244,6 +244,30 @@ picks the checkpoint written when that request completed, and `checkpoint` picks
 the runtime, model and working directory unless you override them, and the source agent is not touched. Forks
 start at turn boundaries, because libfx only checkpoints between turns.
 
+### Reset, handoff and compaction
+
+```ts
+await agent.reset()                                        // new context: the model no longer sees the conversation
+await agent.reset({ summary: "We are migrating to v2." })  // a handoff: the model sees this instead
+const summary = await (await agent.compact()).result()     // the model summarizes; the summary replaces the context
+
+const fx = await DurableFx.open({
+  storage: sqlite("./fx.db"),
+  runtimes: { coding: { tools, compaction: { maxContextTokens: 150_000 } } } // or compact automatically
+})
+```
+
+The conversation is never deleted: it stays in the journal and in older checkpoints, so `fork({ after })` can still
+start from it. A summary travels in the agent's instructions (after the runtime's own), where the model sees it on
+every request until the next reset replaces it; libfx doesn't store instructions in its checkpoints, so nothing is
+rewritten.
+
+Resets and compactions are queued like requests and are turns of their own: they wait for the work already queued,
+appear in `submissions()` with their `kind`, and record `context.reset`. A compaction's summary is one model request,
+counted in `usage()`. It sees the agent's tools, but can't run them. If the process dies during the summary, the
+recovered turn summarizes again. Automatic compaction runs after the turn whose last model request reached
+`maxContextTokens`, before anything else queued. Steering sent during a reset or compaction becomes a new request.
+
 ### Hooks
 
 ```ts
@@ -516,6 +540,7 @@ fx-durable/
 │   └── index.ts             # main entry, no Effect required
 ├── tests/
 │   ├── boundary/            # using fx-durable without Effect
+│   ├── context/             # reset, handoff, compaction
 │   ├── crash/               # SIGKILL crash matrix
 │   ├── fixtures/            # app process the crash suite kills
 │   ├── failure/             # storage errors close the runtime; reopening recovers

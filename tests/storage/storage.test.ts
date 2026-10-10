@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite"
 import { describe, expect, it } from "vitest"
 import { InvalidTransitionError, StorageError } from "../../src/domain/errors.js"
 import { decodePayloadSync, encodePayload } from "../../src/domain/schema.js"
+import { migration001 } from "../../src/durable/sqlite/migrations/001_initial.js"
 import { openTestJournal, tempDb } from "../helpers.js"
 
 const agent = (id: string) => ({
@@ -19,6 +20,7 @@ const submission = (id: string) => ({
   id,
   agentId: "a",
   requestId: "same",
+  kind: "input" as const,
   content: "x",
   state: "queued" as const,
   result: null,
@@ -34,8 +36,25 @@ describe("SQLite storage (plain synchronous code)", () => {
     openTestJournal(db).storage.close()
     const raw = new DatabaseSync(db)
     expect(raw.prepare("PRAGMA journal_mode").get()?.journal_mode).toBe("wal")
-    expect(raw.prepare("SELECT version FROM schema_migrations").all()).toEqual([{ version: 1 }])
+    expect(raw.prepare("SELECT version FROM schema_migrations").all()).toEqual([{ version: 1 }, { version: 2 }])
     raw.close()
+  })
+
+  it("upgrades a 0.2.0 database: existing submissions are inputs, existing checkpoints have no summary", () => {
+    const db = tempDb()
+    const raw = new DatabaseSync(db)
+    raw.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)")
+    raw.exec(migration001.sql)
+    raw.exec("INSERT INTO schema_migrations VALUES (1, 'initial', 1)")
+    raw.exec("INSERT INTO agents VALUES ('a','coding','m',NULL,'idle',NULL,1,1)")
+    raw.prepare("INSERT INTO submissions (id, agent_id, request_id, content, state, result, error, cancel_requested, created_at, updated_at) VALUES ('s1','a',NULL,?,'queued',NULL,NULL,0,1,1)").run(encodePayload("hi"))
+    raw.prepare("INSERT INTO checkpoints (id, agent_id, sequence, runtime_id, model, data, created_at) VALUES ('c1','a',1,'coding','m',?,1)").run(new Uint8Array([1]))
+    raw.close()
+
+    const { storage } = openTestJournal(db)
+    expect(storage.getSubmission("s1")?.kind).toBe("input")
+    expect(storage.latestCheckpoint("a")?.summary).toBeNull()
+    storage.close()
   })
 
   it("transactions are atomic: a throw rolls back every write and its events", () => {

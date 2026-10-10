@@ -1,7 +1,8 @@
 import type { DatabaseSync } from "node:sqlite"
 import { migration001 } from "./migrations/001_initial.js"
+import { migration002 } from "./migrations/002_context.js"
 
-export const migrations = [migration001] as const
+export const migrations = [migration001, migration002] as const
 
 /**
  * Apply pending migrations atomically. Each migration and its version row

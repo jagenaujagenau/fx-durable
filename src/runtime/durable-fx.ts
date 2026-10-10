@@ -19,6 +19,7 @@ import {
   decodeWith,
   type DurableAgentRecord,
   type DurableEvent,
+  type SubmissionKind,
   type SubmissionRecord,
   type SubmissionResult,
   type TaskRecord,
@@ -69,6 +70,18 @@ export interface SubmitOptions {
    * `AgentBusyError`. To join the work in progress, use `agent.steer()`.
    */
   readonly whenBusy?: "queue" | "reject"
+}
+
+export interface ResetOptions {
+  /** A handoff: what the model should know in the new context. */
+  readonly summary?: string
+  readonly requestId?: string
+}
+
+export interface CompactOptions {
+  /** Extra guidance for the summary, e.g. "keep the list of failing tests". */
+  readonly instructions?: string
+  readonly requestId?: string
 }
 
 export interface EventsOptions {
@@ -319,7 +332,33 @@ export class DurableAgent {
   ) {}
 
   /** Durably accept a request. The submission is committed before this resolves. */
-  async submit(content: SubmissionContent, options: SubmitOptions = {}): Promise<Submission> {
+  submit(content: SubmissionContent, options: SubmitOptions = {}): Promise<Submission> {
+    return this.admit("input", content, options)
+  }
+
+  /**
+   * Start a new context: from the next request on, the model no longer sees
+   * this conversation (it stays in the journal and in older checkpoints, so
+   * forks can still start from it). With `summary`, a handoff, the model sees
+   * that text in its instructions instead. Queued like a request: it runs
+   * after the work already queued, and its submission resolves once it has.
+   */
+  reset(options: ResetOptions = {}): Promise<Submission> {
+    return this.admit("reset", options.summary ?? "", { requestId: options.requestId })
+  }
+
+  /**
+   * Replace the context with a summary the model writes of it: a reset whose
+   * handoff is a compaction. The summary is one model request, journaled and
+   * counted in `usage()` like any other; the submission's result is the
+   * summary. Queued like a request. Runtimes can also compact automatically
+   * (`RuntimeDefinition.compaction`).
+   */
+  compact(options: CompactOptions = {}): Promise<Submission> {
+    return this.admit("compaction", options.instructions ?? "", { requestId: options.requestId })
+  }
+
+  private async admit(kind: SubmissionKind, content: SubmissionContent, options: SubmitOptions): Promise<Submission> {
     const agentId = this.id
     const requestId = options.requestId ?? null
     const reject = options.whenBusy === "reject"
@@ -331,7 +370,7 @@ export class DurableAgent {
         const crash = yield* CrashInjector
         const decoded = yield* decodeContent(content)
         const admitted = yield* database.run((journal) =>
-          reject ? journal.submitIfIdle(agentId, requestId, decoded) : journal.submit(agentId, requestId, decoded)
+          reject ? journal.submitIfIdle(agentId, requestId, decoded) : journal.submit(agentId, requestId, decoded, kind)
         )
         if (admitted === null) return yield* new AgentBusyError({ agentId, message: `agent ${agentId} is busy` })
         const result = admitted

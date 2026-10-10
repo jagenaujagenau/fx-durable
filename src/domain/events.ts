@@ -37,6 +37,7 @@ export const EVENT_TYPES = [
   "tool.outcome_unknown_refused",
   "tool.blocked",
   "checkpoint.created",
+  "context.reset",
   "recovery.started",
   "recovery.completed",
   "recovery.failed"

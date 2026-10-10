@@ -34,6 +34,7 @@ const submission = (id: string, requestId: string | null = null): SubmissionReco
   id,
   agentId: "a",
   requestId,
+  kind: "input",
   content: "hello",
   state: "queued",
   result: null,
@@ -192,6 +193,7 @@ export const storageContract: ReadonlyArray<StorageContractCase> = [
         agentId: "a",
         sequence,
         fxCheckpoint: new Uint8Array([sequence]),
+        summary: sequence === 2 ? "earlier work" : null,
         runtimeId: "runtime",
         model: "model",
         createdAt: at
@@ -201,6 +203,8 @@ export const storageContract: ReadonlyArray<StorageContractCase> = [
       assert.throws(() => storage.insertCheckpoint(checkpoint("c3", 2)), StorageError)
       assert.equal(storage.latestCheckpoint("a")?.id, "c2")
       assert.deepEqual(Array.from(storage.latestCheckpoint("a")?.fxCheckpoint ?? []), [2])
+      assert.equal(storage.latestCheckpoint("a")?.summary, "earlier work")
+      assert.equal(storage.getCheckpoint("a", 1)?.summary, null)
       assert.equal(storage.getCheckpoint("a", 1)?.id, "c1")
       assert.equal(storage.getCheckpoint("a", 3), null)
     }
