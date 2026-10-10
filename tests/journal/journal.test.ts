@@ -478,6 +478,9 @@ describe("model calls", () => {
       finishReason: "stop",
       inputTokens: 10,
       outputTokens: 2,
+      cacheReadTokens: null,
+      cacheWriteTokens: null,
+      reasoningTokens: null,
       durationMs: 1200
     })
     expect(storage.getTask(taskId)).toMatchObject({ state: "completed", completedAt: new Date(T0 + 1200) })

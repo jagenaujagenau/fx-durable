@@ -22,6 +22,11 @@ import { IdGenerator } from "./ids.js"
  * - `models` is the narrow journal surface for libfx's transport callback,
  *   which is plain Promise code outside Effect (it throws on failure).
  *
+ * A `StorageError` from any of these is fatal to the runtime: the in-memory
+ * view may no longer match what is stored. The first one is reported through
+ * `onFailure` (fx-durable then closes, and the next open recovers from what
+ * was committed); the call that hit it still fails with it.
+ *
  * This module is the only runtime module allowed to import the journal; a lint
  * rule enforces it.
  */
@@ -35,41 +40,82 @@ export interface DatabaseInterface {
   readonly models: ModelJournal
   /** Listen for events after their transaction commits. Returns an unsubscribe function. */
   readonly onCommitted: (listener: (event: DurableEvent) => void) => () => void
+  /** Called once, with the first storage error. Called at once if one already happened. Returns an unsubscribe function. */
+  readonly onFailure: (listener: (error: StorageError) => void) => () => void
 }
 
 export class Database extends Context.Service<Database, DatabaseInterface>()("fx-durable/Database") {}
 
-const attempt = <A>(f: () => A): Effect.Effect<A, StorageError | NotFoundError> =>
-  Effect.suspend(() => {
-    try {
-      return Effect.succeed(f())
-    } catch (error) {
-      if (error instanceof StorageError || error instanceof NotFoundError) return Effect.fail(error)
-      return Effect.die(error)
+/** Records the first storage error and tells the listeners about it. */
+const failureSignal = () => {
+  let failure: StorageError | null = null
+  const listeners = new Set<(error: StorageError) => void>()
+  return {
+    report: (error: StorageError) => {
+      if (failure) return
+      failure = error
+      for (const listener of listeners) listener(error)
+      listeners.clear()
+    },
+    subscribe: (listener: (error: StorageError) => void) => {
+      if (failure) {
+        listener(failure)
+        return () => undefined
+      }
+      listeners.add(listener)
+      return () => {
+        listeners.delete(listener)
+      }
     }
-  })
+  }
+}
 
-const attemptRead = <A>(f: () => A): Effect.Effect<A, StorageError> =>
-  Effect.suspend(() => {
+export const makeDatabase = (journal: Journal, registry: ExecutorRegistry): DatabaseInterface => {
+  const failures = failureSignal()
+
+  /** Run plain journal code; a storage error is reported before it is rethrown. */
+  const guarded = <A>(f: () => A): A => {
     try {
-      return Effect.succeed(f())
+      return f()
     } catch (error) {
-      return error instanceof StorageError ? Effect.fail(error) : Effect.die(error)
+      if (error instanceof StorageError) failures.report(error)
+      throw error
     }
-  })
+  }
 
-export const makeDatabase = (journal: Journal, registry: ExecutorRegistry): DatabaseInterface => ({
-  run: (f) => attempt(() => f(journal)),
-  read: (f) => attemptRead(() => f(journal.reader)),
-  executors: (f) => attemptRead(() => f(registry)),
-  models: {
-    modelStarted: (call) => journal.modelStarted(call),
-    modelCompleted: (call, taskId, summary) => journal.modelCompleted(call, taskId, summary),
-    modelFailed: (call, taskId, error) => journal.modelFailed(call, taskId, error),
-    recordProgress: (taskId, progress) => journal.recordProgress(taskId, progress)
-  },
-  onCommitted: (listener) => journal.onCommitted(listener)
-})
+  const attempt = <A>(f: () => A): Effect.Effect<A, StorageError | NotFoundError> =>
+    Effect.suspend(() => {
+      try {
+        return Effect.succeed(guarded(f))
+      } catch (error) {
+        if (error instanceof StorageError || error instanceof NotFoundError) return Effect.fail(error)
+        return Effect.die(error)
+      }
+    })
+
+  const attemptRead = <A>(f: () => A): Effect.Effect<A, StorageError> =>
+    Effect.suspend(() => {
+      try {
+        return Effect.succeed(guarded(f))
+      } catch (error) {
+        return error instanceof StorageError ? Effect.fail(error) : Effect.die(error)
+      }
+    })
+
+  return {
+    run: (f) => attempt(() => f(journal)),
+    read: (f) => attemptRead(() => f(journal.reader)),
+    executors: (f) => attemptRead(() => f(registry)),
+    models: {
+      modelStarted: (call) => guarded(() => journal.modelStarted(call)),
+      modelCompleted: (call, taskId, summary) => guarded(() => journal.modelCompleted(call, taskId, summary)),
+      modelFailed: (call, taskId, error) => guarded(() => journal.modelFailed(call, taskId, error)),
+      recordProgress: (taskId, progress) => guarded(() => journal.recordProgress(taskId, progress))
+    },
+    onCommitted: (listener) => journal.onCommitted(listener),
+    onFailure: (listener) => failures.subscribe(listener)
+  }
+}
 
 const isSqliteConfig = (storage: SqliteStorageConfig | Storage): storage is SqliteStorageConfig =>
   "_tag" in storage && storage._tag === "SqliteStorageConfig"

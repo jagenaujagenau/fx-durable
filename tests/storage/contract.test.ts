@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { openMemoryStorage } from "../../src/durable/memory/storage.js"
 import { openSqliteStorage } from "../../src/durable/sqlite/storage.js"
 import { storageContract } from "../../src/testing/index.js"
 import { tempDb } from "../helpers.js"
@@ -7,6 +8,19 @@ describe("storage contract: SQLite", () => {
   for (const check of storageContract) {
     it(check.name, () => {
       const storage = openSqliteStorage({ path: tempDb() })
+      try {
+        check.run(storage)
+      } finally {
+        storage.close()
+      }
+    })
+  }
+})
+
+describe("storage contract: memory", () => {
+  for (const check of storageContract) {
+    it(check.name, () => {
+      const storage = openMemoryStorage()
       try {
         check.run(storage)
       } finally {

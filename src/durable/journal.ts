@@ -1,4 +1,4 @@
-import { InterruptedError, NotFoundError } from "../domain/errors.js"
+import { InterruptedError, NotFoundError, StorageError } from "../domain/errors.js"
 import type { AppendEvent } from "../domain/events.js"
 import { SystemClock, type Clock } from "./clock.js"
 import { executorGone, lostReason } from "../domain/executors.js"
@@ -120,8 +120,13 @@ export interface ModelSummary {
   readonly text: string
   readonly toolCalls: ReadonlyArray<string>
   readonly finishReason: string | null
+  /** Includes cache reads and writes, as the gateway reports it. */
   readonly inputTokens: number | null
+  /** Includes reasoning tokens. */
   readonly outputTokens: number | null
+  readonly cacheReadTokens: number | null
+  readonly cacheWriteTokens: number | null
+  readonly reasoningTokens: number | null
   readonly durationMs: number
 }
 
@@ -576,7 +581,7 @@ export class Journal {
     requestId: string | null,
     content: SubmissionContent
   ): Admission {
-    return this.transaction(() => this.admit(agentId, requestId, content))
+    return this.admitOnce(agentId, requestId, () => this.transaction(() => this.admit(agentId, requestId, content)))
   }
 
   /**
@@ -589,13 +594,29 @@ export class Journal {
     requestId: string | null,
     content: SubmissionContent
   ): Admission | null {
-    return this.transaction(() => {
+    return this.admitOnce(agentId, requestId, () => this.transaction(() => {
       // A retried request ID resolves to its submission even while busy.
       const existing = requestId === null ? null : this.#storage.findSubmissionByRequest(agentId, requestId)
       if (existing) return { record: existing, created: false }
       if (this.#storage.activeTurn(agentId) || this.#storage.nextQueuedSubmission(agentId)) return null
       return this.admit(agentId, requestId, content)
-    })
+    }))
+  }
+
+  /**
+   * Run an admission; if another process committed the same request ID first
+   * (a storage without serializable transactions can let both pass the
+   * lookup), return that submission instead of failing.
+   */
+  private admitOnce<A extends Admission | null>(agentId: string, requestId: string | null, admit: () => A): A | Admission {
+    try {
+      return admit()
+    } catch (error) {
+      if (requestId === null || !(error instanceof StorageError) || !/UNIQUE/i.test(error.message)) throw error
+      const existing = this.#storage.findSubmissionByRequest(agentId, requestId)
+      if (!existing) throw error
+      return { record: existing, created: false }
+    }
   }
 
   /** Insert a queued submission (or return the existing one for a retried request ID). Callers hold a transaction. */
@@ -695,7 +716,13 @@ export class Journal {
           text: summary.text,
           toolCalls: summary.toolCalls,
           finishReason: summary.finishReason,
-          usage: { inputTokens: summary.inputTokens, outputTokens: summary.outputTokens }
+          usage: {
+            inputTokens: summary.inputTokens,
+            outputTokens: summary.outputTokens,
+            cacheReadTokens: summary.cacheReadTokens,
+            cacheWriteTokens: summary.cacheWriteTokens,
+            reasoningTokens: summary.reasoningTokens
+          }
         }
       }
     )

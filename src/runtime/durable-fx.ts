@@ -6,7 +6,7 @@ import * as Executor from "./tool-executor.js"
 import * as Registry from "./tool-registry.js"
 import { AgentSupervisor, layer as supervisorLayer } from "./supervisor.js"
 import { CrashInjector, type CrashPlan } from "./crash.js"
-import { AgentBusyError, AgentExistsError, NotFoundError, SubmissionError } from "../domain/errors.js"
+import { AgentBusyError, AgentExistsError, DurableFxFailedError, NotFoundError, SubmissionError, type StorageError } from "../domain/errors.js"
 import { EventLog, layer as eventLogLayer } from "./events.js"
 import { IdGenerator } from "./ids.js"
 import { Database, databaseLayer } from "./database.js"
@@ -26,6 +26,7 @@ import {
 } from "../domain/schema.js"
 import type { Storage } from "../durable/storage.js"
 import type { Transport } from "../domain/transport.js"
+import { usageOf, type ModelPrices, type UsageReport } from "../domain/usage.js"
 
 /**
  * Promise/AsyncIterable façade over the Effect-native runtime, so adopting
@@ -77,6 +78,11 @@ export interface EventsOptions {
   readonly pollInterval?: number
 }
 
+export interface UsageOptions {
+  /** USD per million tokens by model id. Without a model's price, its `costUsd` (and the total's) is `null`. */
+  readonly prices?: ModelPrices
+}
+
 /** libfx's limit for one steering message. */
 const MAX_STEERING_BYTES = 64 * 1024
 
@@ -123,10 +129,15 @@ export const buildLayer = (options: DurableFxOptions, layers: DurableFxLayers = 
   return recoveryLayer({ maxAttempts: options.maxRecoveryAttempts }).pipe(Layer.provideMerge(supervisor))
 }
 
+/** Why a `DurableFx` closed: `close()` was called, or a storage error closed it. */
+export type CloseReason = { readonly reason: "closed" } | { readonly reason: "failed"; readonly error: StorageError }
+
 interface Runner {
   readonly run: <A, E>(effect: Effect.Effect<A, E, Services>) => Promise<A>
   readonly stream: <A, E>(stream: Stream.Stream<A, E, Services>) => AsyncIterable<A>
-  readonly dispose: () => Promise<void>
+  /** Shut down (once) and dispose the runtime; later calls reject. */
+  readonly close: () => Promise<void>
+  readonly closed: Promise<CloseReason>
 }
 
 // The Effect runtime behind each façade object. Module-private, so the
@@ -135,13 +146,16 @@ const runners = new WeakMap<DurableFx, Runner>()
 
 const notOpen = () => new Error("DurableFx is not open")
 
+const failedError = (cause: StorageError) =>
+  new DurableFxFailedError({ message: `fx-durable closed after a storage error: ${cause.message}`, cause })
+
 const runnerOf = (fx: DurableFx): Runner => {
   const runner = runners.get(fx)
   if (!runner) throw notOpen()
   return runner
 }
 
-/** Run on an open façade; a closed or never-opened one rejects instead of throwing. */
+/** Run on an open façade; a closed, failed, or never-opened one rejects instead of throwing. */
 const runOn = <A, E>(fx: DurableFx, effect: Effect.Effect<A, E, Services>): Promise<A> => {
   const runner = runners.get(fx)
   return runner ? runner.run(effect) : Promise.reject(notOpen())
@@ -152,18 +166,58 @@ export const openDurableFx = async (options: DurableFxOptions, layers: DurableFx
   const runtime = ManagedRuntime.make(buildLayer(options, layers))
   const context = await runtime.context()
   const fx = new DurableFx()
-  runners.set(fx, {
-    run: (effect) =>
-      runtime.runPromiseExit(effect).then((exit) => {
-        if (Exit.isSuccess(exit)) return exit.value
-        throw Cause.squash(exit.cause)
-      }),
-    stream: (stream) => Stream.toAsyncIterableWith(stream, context),
-    dispose: () => runtime.dispose()
+
+  let failure: StorageError | null = null
+  let closing: Promise<void> | null = null
+  let settle: (reason: CloseReason) => void = () => undefined
+  const closed = new Promise<CloseReason>((resolve) => {
+    settle = resolve
   })
+  const shutdown = (reason: CloseReason) => {
+    closing ??= (async () => {
+      await runtime.runPromise(Effect.flatMap(AgentSupervisor, (s) => s.shutdown())).catch(() => undefined)
+      await runtime.dispose().catch(() => undefined)
+      settle(reason)
+    })()
+    return closing
+  }
+
+  runners.set(fx, {
+    run: async (effect) => {
+      if (failure) throw failedError(failure)
+      if (closing) throw notOpen()
+      const exit = await runtime.runPromiseExit(effect)
+      if (Exit.isSuccess(exit)) return exit.value
+      const error = Cause.squash(exit.cause)
+      // The call that hit the storage error rejects with it; the others with DurableFxFailedError.
+      if (failure && error !== failure) throw failedError(failure)
+      throw error
+    },
+    stream: (stream) => Stream.toAsyncIterableWith(stream, context),
+    close: () => shutdown({ reason: "closed" }),
+    closed
+  })
+
+  await runtime.runPromise(
+    Effect.map(Database, (database) =>
+      database.onFailure((error) => {
+        failure = error
+        // Not from inside the failing call: it runs on the runtime being disposed.
+        setTimeout(() => void shutdown({ reason: "failed", error }), 0)
+      })
+    )
+  )
+
   // Before recovery: a recovered turn may call a subagent tool.
   for (const definition of Object.values(options.runtimes ?? {})) bindTools(fx, definition.tools ?? [])
-  if ((options.recovery ?? "auto") === "auto") await fx.resume()
+  if ((options.recovery ?? "auto") === "auto") {
+    try {
+      await fx.resume()
+    } catch (error) {
+      await shutdown(failure ? { reason: "failed", error: failure } : { reason: "closed" })
+      throw error
+    }
+  }
   return fx
 }
 
@@ -224,15 +278,37 @@ export class DurableFx {
     return new DurableAgent(this, id)
   }
 
+  /** Token and cost totals across every agent, from the journaled model requests. */
+  usage(options: UsageOptions = {}): Promise<UsageReport> {
+    return this.run(
+      Effect.gen(function* () {
+        const database = yield* Database
+        const log = yield* EventLog
+        const agents = yield* database.read((storage) => storage.listAgents())
+        const events: Array<DurableEvent> = []
+        for (const agent of agents) events.push(...(yield* log.history(agent.id)))
+        return usageOf(events, options.prices)
+      })
+    )
+  }
+
   listAgents(): Promise<ReadonlyArray<DurableAgentRecord>> {
     return this.run(Effect.flatMap(Database, (database) => database.read((storage) => storage.listAgents())))
   }
 
   /** Stop executing. In-flight turns are left interrupted and recover on the next open. */
   async close(): Promise<void> {
-    await this.run(Effect.flatMap(AgentSupervisor, (s) => s.shutdown())).catch(() => undefined)
-    await runnerOf(this).dispose()
-    runners.delete(this)
+    await runners.get(this)?.close()
+  }
+
+  /**
+   * Settles once this instance has closed: `{ reason: "closed" }` after
+   * `close()`, or `{ reason: "failed", error }` after a storage error closed
+   * it. Everything committed before the error is kept; open again to recover.
+   * Calls made after a failure reject with `DurableFxFailedError`.
+   */
+  get closed(): Promise<CloseReason> {
+    return runnerOf(this).closed
   }
 }
 
@@ -254,18 +330,9 @@ export class DurableAgent {
         const supervisor = yield* AgentSupervisor
         const crash = yield* CrashInjector
         const decoded = yield* decodeContent(content)
-        const admitted = yield* database
-          .run((journal) => (reject ? journal.submitIfIdle(agentId, requestId, decoded) : journal.submit(agentId, requestId, decoded)))
-          .pipe(
-            // Another process may have won the UNIQUE(agent_id, request_id) race.
-            Effect.catchTag("StorageError", (error) =>
-              requestId !== null && /UNIQUE/i.test(error.message)
-                ? Effect.flatMap(database.read((storage) => storage.findSubmissionByRequest(agentId, requestId)), (existing) =>
-                    existing ? Effect.succeed({ record: existing, created: false }) : Effect.fail(error)
-                  )
-                : Effect.fail(error)
-            )
-          )
+        const admitted = yield* database.run((journal) =>
+          reject ? journal.submitIfIdle(agentId, requestId, decoded) : journal.submit(agentId, requestId, decoded)
+        )
         if (admitted === null) return yield* new AgentBusyError({ agentId, message: `agent ${agentId} is busy` })
         const result = admitted
         yield* crash.hit("submission.after-persist")
@@ -326,6 +393,12 @@ export class DurableAgent {
         })
       )
     )
+  }
+
+  /** This agent's token and cost totals, from its journaled model requests. A fork counts only its own. */
+  usage(options: UsageOptions = {}): Promise<UsageReport> {
+    const agentId = this.id
+    return runOn(this.fx, Effect.map(Effect.flatMap(EventLog, (log) => log.history(agentId)), (events) => usageOf(events, options.prices)))
   }
 
   info(): Promise<DurableAgentRecord> {

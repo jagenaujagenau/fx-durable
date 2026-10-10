@@ -275,6 +275,61 @@ as it streams. Both are kept in the running task's `metadata.progress`, updated 
 that attaches in the middle of a call can read them from `agent.currentTurn()`. Progress is not history: it is not
 an event, and the task's result replaces it.
 
+### Coding tools
+
+`fx-durable/tools` has file and shell tools for coding agents, with replay policies already chosen:
+
+```ts
+import { createCodingTools } from "fx-durable/tools"
+
+const tools = createCodingTools() // works in the agent's cwd
+const fx = await DurableFx.open({
+  storage: sqlite("./fx.db"),
+  runtimes: { coding: { tools: tools.all }, explorer: { tools: tools.readOnly } }
+})
+await fx.agent("engineer", { runtime: "coding", model: "anthropic/claude-sonnet-4.5", cwd: "/path/to/repo" })
+```
+
+| Tool | Replay | After a crash |
+|------|--------|---------------|
+| `read_file`, `list_files`, `glob`, `grep` | safe, `reuse: false` | read again, never a stale answer |
+| `write_file` | safe | writing the same content twice is harmless |
+| `edit_file` | safe | an edit that is already applied reports `alreadyApplied` |
+| `bash` | unsafe | `outcome_unknown`; never run again on its own |
+
+`bash` streams its output through `context.progress` and runs without environment variables whose names look like
+credentials (`env` overrides that). Paths outside the workspace are refused, which keeps a model on track but is not a
+sandbox. `workspace` picks a directory other than the agent's `cwd`, as a string or per call.
+
+### Usage and cost
+
+```ts
+const usage = await agent.usage({ prices: { "anthropic/claude-sonnet-4.5": { input: 3, output: 15, cacheRead: 0.3 } } })
+usage.total // { requests, failedRequests, inputTokens, outputTokens, cacheReadTokens, ..., costUsd }
+usage.byModel.get("anthropic/claude-sonnet-4.5")
+await fx.usage() // every agent
+```
+
+Totals are folded from the journaled `model.completed` events, so nothing extra is stored and any price table can be
+applied later. Prices are USD per million tokens; cache prices default to the input price. `costUsd` is `null` when
+a model that made requests has no price. Failed and interrupted requests are counted, but their tokens are unknown.
+A fork counts only its own requests.
+
+### When storage fails
+
+A storage error closes fx-durable: the in-memory view may no longer match what is stored, so it stops instead of
+carrying on. The call that hit the error rejects with the `StorageError`, calls that were waiting or come later
+reject with `DurableFxFailedError`, and `fx.closed` settles:
+
+```ts
+fx.closed.then((end) => {
+  if (end.reason === "failed") restartLater(end.error) // a new open() recovers from what was committed
+})
+```
+
+Errors in your own code stay local: a throwing tool gives the model an error result, and a throwing hook blocks or
+skips that call.
+
 ## Guarantees
 
 The [crash suite](tests/crash/crash-matrix.test.ts) checks each of these by killing real processes with SIGKILL.
@@ -354,6 +409,9 @@ The implementation must keep the durability contract documented on the interface
 - `afterCommit` runs only after the outermost commit,
 - committed writes survive a crash,
 - and the uniqueness and sequencing constraints hold.
+
+`openMemoryStorage()` keeps everything in process memory. It passes the contract except durability, so use it for
+tests and short-lived agents, or as a reference for your own backend.
 
 Run the conformance suite against your backend:
 
@@ -449,10 +507,10 @@ fx-durable/
 ├── src/
 │   ├── cli/                 # fxd and the demo
 │   ├── domain/              # schemas, event taxonomy, state machines, errors
-│   ├── durable/             # Journal, ExecutorRegistry, Storage, Clock, SQLite (plain sync code)
+│   ├── durable/             # Journal, ExecutorRegistry, Storage, Clock, SQLite, memory (plain sync code)
 │   ├── runtime/             # Database boundary, supervisor, recovery, tool executor (Effect)
 │   ├── testing/             # scripted model, storage contract, manual clock
-│   ├── tools/               # defineDurableTool, replay policies, Standard Schema
+│   ├── tools/               # defineDurableTool, replay policies, coding tools (fx-durable/tools)
 │   ├── types/               # libfx type declarations
 │   ├── effect.ts            # Effect-native entry
 │   └── index.ts             # main entry, no Effect required
@@ -460,13 +518,17 @@ fx-durable/
 │   ├── boundary/            # using fx-durable without Effect
 │   ├── crash/               # SIGKILL crash matrix
 │   ├── fixtures/            # app process the crash suite kills
+│   ├── failure/             # storage errors close the runtime; reopening recovers
 │   ├── idempotency/
 │   ├── journal/             # exhaustive synchronous tests of durable state
+│   ├── libfx/               # what fx-durable assumes about libfx checkpoints
 │   ├── live/                # crash scenarios against the real AI Gateway (opt-in)
 │   ├── reconnect/
 │   ├── recovery/
 │   ├── state-machine/
-│   ├── storage/             # storage contract
+│   ├── storage/             # storage contract, SQLite and memory
+│   ├── tools/               # coding tools
+│   ├── usage/               # token and cost totals
 │   └── helpers.ts
 ├── tools/
 │   └── oxlint/              # anti-slop lint rules

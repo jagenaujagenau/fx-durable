@@ -84,12 +84,14 @@ export const layer = Layer.effect(
         }
 
         const body = Effect.gen(function* () {
+          const agent = yield* database.read((storage) => storage.getAgent(task.agentId))
           // Start the external effect, then hit the "during" crash point while it is in flight.
           const promise = yield* Effect.sync(() =>
             tool.run(input, {
               agentId: task.agentId,
               turnId: task.turnId,
               taskId: task.id,
+              cwd: agent?.cwd ?? null,
               idempotencyKey: task.idempotencyKey,
               signal: controller.signal,
               replay: options.replay,

@@ -29,10 +29,18 @@ interface StreamSummary {
   finishReason: string | null
   inputTokens: number | null
   outputTokens: number | null
+  cacheReadTokens: number | null
+  cacheWriteTokens: number | null
+  reasoningTokens: number | null
 }
 
 // The gateway stream parts fx-durable summarizes. Other part types are ignored.
-const TokenCount = Schema.Struct({ total: Schema.optional(Schema.Number) })
+const InputTokens = Schema.Struct({
+  total: Schema.optional(Schema.Number),
+  cacheRead: Schema.optional(Schema.NullOr(Schema.Number)),
+  cacheWrite: Schema.optional(Schema.NullOr(Schema.Number))
+})
+const OutputTokens = Schema.Struct({ total: Schema.optional(Schema.Number), reasoning: Schema.optional(Schema.NullOr(Schema.Number)) })
 const GatewayPart = Schema.Union([
   Schema.Struct({ type: Schema.Literal("text-delta"), delta: Schema.String }),
   Schema.Struct({ type: Schema.Literal("tool-call"), toolName: Schema.String }),
@@ -40,7 +48,7 @@ const GatewayPart = Schema.Union([
     type: Schema.Literal("finish"),
     finishReason: Schema.optional(Schema.Struct({ unified: Schema.optional(Schema.String) })),
     usage: Schema.optional(
-      Schema.Struct({ inputTokens: Schema.optional(TokenCount), outputTokens: Schema.optional(TokenCount) })
+      Schema.Struct({ inputTokens: Schema.optional(InputTokens), outputTokens: Schema.optional(OutputTokens) })
     )
   })
 ])
@@ -99,7 +107,17 @@ export const decodeModelTaskMetadata = Schema.decodeUnknownOption(ModelTaskMetad
 const observeSse = () => {
   const decoder = new TextDecoder()
   let buffer = ""
-  const summary: StreamSummary = { finished: false, text: "", toolCalls: [], finishReason: null, inputTokens: null, outputTokens: null }
+  const summary: StreamSummary = {
+    finished: false,
+    text: "",
+    toolCalls: [],
+    finishReason: null,
+    inputTokens: null,
+    outputTokens: null,
+    cacheReadTokens: null,
+    cacheWriteTokens: null,
+    reasoningTokens: null
+  }
   const line = (raw: string) => {
     if (!raw.startsWith("data:")) return
     const part = decodePart(raw.slice(5).trim())
@@ -117,6 +135,9 @@ const observeSse = () => {
         summary.finishReason = value.finishReason?.unified ?? null
         summary.inputTokens = value.usage?.inputTokens?.total ?? null
         summary.outputTokens = value.usage?.outputTokens?.total ?? null
+        summary.cacheReadTokens = value.usage?.inputTokens?.cacheRead ?? null
+        summary.cacheWriteTokens = value.usage?.inputTokens?.cacheWrite ?? null
+        summary.reasoningTokens = value.usage?.outputTokens?.reasoning ?? null
         break
     }
   }

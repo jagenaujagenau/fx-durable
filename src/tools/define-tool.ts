@@ -7,6 +7,8 @@ export interface DurableToolContext {
   readonly agentId: string
   readonly turnId: string
   readonly taskId: string
+  /** The agent's working directory (`agent(id, { cwd })`), or null when it has none. */
+  readonly cwd: string | null
   /** Present for idempotent tools: pass it to the downstream system. */
   readonly idempotencyKey: string | null
   /** Aborted on cancellation. Aborting does not prove an external effect was cancelled. */

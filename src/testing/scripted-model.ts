@@ -31,6 +31,17 @@ export interface ScriptedRequest {
 export interface ScriptedResponse {
   readonly text?: string
   readonly toolCalls?: ReadonlyArray<{ readonly name: string; readonly input: JsonObject }>
+  /** Token usage to report. Defaults to small made-up counts with no cache or reasoning tokens. */
+  readonly usage?: ScriptedUsage
+}
+
+/** Token counts in the gateway's terms: `input` includes cache reads and writes, `output` includes reasoning. */
+export interface ScriptedUsage {
+  readonly input: number
+  readonly output: number
+  readonly cacheRead?: number
+  readonly cacheWrite?: number
+  readonly reasoning?: number
 }
 
 export type Script = (request: ScriptedRequest) => ScriptedResponse | Promise<ScriptedResponse>
@@ -63,9 +74,9 @@ const GatewayRequest = Schema.fromJsonString(
 )
 const decodeRequest = Schema.decodeUnknownSync(GatewayRequest)
 
-const usage = (input: number, output: number) => ({
-  inputTokens: { total: input, noCache: input, cacheRead: 0, cacheWrite: 0 },
-  outputTokens: { total: output, text: output, reasoning: 0 }
+const usage = ({ input, output, cacheRead = 0, cacheWrite = 0, reasoning = 0 }: ScriptedUsage) => ({
+  inputTokens: { total: input, noCache: input - cacheRead - cacheWrite, cacheRead, cacheWrite },
+  outputTokens: { total: output, text: output - reasoning, reasoning }
 })
 
 let callCounter = 0
@@ -128,7 +139,12 @@ const encodeParts = (response: ScriptedResponse, step: number) => {
   parts.push({
     type: "finish",
     finishReason: hasTools ? { unified: "tool-calls", raw: "tool_use" } : { unified: "stop", raw: "end_turn" },
-    usage: usage(100 + step * 10, Math.max(1, Math.ceil((response.text?.length ?? 0) / 4)) + (hasTools ? 20 : 0))
+    usage: usage(
+      response.usage ?? {
+        input: 100 + step * 10,
+        output: Math.max(1, Math.ceil((response.text?.length ?? 0) / 4)) + (hasTools ? 20 : 0)
+      }
+    )
   })
   return parts
 }

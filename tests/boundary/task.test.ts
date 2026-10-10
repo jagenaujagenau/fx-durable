@@ -48,7 +48,7 @@ describe("resumeOnCall and subagents", () => {
 
   it("fails clearly when the subagent tool runs outside an open runtime", async () => {
     const subagent = defineSubagent({ name: "research", description: "Research", runtime: "researcher" })
-    const context = { agentId: "a", turnId: "t", taskId: "k", idempotencyKey: "k", signal: new AbortController().signal, replay: false, progress: () => undefined }
+    const context = { agentId: "a", turnId: "t", taskId: "k", cwd: null, idempotencyKey: "k", signal: new AbortController().signal, replay: false, progress: () => undefined }
     await expect(subagent.run({ task: "x" }, context)).rejects.toThrow(/not part of an open DurableFx/)
   })
 })

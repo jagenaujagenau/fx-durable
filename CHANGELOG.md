@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **A storage error now closes fx-durable** instead of being logged and retried. The call that hit it rejects with
+  the `StorageError`; calls that were waiting or come later reject with the new `DurableFxFailedError`. Reopening
+  recovers from what was committed.
+- A duplicate `requestId` that loses a race to another process is resolved in the Journal, so it never surfaces as a
+  storage error.
+
+### Added
+
+- `fx.closed`: settles with `{ reason: "closed" }` after `close()`, or `{ reason: "failed", error }` after a storage
+  error. `DatabaseInterface.onFailure` (`fx-durable/effect`) reports the first storage error.
+- `agent.usage({ prices })` and `fx.usage({ prices })`: token and cost totals per model, folded from the event log.
+  `model.completed` events now also record `cacheReadTokens`, `cacheWriteTokens`, and `reasoningTokens`.
+- `fx-durable/tools`: `createCodingTools()` with `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`,
+  and `bash`, with replay policies chosen per tool.
+- `DurableToolContext.cwd`: the agent's working directory.
+- `openMemoryStorage()`: in-memory `Storage` that passes the storage contract (except durability).
+- `ScriptedResponse.usage` in `fx-durable/testing`, to script token counts.
+- `tests/libfx/`: the libfx checkpoint behavior fx-durable relies on (restoring with other tools, instructions, or
+  model; the v1 checkpoint format), so a libfx upgrade that changes it fails the suite.
+
 ## 0.2.0
 
 ### Breaking

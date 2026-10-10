@@ -13,6 +13,16 @@ export class StorageError extends Schema.TaggedError<StorageError>()("StorageErr
   cause: Schema.optional(Schema.Unknown)
 }) {}
 
+/**
+ * fx-durable closed itself after a storage error (`cause`); this call came
+ * after, or was waiting when it happened. Open it again to recover from what
+ * was committed.
+ */
+export class DurableFxFailedError extends Schema.TaggedError<DurableFxFailedError>()("DurableFxFailedError", {
+  message: Schema.String,
+  cause: StorageError
+}) {}
+
 export class CheckpointError extends Schema.TaggedError<CheckpointError>()("CheckpointError", {
   agentId: Schema.String,
   message: Schema.String,
