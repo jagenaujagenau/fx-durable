@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 fx-durable is rebuilt on libfx's durable sessions (the next libfx release; until it ships, fx-durable pins
 `libfx@0.0.13-dev.1432.g1df91f0b4ebf`). libfx now keeps each conversation itself: it stores every step of a turn,
