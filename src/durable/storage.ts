@@ -155,6 +155,11 @@ export interface Storage {
   readonly getTask: (id: string) => TaskRecord | null
   readonly tasksForTurn: (turnId: string) => ReadonlyArray<TaskRecord>
   readonly unfinishedTasks: () => ReadonlyArray<TaskRecord>
+  /**
+   * Interrupted tool calls nobody will call again: their turn has ended
+   * (completed, failed, or cancelled) and no later task retries them.
+   */
+  readonly abandonedTasks: () => ReadonlyArray<TaskRecord>
   readonly insertTask: (task: NewTask) => void
   readonly updateTask: (id: string, patch: TaskPatch) => void
 
@@ -198,6 +203,7 @@ export type StorageReader = Pick<
   | "getTask"
   | "tasksForTurn"
   | "unfinishedTasks"
+  | "abandonedTasks"
   | "latestCheckpoint"
   | "getCheckpoint"
   | "eventsAfter"
@@ -223,6 +229,7 @@ export const readerOf = (storage: Storage): StorageReader => ({
   getTask: (id) => storage.getTask(id),
   tasksForTurn: (turnId) => storage.tasksForTurn(turnId),
   unfinishedTasks: () => storage.unfinishedTasks(),
+  abandonedTasks: () => storage.abandonedTasks(),
   latestCheckpoint: (agentId) => storage.latestCheckpoint(agentId),
   getCheckpoint: (agentId, sequence) => storage.getCheckpoint(agentId, sequence),
   eventsAfter: (agentId, after, limit) => storage.eventsAfter(agentId, after, limit),

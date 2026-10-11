@@ -11,9 +11,9 @@ import { LibFx, type FxSession, type LibfxTool, type PromptResult } from "./libf
 import { decodeModelTaskMetadata, makeDurableFetch, type ModelTransportHolder } from "./model.js"
 import { compactionPrompt, contentText, instructionsWithSummary } from "../domain/context.js"
 import { RuntimeRegistry } from "./runtime-registry.js"
-import type { DurableAgentRecord, SubmissionContent, TurnRecord } from "../domain/schema.js"
+import type { DurableAgentRecord, SubmissionContent, TaskRecord, TurnRecord } from "../domain/schema.js"
 import { isTerminalSubmission } from "../domain/state-machine.js"
-import { buildRecoveryPrompt } from "../domain/tool-outcomes.js"
+import { abandonedCalls, buildRecoveryPrompt } from "../domain/tool-outcomes.js"
 import { steeringFor } from "../domain/steering.js"
 import { makeTurnContext, type TurnContext } from "./turn-context.js"
 
@@ -33,6 +33,13 @@ export interface AgentSupervisorInterface {
   readonly cancel: (submissionId: string) => Effect.Effect<void, StorageError | NotFoundError>
   /** Journal guidance for the agent's active turn and deliver it if the turn runs here. */
   readonly steer: (agentId: string, text: string) => Effect.Effect<SteerOutcome, StorageError | NotFoundError>
+  /**
+   * Run the `abandon` hooks of interrupted calls nobody will call again
+   * (`Storage.abandonedTasks`), then record them as cancelled. Calls whose
+   * agent's runtime is not registered, or whose hook fails, are kept for the
+   * next sweep.
+   */
+  readonly abandon: (tasks: ReadonlyArray<TaskRecord>) => Effect.Effect<void, StorageError>
   /** Mark this executor as stopped and interrupt its turns (they stay recoverable). */
   readonly shutdown: () => Effect.Effect<void>
 }
@@ -412,6 +419,42 @@ export const layer = (options: SupervisorOptions = {}) =>
           yield* database.run((journal) => journal.failTurn(turn, message))
         })
 
+      const abandon = Effect.fn("AgentSupervisor.abandon")(function* (tasks: ReadonlyArray<TaskRecord>) {
+        for (const agentId of new Set(tasks.map((task) => task.agentId))) {
+          const agent = yield* database.read((storage) => storage.getAgent(agentId))
+          if (!agent || !(yield* registry.has(agent.runtimeId))) continue
+          const calls = tasks.filter((task) => task.agentId === agentId)
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const runtime = yield* registry.resolve(agent.runtimeId)
+              const resolved = yield* toolRegistry.resolve(agent, runtime)
+              for (const task of calls) {
+                // A tool no longer in the runtime has nothing to clean up with.
+                const hook = resolved.byName.get(task.name ?? "")?.abandon ?? null
+                const call = { agentId, turnId: task.turnId, taskId: task.id, input: task.input, idempotencyKey: task.idempotencyKey }
+                const failure = hook
+                  ? yield* Effect.promise(() => Promise.resolve().then(() => hook(call)).then(() => null, (cause: unknown) => errorMessage(cause)))
+                  : null
+                yield* database.run((journal) => journal.abandonTask(task, failure))
+              }
+            })
+          ).pipe(
+            Effect.catchTag(["RuntimeConfigurationError", "NotFoundError"], (error) =>
+              Effect.logWarning(`fx-durable: cannot resolve ${agentId}'s tools to abandon its interrupted calls`, error)
+            )
+          )
+        }
+      })
+
+      /** After a turn ends, clean up the interrupted calls it did not call again. */
+      const abandonUncalled = (turnId: string) =>
+        Effect.gen(function* () {
+          const turn = yield* database.read((storage) => storage.getTurn(turnId))
+          if (!turn || turn.state === "running" || turn.state === "interrupted") return
+          const calls = abandonedCalls(yield* database.read((storage) => storage.tasksForTurn(turnId)))
+          if (calls.length > 0) yield* abandon(calls)
+        })
+
       /** One scheduling step. Returns true if it did work. */
       const step = (agentId: string) =>
         Effect.gen(function* () {
@@ -431,6 +474,7 @@ export const layer = (options: SupervisorOptions = {}) =>
             attempts.set(agentId, { ctx, fiber })
             yield* Fiber.join(fiber).pipe(Effect.exit)
             attempts.delete(agentId)
+            yield* abandonUncalled(active.id)
             return true
           }
           if (agent.state === "configuration_error" && !(yield* registry.has(agent.runtimeId))) return false
@@ -518,6 +562,6 @@ export const layer = (options: SupervisorOptions = {}) =>
         return { kind: accepted ? "delivered" : "missed", submissionId: recorded.submissionId } satisfies SteerOutcome
       })
 
-      return AgentSupervisor.of({ executorId, ensureWorker, wake, cancel, steer, shutdown })
+      return AgentSupervisor.of({ executorId, ensureWorker, wake, cancel, steer, abandon, shutdown })
     })
   )

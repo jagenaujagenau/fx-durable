@@ -154,13 +154,20 @@ export const layer = Layer.effect(
           Effect.onInterrupt(() =>
             Effect.gen(function* () {
               if (settled.done) return
-              controller.abort()
+              controller.abort(scope.interruptReason())
               yield* settleNested
               const current = yield* database.read((storage) => storage.getTask(task.id))
               if (!current || current.state !== "running") return
               // Local cancellation does not prove an external unsafe effect was cancelled.
               if (task.replayPolicy === "safe") {
                 yield* database.run((journal) => journal.transitionTask(task.id, "cancelled", { error: "cancelled" }, { type: "tool.cancelled", payload: { tool: tool.name } }))
+              } else if (task.replayPolicy === "idempotent") {
+                // As after a crash: a retry with the same key resumes the work (or the call is abandoned).
+                const reason = scope.interruptReason()
+                yield* database.run((journal) => journal.transitionTask(task.id, "interrupted", { error: reason }, {
+                  type: "tool.interrupted",
+                  payload: { tool: tool.name, input, replay: task.replayPolicy, action: "retry_with_same_key", reason }
+                }))
               } else {
                 const reason = scope.interruptReason()
                 yield* database.run((journal) => journal.transitionTask(

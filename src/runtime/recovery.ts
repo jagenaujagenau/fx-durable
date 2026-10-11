@@ -89,6 +89,7 @@ export const layer = (options: RecoveryOptions = {}) =>
           }
 
           if (turn.attempt >= maxAttempts) {
+            // Its interrupted calls are abandoned by the sweep at the end of resume().
             yield* database.run((journal) => journal.abandonRecovery(turn, reason))
             return { outcome: "gave_up" as const, replayed: [], unknown: [] }
           }
@@ -141,6 +142,8 @@ export const layer = (options: RecoveryOptions = {}) =>
           unknownOutcomes.push(...result.unknown)
         }
         unknownOutcomes.push(...(yield* database.run((journal) => journal.settleOrphanedTasks())))
+        // Calls left behind by turns that ended before this process could clean up after them.
+        yield* supervisor.abandon(yield* database.read((storage) => storage.abandonedTasks()))
 
         // Agents stuck in transient states with no active turn, and agents with queued work.
         for (const agent of yield* database.read((storage) => storage.listAgents())) {

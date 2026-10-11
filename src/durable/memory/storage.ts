@@ -43,6 +43,7 @@ const copy = <A>(value: A): A => structuredClone(value)
 
 const ACTIVE_TURN = new Set<TurnRecord["state"]>(["running", "interrupted"])
 const UNFINISHED_TASK = new Set<TaskRecord["state"]>(["pending", "running"])
+const SETTLED_TURN = new Set<TurnRecord["state"]>(["completed", "failed", "cancelled"])
 
 const byCreated = (a: { createdAt: Date }, b: { createdAt: Date }) => a.createdAt.getTime() - b.createdAt.getTime()
 
@@ -195,6 +196,14 @@ export const openMemoryStorage = (): Storage => {
     tasksForTurn: (turnId) => op("tasksForTurn", () => [...state.tasks.values()].filter((t) => t.turnId === turnId).map(copy)),
     unfinishedTasks: () =>
       op("unfinishedTasks", () => [...state.tasks.values()].filter((t) => UNFINISHED_TASK.has(t.state)).map(copy)),
+    abandonedTasks: () =>
+      op("abandonedTasks", () => {
+        const retried = new Set([...state.tasks.values()].map((t) => t.parentTaskId))
+        return [...state.tasks.values()]
+          .filter((t) => t.state === "interrupted" && t.type === "tool" && !retried.has(t.id))
+          .filter((t) => SETTLED_TURN.has(state.turns.get(t.turnId)?.state ?? "running"))
+          .map(copy)
+      }),
     insertTask: (task) =>
       op("insertTask", () => {
         if (state.tasks.has(task.id)) throw conflict("insertTask", "tasks.id")

@@ -11,7 +11,12 @@ export interface DurableToolContext {
   readonly cwd: string | null
   /** Present for idempotent tools: pass it to the downstream system. */
   readonly idempotencyKey: string | null
-  /** Aborted on cancellation. Aborting does not prove an external effect was cancelled. */
+  /**
+   * Aborted when the call stops early. `signal.reason` is `"cancelled"` when
+   * it was cancelled and `"executor_lost"` when this process is stopping:
+   * then the call may run again after a restart, so leave work it started
+   * elsewhere running. Aborting does not prove an external effect was cancelled.
+   */
   readonly signal: AbortSignal
   /** True when this execution is an automatic replay after a crash. */
   readonly replay: boolean
@@ -42,6 +47,16 @@ export interface DurableToolContext {
 export interface NestedCallOptions {
   /** Identifies the call among this tool's nested calls, across reruns. Default: its position. */
   readonly key?: string
+}
+
+/** A call that was interrupted and that nobody will call again. */
+export interface AbandonedCall {
+  readonly agentId: string
+  readonly turnId: string
+  readonly taskId: string
+  readonly input: Json
+  /** The key the interrupted call ran with (idempotent tools). */
+  readonly idempotencyKey: string | null
 }
 
 /** Who may call a tool: the model, other tools (`context.executeTool`), or both. */
@@ -79,6 +94,17 @@ interface ToolBase {
    * model's tool list, for tools that only scripts and other tools use.
    */
   readonly callers?: ToolCallers
+  /**
+   * Clean up after a call that was interrupted and will not run again: its
+   * turn ended (the recovered turn finished without calling it again, failed,
+   * or was cancelled). For calls that started work which goes on without
+   * them, such as a subagent or a background job, which would otherwise keep
+   * running with nobody waiting for the answer. Runs at least once per such
+   * call, after the turn ends or at the next `resume()` if the process died
+   * first, until it resolves; make it idempotent. Then the call is recorded
+   * as cancelled.
+   */
+  readonly abandon?: (call: AbandonedCall) => void | Promise<void>
 }
 
 /** A tool whose input is decoded and validated with an Effect Schema. */
@@ -114,6 +140,7 @@ export interface DurableTool {
   /** Interrupted calls are retried when the turn calls them again, not replayed during recovery. */
   readonly resumeOnCall: boolean
   readonly callers: ToolCallers
+  readonly abandon: ((call: AbandonedCall) => void | Promise<void>) | null
   readonly jsonSchema: JsonObject
   /** Validate the input and execute. Rejects on invalid input or tool failure. */
   readonly run: (input: Json, context: DurableToolContext) => Promise<Json>
@@ -187,7 +214,8 @@ export function defineDurableTool(definition: AnyDefinition): DurableTool {
     replay: definition.replay,
     reuse,
     resumeOnCall,
-    callers: definition.callers ?? "both"
+    callers: definition.callers ?? "both",
+    abandon: definition.abandon ?? null
   }
   if (isSchemaDefinition(definition)) {
     const decode = Schema.decodeUnknownSync(definition.inputSchema)

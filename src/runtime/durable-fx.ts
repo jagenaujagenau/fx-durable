@@ -480,6 +480,16 @@ export class DurableAgent {
     return runOn(this.fx, Effect.flatMap(Database, (database) => database.read((storage) => storage.listSubmissions(this.id, limit))))
   }
 
+  /** The submission made with `requestId`, or null if there is none. */
+  async submission(requestId: string): Promise<Submission | null> {
+    const agentId = this.id
+    const record = await runOn(
+      this.fx,
+      Effect.flatMap(Database, (database) => database.read((storage) => storage.findSubmissionByRequest(agentId, requestId)))
+    )
+    return record ? new Submission(this.fx, record.id, agentId, record.requestId, false) : null
+  }
+
   /** One journaled task (a tool or model call) of this agent, with its input and output. */
   task(taskId: string): Promise<TaskRecord> {
     const agentId = this.id

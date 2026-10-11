@@ -365,6 +365,16 @@ export const openSqliteStorage = (options: SqliteOptions): Storage => {
       op("unfinishedTasks", () =>
         all("SELECT * FROM tasks WHERE state IN ('pending', 'running') ORDER BY rowid", taskFromRow)
       ),
+    abandonedTasks: () =>
+      op("abandonedTasks", () =>
+        all(
+          `SELECT t.* FROM tasks t JOIN turns u ON u.id = t.turn_id
+           WHERE t.state = 'interrupted' AND t.type = 'tool' AND u.state IN ('completed', 'failed', 'cancelled')
+             AND NOT EXISTS (SELECT 1 FROM tasks r WHERE r.parent_task_id = t.id)
+           ORDER BY t.rowid`,
+          taskFromRow
+        )
+      ),
     insertTask: (t) =>
       op("insertTask", () => {
         stmt(

@@ -230,6 +230,29 @@ This uses a tool option you can use too: `resumeOnCall: true` (idempotent tools 
 during recovery, which would block it while it waits on other durable work. When the recovered turn calls it again,
 it is retried with its original idempotency key.
 
+If the recovered turn finishes without calling it again (the model moved on), the call is **abandoned** and the
+child's request is cancelled, so no subagent keeps working for an answer nobody waits for. Stopping the process
+(`fx.close()`) leaves the child running for the restart to pick up; cancelling the parent's request cancels it.
+
+Your own tools can clean up the same way with `abandon`:
+
+```ts
+const startJob = defineDurableTool({
+  name: "start_job",
+  replay: { strategy: "idempotent" },
+  resumeOnCall: true,
+  execute: ({ spec }, { idempotencyKey, signal }) => jobs.runAndWait(spec, { key: idempotencyKey, signal }),
+  // Interrupted, and the turn ended without calling it again.
+  abandon: ({ idempotencyKey }) => jobs.cancel(idempotencyKey)
+})
+```
+
+An interrupted call is abandoned when its turn ends (completed, failed, or cancelled) without a retry. The hook runs
+then, or at the next `resume()` if the process died first, and again at each `resume()` until it succeeds, so make it
+idempotent. The call is then recorded as cancelled (`tool.abandoned`). A failed attempt is recorded as
+`tool.abandon_failed`. A tool's `signal.reason` is `"cancelled"` when the call is cancelled, and `"executor_lost"`
+when the process is stopping and the call may resume after a restart.
+
 ### Tools calling tools
 
 ```ts

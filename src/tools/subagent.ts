@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { NotFoundError } from "../domain/errors.js"
 import type { DurableFx } from "../runtime/durable-fx.js"
 import { defineDurableTool, type DurableTool } from "./define-tool.js"
 
@@ -52,6 +53,18 @@ export const defineSubagent = (definition: SubagentDefinition): DurableTool => {
       properties: { task: { type: "string", description: "The task for the subagent, with all the context it needs" } },
       required: ["task"]
     },
+    // The recovered turn moved on without this answer: stop the child working on it.
+    abandon: async (call) => {
+      const fx = bound
+      if (!fx) throw new Error(`subagent ${definition.name} is not part of an open DurableFx runtime`)
+      const key = call.idempotencyKey ?? call.taskId
+      // The call may have died before it created the child.
+      const child = await fx.attach(subagentId(call.agentId, definition.name, key)).catch((cause: unknown) => {
+        if (cause instanceof NotFoundError) return null
+        throw cause
+      })
+      await (await child?.submission(key))?.cancel()
+    },
     execute: async (input, context) => {
       const fx = bound
       if (!fx) throw new Error(`subagent ${definition.name} is not part of an open DurableFx runtime`)
@@ -62,7 +75,11 @@ export const defineSubagent = (definition: SubagentDefinition): DurableTool => {
       const child = await fx.agent(childId, { runtime: definition.runtime, model: definition.model ?? parent.model, cwd: parent.cwd })
       const submission = await child.submit(task, { requestId: key })
 
-      const cancel = () => void submission.cancel().catch(() => undefined)
+      const cancel = () => {
+        // A stopping process leaves the child running: the call resumes it after the restart.
+        if (context.signal.reason === "executor_lost") return
+        void submission.cancel().catch(() => undefined)
+      }
       context.signal.addEventListener("abort", cancel, { once: true })
       // Relay what the child says as this call's progress.
       void (async () => {

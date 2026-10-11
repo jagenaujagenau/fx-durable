@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert"
 import { StorageError } from "../domain/errors.js"
-import type { DurableAgentRecord, SubmissionRecord, TurnRecord } from "../domain/schema.js"
+import type { DurableAgentRecord, SubmissionRecord, TaskRecord, TurnRecord } from "../domain/schema.js"
 import type { Storage } from "../durable/storage.js"
 
 /**
@@ -118,6 +118,40 @@ export const storageContract: ReadonlyArray<StorageContractCase> = [
       storage.updateTask("k2", { state: "completed", output: 3, completedAt: at })
       assert.equal(storage.getTask("k2")?.output, 3)
       assert.deepEqual(storage.unfinishedTasks().map((t) => t.id), ["k1", "k3"])
+    }
+  },
+  {
+    name: "abandoned tasks: interrupted tool calls of ended turns that nothing retries",
+    run: (storage) => {
+      storage.insertAgent(agent())
+      storage.insertSubmission(submission("s1"))
+      storage.insertTurn(turn("ended", "completed"))
+      storage.insertTurn(turn("recovering", "interrupted"))
+      const task = (id: string, turnId: string, state: TaskRecord["state"], parentTaskId: string | null = null, type: TaskRecord["type"] = "tool") => ({
+        id,
+        turnId,
+        agentId: "a",
+        parentTaskId,
+        callerTaskId: null,
+        callKey: null,
+        type,
+        state,
+        name: "tool",
+        input: null,
+        inputHash: null,
+        replayPolicy: "idempotent" as const,
+        idempotencyKey: null,
+        attempt: 1,
+        metadata: null,
+        startedAt: at
+      })
+      storage.insertTask(task("left", "ended", "interrupted"))
+      storage.insertTask(task("retried", "ended", "interrupted"))
+      storage.insertTask(task("retry", "ended", "completed", "retried"))
+      storage.insertTask(task("model", "ended", "interrupted", null, "model"))
+      storage.insertTask(task("awaiting", "recovering", "interrupted"))
+      storage.insertTask(task("left2", "ended", "interrupted"))
+      assert.deepEqual(storage.abandonedTasks().map((t) => t.id), ["left", "left2"])
     }
   },
   {

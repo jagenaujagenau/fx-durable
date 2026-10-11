@@ -26,6 +26,7 @@ export type {
   DurableToolContext,
   NestedCallOptions,
   ToolCallers,
+  AbandonedCall,
   JsonToolDefinition,
   SchemaToolDefinition,
   StandardToolDefinition,

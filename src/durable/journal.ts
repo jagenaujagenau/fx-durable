@@ -930,6 +930,32 @@ export class Journal {
     })
   }
 
+  /**
+   * An interrupted call whose turn ended without calling it again: after its
+   * tool's `abandon` hook succeeded (or it has none), it is cancelled. When
+   * the hook failed, it stays interrupted, and the next sweep tries again.
+   */
+  abandonTask(task: TaskRecord, failure: string | null): void {
+    this.transaction(() => {
+      const current = this.#storage.getTask(task.id)
+      if (!current || current.state !== "interrupted") return
+      if (failure !== null) {
+        this.appendEvent({
+          agentId: task.agentId,
+          type: "tool.abandon_failed",
+          turnId: task.turnId,
+          taskId: task.id,
+          payload: { tool: task.name, error: failure }
+        })
+        return
+      }
+      this.transitionTask(task.id, "cancelled", { error: "abandoned: the turn ended without calling it again" }, {
+        type: "tool.abandoned",
+        payload: { tool: task.name, input: task.input }
+      })
+    })
+  }
+
   /** Unfinished tasks outside any active turn (should not exist) are made explicit. */
   settleOrphanedTasks(): ReadonlyArray<string> {
     return this.transaction(() => {

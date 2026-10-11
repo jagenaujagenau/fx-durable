@@ -13,6 +13,15 @@ export const unknownOutcomeNotice = (tool: string, input: Json): string =>
   ].join("\n")
 
 /** Follow replay/re-execution children to the task that currently decides a call's outcome. */
+/**
+ * The turn's interrupted tool calls that no later task retries. Once the turn
+ * has ended, nobody will call them again (`Storage.abandonedTasks` across turns).
+ */
+export const abandonedCalls = (tasks: ReadonlyArray<TaskRecord>): ReadonlyArray<TaskRecord> => {
+  const retried = new Set(tasks.map((task) => task.parentTaskId))
+  return tasks.filter((task) => task.type === "tool" && task.state === "interrupted" && !retried.has(task.id))
+}
+
 export const effectiveTask = (task: TaskRecord, all: ReadonlyArray<TaskRecord>): TaskRecord => {
   let current = task
   while (true) {

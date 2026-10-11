@@ -12,9 +12,10 @@ type Table<S extends string> = { readonly [K in S]: ReadonlyArray<S> }
 export const TaskTransitions = {
   pending: ["running", "cancelled", "interrupted"],
   running: ["completed", "failed", "cancelled", "interrupted", "outcome_unknown"],
-  // An interrupted task is either replayed (via a new child task) or
-  // re-classified as outcome_unknown. The original row stays interrupted.
-  interrupted: ["outcome_unknown"],
+  // An interrupted task is either replayed (via a new child task, and the
+  // original row stays interrupted), re-classified as outcome_unknown, or
+  // cancelled once its turn has ended without calling it again (abandoned).
+  interrupted: ["outcome_unknown", "cancelled"],
   completed: [],
   failed: [],
   cancelled: [],
