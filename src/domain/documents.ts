@@ -1,5 +1,5 @@
 import { isJsonObject, type JsonObject } from "./json.js"
-import type { DocumentForkPolicy, DocumentHistory, DocumentRecord } from "./schema.js"
+import type { DocumentForkPolicy, DocumentRecord } from "./schema.js"
 
 /**
  * Typed documents: application state (a todo list, a plan, settings) stored
@@ -25,17 +25,7 @@ interface DefinitionBase<T extends JsonObject> {
 export interface AgentDocumentDefinition<T extends JsonObject> extends DefinitionBase<T> {
   /** One document per agent. */
   readonly scope: "agent"
-  /**
-   * `"latest"` (default) keeps the current value. `"rewindable"` keeps every
-   * value, so you can read the document as of a checkpoint and forks can
-   * start from that value.
-   */
-  readonly history?: DocumentHistory
-  /**
-   * What a fork starts with: `"copy"` (default) the current value,
-   * `"initial"` the initial value, or `"asOf"` (rewindable only) the value
-   * the document had at the checkpoint the fork starts from.
-   */
+  /** What a fork starts with: `"copy"` (default) the value at the fork, or `"initial"` the initial value. */
   readonly fork?: DocumentForkPolicy
 }
 
@@ -49,7 +39,6 @@ export interface DurableDocument<T extends JsonObject, S extends DocumentScope =
   readonly kind: string
   readonly version: number
   readonly scope: S
-  readonly history: DocumentHistory
   readonly fork: DocumentForkPolicy
   readonly initial: () => T
   readonly migrate: ((value: JsonObject, fromVersion: number) => T) | null
@@ -80,13 +69,8 @@ export function defineDocument<T extends JsonObject>(
     initial: definition.initial,
     migrate: definition.migrate ?? null
   }
-  if (definition.scope === "global") return { ...base, scope: "global", history: "latest", fork: "copy" }
-  const history = definition.history ?? "latest"
-  const fork = definition.fork ?? "copy"
-  if (fork === "asOf" && history !== "rewindable") {
-    throw new TypeError(`document ${definition.kind}: fork: "asOf" requires history: "rewindable"`)
-  }
-  return { ...base, scope: "agent", history, fork }
+  if (definition.scope === "global") return { ...base, scope: "global", fork: "copy" }
+  return { ...base, scope: "agent", fork: definition.fork ?? "copy" }
 }
 
 /** The value stored in `record`, brought up to the definition's version; the initial value if never written. */

@@ -1,62 +1,31 @@
 import { StorageError } from "../../domain/errors.js"
-import type {
-  AgentCheckpoint,
-  DocumentRecord,
-  DurableAgentRecord,
-  DurableEvent,
-  SubmissionRecord,
-  TaskRecord,
-  TurnRecord
-} from "../../domain/schema.js"
-import type { ExecutorRecord, Storage } from "../storage.js"
+import type { DocumentRecord, DurableAgentRecord, SubmissionRecord, ToolCallRecord } from "../../domain/schema.js"
+import type { Storage, ToolCallKey } from "../storage.js"
 
 /**
- * Storage that keeps everything in process memory: nothing survives the
- * process, so it gives none of the crash guarantees (contract item 8). For
- * tests, short-lived agents, and as a reference for custom backends; it passes
- * every other check of `storageContract`.
+ * Storage that keeps everything in process memory: for tests, examples, and
+ * short-lived agents that need no durability. It keeps every rule of the
+ * storage contract except that nothing survives the process.
  *
- * Maps keep insertion order, which stands in for SQLite's rowid. Records are
- * copied in and out, so callers never share an object with the store.
+ * Maps keep insertion order, which stands in for SQLite's rowid order.
  */
 
 interface State {
   readonly agents: Map<string, DurableAgentRecord>
   readonly submissions: Map<string, SubmissionRecord>
-  readonly turns: Map<string, TurnRecord>
-  readonly tasks: Map<string, TaskRecord>
-  readonly checkpoints: Map<string, AgentCheckpoint>
-  /** Current document values by `documentKey`, and their history by `documentKey` and revision. */
+  readonly toolCalls: Map<string, ToolCallRecord>
   readonly documents: Map<string, DocumentRecord>
-  readonly revisions: Map<string, DocumentRecord>
-  readonly events: Map<string, Array<DurableEvent>>
-  readonly executors: Map<string, ExecutorRecord>
 }
 
-const emptyState = (): State => ({
-  agents: new Map(),
-  submissions: new Map(),
-  turns: new Map(),
-  tasks: new Map(),
-  checkpoints: new Map(),
-  documents: new Map(),
-  revisions: new Map(),
-  events: new Map(),
-  executors: new Map()
-})
+const emptyState = (): State => ({ agents: new Map(), submissions: new Map(), toolCalls: new Map(), documents: new Map() })
 
 const copy = <A>(value: A): A => structuredClone(value)
 
-const documentKey = (agentId: string | null, kind: string) => JSON.stringify([agentId, kind])
+const key = (...parts: ReadonlyArray<string | null>) => JSON.stringify(parts)
+const callKeyOf = (k: ToolCallKey) => key(k.sessionId, k.executionId, k.callKey)
 
-const ACTIVE_TURN = new Set<TurnRecord["state"]>(["running", "interrupted"])
-const UNFINISHED_TASK = new Set<TaskRecord["state"]>(["pending", "running"])
-const SETTLED_TURN = new Set<TurnRecord["state"]>(["completed", "failed", "cancelled"])
-
-const byCreated = (a: { createdAt: Date }, b: { createdAt: Date }) => a.createdAt.getTime() - b.createdAt.getTime()
-
-/** SQLite sorts NULL below every value. */
-const startedMs = (turn: TurnRecord) => turn.startedAt?.getTime() ?? Number.NEGATIVE_INFINITY
+const byString = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
+const createdMs = (s: SubmissionRecord) => s.createdAt.getTime()
 
 /** Drop the keys of a sparse patch whose value is `undefined`. */
 const defined = <P extends object>(patch: P): Partial<P> =>
@@ -109,187 +78,82 @@ export const openMemoryStorage = (): Storage => {
 
   const patch = <A extends object>(map: Map<string, A>, id: string, changes: Partial<A>) => {
     const current = map.get(id)
-    if (current) map.set(id, { ...current, ...changes })
+    if (current) map.set(id, { ...current, ...copy(changes) })
   }
-
-  const checkpointKey = (agentId: string, sequence: number) => `${agentId}\u0000${sequence}`
 
   const storage: Storage = {
     transaction,
     afterCommit,
 
     getAgent: (id) => op("getAgent", () => get(state.agents, id)),
-    listAgents: () => op("listAgents", () => [...state.agents.values()].sort((a, b) => a.id.localeCompare(b.id)).map(copy)),
+    listAgents: () => op("listAgents", () => [...state.agents.values()].sort((a, b) => byString(a.id, b.id)).map(copy)),
     insertAgent: (agent) =>
       op("insertAgent", () => {
         if (state.agents.has(agent.id)) throw conflict("insertAgent", "agents.id")
         state.agents.set(agent.id, copy(agent))
       }),
-    updateAgent: (id, changes, now) => op("updateAgent", () => patch(state.agents, id, { ...defined(changes), updatedAt: now })),
+    updateAgent: (id, changes) => op("updateAgent", () => patch(state.agents, id, defined(changes))),
 
-    getSubmission: (id) => op("getSubmission", () => get(state.submissions, id)),
-    findSubmissionByRequest: (agentId, requestId) =>
-      op("findSubmissionByRequest", () => {
-        for (const s of state.submissions.values()) if (s.agentId === agentId && s.requestId === requestId) return copy(s)
-        return null
+    getSubmission: (agentId, id) => op("getSubmission", () => get(state.submissions, key(agentId, id))),
+    insertSubmission: (submission) =>
+      op("insertSubmission", () => {
+        const k = key(submission.agentId, submission.id)
+        if (state.submissions.has(k)) throw conflict("insertSubmission", "submissions.agent_id, submissions.id")
+        state.submissions.set(k, copy(submission))
       }),
-    nextQueuedSubmission: (agentId) =>
-      op("nextQueuedSubmission", () => {
-        const queued = [...state.submissions.values()].filter((s) => s.agentId === agentId && s.state === "queued")
-        const next = queued.sort(byCreated)[0]
-        return next ? copy(next) : null
-      }),
+    updateSubmission: (agentId, id, changes) => op("updateSubmission", () => patch(state.submissions, key(agentId, id), defined(changes))),
     listSubmissions: (agentId, limit) =>
       op("listSubmissions", () =>
         [...state.submissions.values()]
           .filter((s) => s.agentId === agentId)
           .reverse()
-          .sort((a, b) => byCreated(b, a))
+          .sort((a, b) => createdMs(b) - createdMs(a))
           .slice(0, limit)
           .map(copy)
       ),
-    insertSubmission: (submission) =>
-      op("insertSubmission", () => {
-        if (state.submissions.has(submission.id)) throw conflict("insertSubmission", "submissions.id")
-        if (
-          submission.requestId !== null &&
-          [...state.submissions.values()].some((s) => s.agentId === submission.agentId && s.requestId === submission.requestId)
-        ) {
-          throw conflict("insertSubmission", "submissions.agent_id, submissions.request_id")
-        }
-        state.submissions.set(submission.id, copy(submission))
-      }),
-    updateSubmission: (id, changes, now) =>
-      op("updateSubmission", () => patch(state.submissions, id, { ...defined(changes), updatedAt: now })),
-
-    getTurn: (id) => op("getTurn", () => get(state.turns, id)),
-    activeTurn: (agentId) =>
-      op("activeTurn", () => {
-        for (const t of state.turns.values()) if (t.agentId === agentId && ACTIVE_TURN.has(t.state)) return copy(t)
-        return null
-      }),
-    unfinishedTurns: () =>
-      op("unfinishedTurns", () =>
-        [...state.turns.values()]
-          .filter((t) => ACTIVE_TURN.has(t.state))
-          .sort((a, b) => startedMs(a) - startedMs(b))
+    runningSubmissions: () =>
+      op("runningSubmissions", () =>
+        [...state.submissions.values()].filter((s) => s.state === "running").sort((a, b) => createdMs(a) - createdMs(b)).map(copy)
+      ),
+    finishedSubmissions: (agentId) =>
+      op("finishedSubmissions", () =>
+        [...state.submissions.values()]
+          .filter((s) => s.result !== null && (agentId === null || s.agentId === agentId))
+          .sort((a, b) => createdMs(a) - createdMs(b))
           .map(copy)
       ),
-    listTurns: (agentId, limit) =>
-      op("listTurns", () =>
-        [...state.turns.values()]
-          .filter((t) => t.agentId === agentId)
-          .reverse()
-          .sort((a, b) => startedMs(b) - startedMs(a))
-          .slice(0, limit)
-          .map(copy)
+
+    getToolCall: (k) => op("getToolCall", () => get(state.toolCalls, callKeyOf(k))),
+    insertToolCall: (call) =>
+      op("insertToolCall", () => {
+        const k = callKeyOf(call)
+        if (state.toolCalls.has(k)) throw conflict("insertToolCall", "tool_calls.session_id, execution_id, call_key")
+        state.toolCalls.set(k, copy(call))
+      }),
+    updateToolCall: (k, changes) => op("updateToolCall", () => patch(state.toolCalls, callKeyOf(k), defined(changes))),
+    runningToolCalls: () =>
+      op("runningToolCalls", () =>
+        [...state.toolCalls.values()].filter((c) => c.state === "running").sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime()).map(copy)
       ),
-    turnForSubmission: (submissionId) =>
-      op("turnForSubmission", () => {
-        const turns = [...state.turns.values()].filter((t) => t.submissionId === submissionId)
-        const last = turns.at(-1)
-        return last ? copy(last) : null
-      }),
-    insertTurn: (turn) =>
-      op("insertTurn", () => {
-        if (state.turns.has(turn.id)) throw conflict("insertTurn", "turns.id")
-        if (ACTIVE_TURN.has(turn.state) && storage.activeTurn(turn.agentId)) {
-          throw conflict("insertTurn", "turns.agent_id (one active turn per agent)")
-        }
-        state.turns.set(turn.id, copy(turn))
-      }),
-    updateTurn: (id, changes) => op("updateTurn", () => patch(state.turns, id, defined(changes))),
+    toolCallsOf: (sessionId, executionId) =>
+      op("toolCallsOf", () => [...state.toolCalls.values()].filter((c) => c.sessionId === sessionId && c.executionId === executionId).map(copy)),
 
-    getTask: (id) => op("getTask", () => get(state.tasks, id)),
-    tasksForTurn: (turnId) => op("tasksForTurn", () => [...state.tasks.values()].filter((t) => t.turnId === turnId).map(copy)),
-    unfinishedTasks: () =>
-      op("unfinishedTasks", () => [...state.tasks.values()].filter((t) => UNFINISHED_TASK.has(t.state)).map(copy)),
-    abandonedTasks: () =>
-      op("abandonedTasks", () => {
-        const retried = new Set([...state.tasks.values()].map((t) => t.parentTaskId))
-        return [...state.tasks.values()]
-          .filter((t) => t.state === "interrupted" && t.type === "tool" && !retried.has(t.id))
-          .filter((t) => SETTLED_TURN.has(state.turns.get(t.turnId)?.state ?? "running"))
-          .map(copy)
-      }),
-    insertTask: (task) =>
-      op("insertTask", () => {
-        if (state.tasks.has(task.id)) throw conflict("insertTask", "tasks.id")
-        state.tasks.set(task.id, {
-          ...copy(task),
-          output: null,
-          error: null,
-          acknowledged: false,
-          completedAt: null
-        })
-      }),
-    updateTask: (id, changes) => op("updateTask", () => patch(state.tasks, id, copy(defined(changes)))),
-
-    latestCheckpoint: (agentId) =>
-      op("latestCheckpoint", () => {
-        let latest: AgentCheckpoint | null = null
-        for (const c of state.checkpoints.values()) {
-          if (c.agentId === agentId && (latest === null || c.sequence > latest.sequence)) latest = c
-        }
-        return latest ? copy(latest) : null
-      }),
-    getCheckpoint: (agentId, sequence) => op("getCheckpoint", () => get(state.checkpoints, checkpointKey(agentId, sequence))),
-    insertCheckpoint: (checkpoint) =>
-      op("insertCheckpoint", () => {
-        const key = checkpointKey(checkpoint.agentId, checkpoint.sequence)
-        if (state.checkpoints.has(key)) throw conflict("insertCheckpoint", "checkpoints.agent_id, checkpoints.sequence")
-        state.checkpoints.set(key, copy(checkpoint))
-      }),
-
-    getDocument: (agentId, kind) => op("getDocument", () => get(state.documents, documentKey(agentId, kind))),
+    getDocument: (agentId, kind) => op("getDocument", () => get(state.documents, key(agentId, kind))),
     putDocument: (document) =>
       op("putDocument", () => {
-        state.documents.set(documentKey(document.agentId, document.kind), copy(document))
-      }),
-    insertDocumentRevision: (document) =>
-      op("insertDocumentRevision", () => {
-        const key = JSON.stringify([document.agentId, document.kind, document.revision])
-        if (state.revisions.has(key)) throw conflict("insertDocumentRevision", "document_revisions.owner, kind, revision")
-        state.revisions.set(key, copy(document))
-      }),
-    documentAsOf: (agentId, kind, sequence) =>
-      op("documentAsOf", () => {
-        let found: DocumentRecord | null = null
-        for (const d of state.revisions.values()) {
-          if (d.agentId === agentId && d.kind === kind && d.checkpointSeq < sequence && (found === null || d.revision > found.revision)) found = d
-        }
-        return found ? copy(found) : null
+        state.documents.set(key(document.agentId, document.kind), copy(document))
       }),
     agentDocuments: (agentId) =>
       op("agentDocuments", () =>
         [...state.documents.values()]
           .filter((d) => d.agentId === agentId)
-          .sort((a, b) => (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0))
+          .sort((a, b) => byString(a.kind, b.kind))
           .map(copy)
       ),
 
-    lastEventSequence: (agentId) => op("lastEventSequence", () => state.events.get(agentId)?.length ?? 0),
-    appendEvent: (event) =>
-      op("appendEvent", () => {
-        const log = state.events.get(event.agentId) ?? []
-        const stored: DurableEvent = { ...copy(event), sequence: log.length + 1 }
-        state.events.set(event.agentId, [...log, stored])
-        return copy(stored)
-      }),
-    eventsAfter: (agentId, after, limit) =>
-      op("eventsAfter", () => (state.events.get(agentId) ?? []).slice(after, after + limit).map(copy)),
-
-    registerExecutor: (executor) =>
-      op("registerExecutor", () => {
-        if (state.executors.has(executor.id)) throw conflict("registerExecutor", "executors.id")
-        state.executors.set(executor.id, copy(executor))
-      }),
-    heartbeatExecutor: (id, now) => op("heartbeatExecutor", () => patch(state.executors, id, { heartbeatAt: now })),
-    stopExecutor: (id, now) => op("stopExecutor", () => patch(state.executors, id, { stoppedAt: now })),
-    getExecutor: (id) => op("getExecutor", () => get(state.executors, id)),
-
     close: () => {
       open = false
+      state = emptyState()
     }
   }
   return storage

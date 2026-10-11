@@ -3,7 +3,7 @@ import { z } from "zod"
 import { defineDocument, defineDurableTool, defineExtension, type DurableTool, type Json } from "../../src/index.js"
 import { isJsonString } from "../../src/domain/json.js"
 import type { Script, ScriptedRequest } from "../../src/testing/index.js"
-import { openFx, tempDb, waitFor } from "../helpers.js"
+import { openFx, tempDb } from "../helpers.js"
 
 const systemOf = (req: ScriptedRequest) =>
   req.messages.filter((m) => m.role === "system").map((m) => (isJsonString(m.content) ? m.content : "")).join("\n")
@@ -155,18 +155,16 @@ describe("extensions", () => {
     await fx.close()
   })
 
-  it("parks the turn on a configuration error, and resume() continues it once fixed", async () => {
+  it("refuses a request while two extensions bring tools with the same name, and takes it once fixed", async () => {
     const fx = await openFx(tempDb(), () => ({ text: "ok" }), {
       runtimes: { r: { extensions: [defineExtension({ name: "a", tools: [echo("x")] }), defineExtension({ name: "b", tools: [echo("x")] })] } }
     })
     const agent = await fx.agent("a", { runtime: "r", model: "test/model" })
-    const submission = await agent.submit("hi")
-    await waitFor(async () => (await agent.info()).state === "configuration_error")
-    expect((await agent.info()).stateReason).toContain("duplicate tool name: x")
+    await expect(agent.submit("hi")).rejects.toThrow("duplicate tool name: x")
+    expect(await agent.submissions()).toEqual([])
 
     await fx.installExtension(defineExtension({ name: "b", tools: [echo("y")] }))
-    await fx.resume()
-    expect((await submission.result()).text).toBe("ok")
+    expect((await (await agent.submit("hi")).result()).text).toBe("ok")
     await fx.close()
   })
 })

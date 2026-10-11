@@ -9,10 +9,10 @@ import { defineDurableTool, type DurableTool, type DurableToolContext } from "./
  * File and shell tools for coding agents, as durable tools.
  *
  * Each tool's replay policy follows from what happens if it runs twice:
- * reads are safe and re-read after a crash (`reuse: false`) instead of
- * returning what the file held before; writes and edits are safe because
- * running them again leaves the same file; `bash` is unsafe, so an
- * interrupted command is reported as outcome unknown, never run again.
+ * reads are safe; writes and edits are safe because running them again
+ * leaves the same file; `bash` is unsafe, so a command a crash cut off is
+ * reported as outcome unknown, never run again. Writes, edits, and `bash`
+ * are `writes: true`, so libfx never runs them alongside other calls.
  *
  * Paths are resolved inside the workspace and refused outside it. That keeps
  * a model on track; it is not a sandbox (symlinks and `bash` can reach out).
@@ -116,7 +116,6 @@ export const createCodingTools = (options: CodingToolsOptions = {}): CodingTools
     name: "read_file",
     description: "Read a text file from the workspace. Returns numbered lines (like `cat -n`). Use offset/limit for large files.",
     replay: "safe",
-    reuse: false,
     inputSchema: Schema.Struct({
       path: Schema.String.annotate(description("File path, relative to the workspace root")),
       offset: Schema.optionalKey(Schema.Int.annotate(description("1-based line to start from"))),
@@ -136,6 +135,7 @@ export const createCodingTools = (options: CodingToolsOptions = {}): CodingTools
     name: "write_file",
     description: "Create or overwrite a file in the workspace with the given content. Prefer edit_file for changes to existing files.",
     replay: "safe",
+    writes: true,
     inputSchema: Schema.Struct({
       path: Schema.String.annotate(description("File path, relative to the workspace root")),
       content: Schema.String.annotate(description("The complete new file content"))
@@ -157,6 +157,7 @@ export const createCodingTools = (options: CodingToolsOptions = {}): CodingTools
     description:
       "Replace an exact string in a file. old_string must match the file exactly (including whitespace) and be unique unless replace_all is true. Read the file first.",
     replay: "safe",
+    writes: true,
     inputSchema: Schema.Struct({
       path: Schema.String.annotate(description("File path, relative to the workspace root")),
       old_string: Schema.String.annotate(description("Exact text to replace")),
@@ -189,7 +190,6 @@ export const createCodingTools = (options: CodingToolsOptions = {}): CodingTools
     name: "list_files",
     description: "List the entries of a directory in the workspace (directories end with /).",
     replay: "safe",
-    reuse: false,
     inputSchema: Schema.Struct({
       path: Schema.optionalKey(Schema.String.annotate(description("Directory, relative to the workspace root (default: root)")))
     }),
@@ -209,7 +209,6 @@ export const createCodingTools = (options: CodingToolsOptions = {}): CodingTools
     name: "glob",
     description: 'Find files by glob pattern, e.g. "**/*.ts" or "src/**/*.test.js". Ignores .git and node_modules.',
     replay: "safe",
-    reuse: false,
     inputSchema: Schema.Struct({
       pattern: Schema.String.annotate(description("Glob pattern")),
       path: Schema.optionalKey(Schema.String.annotate(description("Directory to search from (default: root)")))
@@ -229,7 +228,6 @@ export const createCodingTools = (options: CodingToolsOptions = {}): CodingTools
     name: "grep",
     description: "Search file contents with a regular expression. Returns matching lines as path:line:text.",
     replay: "safe",
-    reuse: false,
     inputSchema: Schema.Struct({
       pattern: Schema.String.annotate(description("Regular expression")),
       path: Schema.optionalKey(Schema.String.annotate(description("File or directory to search (default: root)"))),
@@ -254,6 +252,7 @@ export const createCodingTools = (options: CodingToolsOptions = {}): CodingTools
     description:
       "Run a shell command in the workspace root (bash -c). Use for tests, builds, git, and package managers. Not for reading or editing files: use the file tools.",
     replay: "unsafe",
+    writes: true,
     inputSchema: Schema.Struct({
       command: Schema.String.annotate(description("The command to run")),
       description: Schema.optionalKey(Schema.String.annotate(description("What the command does, in 5-10 words"))),

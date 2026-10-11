@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { z } from "zod"
-import { ToolBlockedError, defineDurableTool, type DurableAgent, type Json, type TaskRecord, type ToolCall } from "../../src/index.js"
+import { defineDurableTool, defineSubagent, type DurableAgent, type Json, type ToolCall, type ToolCallRecord } from "../../src/index.js"
 import type { Script, ScriptedRequest } from "../../src/testing/index.js"
 import { deferred, openFx, tempDb, waitFor } from "../helpers.js"
 
@@ -18,69 +18,58 @@ const add = defineDurableTool({
   execute: ({ a, b }) => a + b
 })
 
-const toolTasks = async (agent: DurableAgent) => {
-  const tasks: Array<TaskRecord> = []
-  for await (const event of agent.events({ follow: false })) {
-    if (event.type === "tool.started" && event.taskId) tasks.push(await agent.task(event.taskId))
-  }
-  return tasks
+/** The execution id of the last model call of each tool, as the tool saw it. */
+const executions = new Map<string, string>()
+const remember = (tool: string, executionId: string) => executions.set(tool, executionId)
+
+/** The journaled calls under the model's last call of `tool`: that call first, then its nested calls. */
+const callsOf = async (agent: DurableAgent, tool: string): Promise<ReadonlyArray<ToolCallRecord>> => {
+  const { sessionId } = await agent.info()
+  const executionId = executions.get(tool)
+  return sessionId && executionId ? agent.toolCalls(sessionId, executionId) : []
 }
 
 describe("tools calling tools", () => {
-  it("journals each nested call as a task owned by its caller", async () => {
+  it("journals each nested call under its caller, with its own result", async () => {
     const script = defineDurableTool({
       name: "script",
       replay: "safe",
-      execute: async (_input, { executeTool }) => [await executeTool("add", { a: 1, b: 2 }), await executeTool("add", { a: 3, b: 4 })]
+      execute: async (_input, { executeTool, executionId }) => {
+        remember("script", executionId)
+        return [await executeTool("add", { a: 1, b: 2 }), await executeTool("add", { a: 3, b: 4 }, { key: "second" })]
+      }
     })
     const fx = await openFx(tempDb(), callOnce("script"), { runtimes: { r: { tools: [script, add] } } })
     const agent = await fx.agent("a", { runtime: "r", model: "test/model" })
     expect((await (await agent.submit("go")).result()).text).toBe("[3,7]")
-
-    const [caller, first, second] = await toolTasks(agent)
-    expect(caller).toMatchObject({ name: "script", callerTaskId: null, state: "completed" })
-    expect(first).toMatchObject({ name: "add", callerTaskId: caller!.id, callKey: "0", output: 3, state: "completed" })
-    expect(second).toMatchObject({ name: "add", callerTaskId: caller!.id, callKey: "1", output: 7 })
+    expect((await callsOf(agent, "script")).map((c) => [c.name, c.callKey, c.state, c.output])).toEqual([
+      ["script", "", "completed", [3, 7]],
+      ["add", "0", "completed", 3],
+      ["add", "second", "completed", 7]
+    ])
     await fx.close()
   })
 
   it("offers the model only tools it may call, and tools only tools they may call", async () => {
     const offered: Array<ReadonlyArray<string>> = []
     const modelOnly = defineDurableTool({ name: "model_only", replay: "safe", callers: "model", execute: () => "x" })
-    const script = defineDurableTool({
-      name: "script",
-      replay: "safe",
-      execute: async (_input, { executeTool }) => {
-        await executeTool("model_only", {})
-      }
-    })
-    const fx = await openFx(
-      tempDb(),
-      (req) => {
-        offered.push(req.tools)
-        return callOnce("script")(req)
-      },
-      { runtimes: { r: { tools: [script, add, modelOnly] } } }
-    )
+    const script = defineDurableTool({ name: "script", replay: "safe", execute: async (_input, { executeTool }) => executeTool("model_only", {}) })
+    const fx = await openFx(tempDb(), (req) => (offered.push(req.tools), callOnce("script")(req)), { runtimes: { r: { tools: [script, add, modelOnly] } } })
     const agent = await fx.agent("a", { runtime: "r", model: "test/model" })
-    await (await agent.submit("go")).result()
+    expect((await (await agent.submit("go")).result()).text).toContain("no tool named model_only can be called from a tool")
     expect(offered[0]).toEqual(["script", "model_only"])
-    const [caller] = await toolTasks(agent)
-    expect(caller).toMatchObject({ state: "failed", error: "no tool named model_only can be called from a tool" })
     await fx.close()
   })
 
-  it("runs the runtime's hooks, which see the caller", async () => {
+  it("runs the hooks for nested calls too; they see the caller, and may block or change them", async () => {
     const seen: Array<ToolCall> = []
     const script = defineDurableTool({
       name: "script",
       replay: "safe",
       execute: async (_input, { executeTool }) => {
-        try {
-          return await executeTool("add", { a: 1, b: 1 })
-        } catch (error) {
-          return error instanceof ToolBlockedError ? `blocked: ${error.message}` : "other error"
-        }
+        const doubled = await executeTool("add", { a: 1, b: 1 })
+        const blocked = await executeTool("add", { a: 100, b: 0 }).catch((cause: Error) => cause.message)
+        return [doubled, blocked]
       }
     })
     const fx = await openFx(tempDb(), callOnce("script"), {
@@ -90,115 +79,75 @@ describe("tools calling tools", () => {
           hooks: {
             beforeTool: (call) => {
               seen.push(call)
-              return call.caller ? { block: "no nested adds" } : undefined
+              if (call.name !== "add") return undefined
+              return z.object({ a: z.number() }).parse(call.input).a === 100 ? { block: "too big" } : { input: { a: 2, b: 2 } }
             }
           }
         }
       }
     })
     const agent = await fx.agent("a", { runtime: "r", model: "test/model" })
-    expect((await (await agent.submit("go")).result()).text).toBe("blocked: no nested adds")
-    expect(seen.map((c) => c.caller?.tool ?? null)).toEqual([null, "script"])
+    expect((await (await agent.submit("go")).result()).text).toBe('[4,"too big"]')
+    expect(seen.map((c) => [c.name, c.caller?.tool ?? null])).toEqual([
+      ["script", null],
+      ["add", "script"],
+      ["add", "script"]
+    ])
     await fx.close()
   })
 
-  it("nests", async () => {
-    const outer = defineDurableTool({ name: "outer", replay: "safe", execute: (_i, { executeTool }) => executeTool("inner", {}) })
-    const inner = defineDurableTool({ name: "inner", replay: "safe", callers: "tools", execute: (_i, { executeTool }) => executeTool("add", { a: 20, b: 22 }) })
-    const fx = await openFx(tempDb(), callOnce("outer"), { runtimes: { r: { tools: [outer, inner, add] } } })
-    const agent = await fx.agent("a", { runtime: "r", model: "test/model" })
-    expect((await (await agent.submit("go")).result()).text).toBe("42")
-    const [o, i, a] = await toolTasks(agent)
-    expect([i?.callerTaskId, a?.callerTaskId]).toEqual([o?.id, i?.id])
-    await fx.close()
-  })
-
-  it("aborts nested calls still running when the caller returns", async () => {
-    const aborted = deferred()
-    const slow = defineDurableTool({
-      name: "slow",
-      replay: "safe",
-      callers: "tools",
-      execute: (_i, { signal }) =>
-        new Promise((_resolve, reject) =>
-          signal.addEventListener("abort", () => {
-            aborted.resolve()
-            reject(new Error("aborted"))
-          })
-        )
-    })
+  it("refuses a nested key reused for a different call", async () => {
     const script = defineDurableTool({
       name: "script",
       replay: "safe",
-      execute: (_i, { executeTool }) => {
-        executeTool("slow", {}).catch(() => undefined)
-        return "returned early"
+      execute: async (_input, { executeTool }) => {
+        await executeTool("add", { a: 1, b: 1 }, { key: "k" })
+        return executeTool("add", { a: 2, b: 2 }, { key: "k" })
       }
     })
-    const fx = await openFx(tempDb(), callOnce("script"), { runtimes: { r: { tools: [script, slow] } } })
+    const fx = await openFx(tempDb(), callOnce("script"), { runtimes: { r: { tools: [script, add] } } })
     const agent = await fx.agent("a", { runtime: "r", model: "test/model" })
-    expect((await (await agent.submit("go")).result()).text).toBe("returned early")
-    await aborted.promise
-    const nested = (await toolTasks(agent)).find((t) => t.name === "slow")
-    expect(nested?.state).toBe("cancelled")
+    expect((await (await agent.submit("go")).result()).text).toContain("nested call key k was used by another call")
     await fx.close()
   })
 
-  it("after a restart, a caller that runs again gets its finished nested calls back", async () => {
-    const db = tempDb()
-    const deployed: Array<string> = []
-    const deploy = defineDurableTool({
-      name: "deploy",
-      replay: "unsafe",
-      callers: "tools",
-      inputSchema: z.object({ version: z.string() }),
-      execute: ({ version }) => {
-        deployed.push(version)
-        return `deployed ${version}`
-      }
-    })
-    const halfway = deferred()
-    let firstRun = true
-    const release = defineDurableTool({
-      name: "release",
+  it("keeps a running call's progress in the journal", async () => {
+    const release = deferred()
+    const long = defineDurableTool({
+      name: "long",
       replay: "safe",
-      execute: async (_i, { executeTool }) => {
-        const result = await executeTool("deploy", { version: "v2" })
-        if (firstRun) {
-          firstRun = false
-          halfway.resolve()
-          await new Promise(() => undefined) // the process goes away here
-        }
-        return `${result}, announced`
+      execute: async (_input, { progress, executionId }) => {
+        remember("long", executionId)
+        progress("step 1\n")
+        progress("step 2\n")
+        await release.promise
+        return "done"
       }
     })
-    const runtimes = { r: { tools: [release, deploy] } }
-    const fx = await openFx(db, callOnce("release"), { runtimes })
+    const fx = await openFx(tempDb(), callOnce("long"), { runtimes: { r: { tools: [long] } } })
     const agent = await fx.agent("a", { runtime: "r", model: "test/model" })
-    const submission = await agent.submit("ship it")
-    await halfway.promise
+    const submission = await agent.submit("go")
+    await waitFor(async () => (await callsOf(agent, "long"))[0]?.progress === "step 1\nstep 2\n")
+    release.resolve()
+    await submission.result()
     await fx.close()
-
-    const reopened = await openFx(db, callOnce("release"), { runtimes })
-    const again = await reopened.attach("a")
-    await waitFor(async () => (await again.submissions()).find((s) => s.id === submission.id)?.state === "completed")
-    expect((await again.submissions())[0]?.result?.text).toBe("deployed v2, announced")
-    expect(deployed).toEqual(["v2"])
-    const events = []
-    for await (const e of again.events({ follow: false })) events.push(e)
-    expect(events.find((e) => e.type === "tool.reused")?.payload).toMatchObject({ tool: "deploy", state: "completed" })
-    await reopened.close()
   })
+})
 
-  it("rejects calls to unknown tools", async () => {
-    const script = defineDurableTool({
-      name: "script",
-      replay: "safe",
-      execute: (_i, { executeTool }) => executeTool("nope", {}).catch((cause: unknown) => (cause instanceof Error ? cause.message : "?"))
-    })
-    const fx = await openFx(tempDb(), callOnce("script"), { runtimes: { r: { tools: [script] } } })
-    const agent = await fx.agent("a", { runtime: "r", model: "test/model" })
-    expect((await (await agent.submit("go")).result()).text).toBe("no tool named nope can be called from a tool")
+describe("subagents", () => {
+  it("hands a task to a child agent named after the call, and returns its answer", async () => {
+    const delegate = defineSubagent({ name: "delegate", description: "Hand off a task", runtime: "worker" })
+    const script: Script = (req) => {
+      if (!req.tools.includes("delegate")) return { text: `worker did: ${req.userText}` }
+      return req.step === 0 ? { toolCalls: [{ name: "delegate", input: { task: "count the files" } }] } : { text: `parent got ${req.toolResults[0]?.output}` }
+    }
+    const fx = await openFx(tempDb(), script, { runtimes: { boss: { tools: [delegate] }, worker: {} } })
+    const agent = await fx.agent("boss", { runtime: "boss", model: "test/model" })
+    const answer = (await (await agent.submit("go")).result()).text
+    expect(answer).toContain("worker did: count the files")
+    const children = (await fx.listAgents()).filter((a) => a.id !== "boss")
+    expect(children).toHaveLength(1)
+    expect(children[0]?.id).toMatch(/^boss\/delegate\//)
     await fx.close()
   })
 })

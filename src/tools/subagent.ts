@@ -1,5 +1,4 @@
 import { Schema } from "effect"
-import { NotFoundError } from "../domain/errors.js"
 import type { DurableFx } from "../runtime/durable-fx.js"
 import { defineDurableTool, type DurableTool } from "./define-tool.js"
 
@@ -7,12 +6,12 @@ import { defineDurableTool, type DurableTool } from "./define-tool.js"
  * Subagents: a tool that hands a task to a child durable agent and returns its
  * answer.
  *
- * The child's agent ID and its submission's request ID both come from the
- * call's idempotency key. After a crash, the recovered turn calls the tool
- * again (it is `resumeOnCall`, so recovery does not block on it), and the call
- * attaches to the same child and the same submission. The child's own
- * interrupted work is recovered like any agent's. One task, one subagent, no
- * matter how many times the processes die.
+ * The child's agent id and its request id both come from the call's
+ * idempotency key, which is stable across runs of the call. If a crash cuts
+ * the call off, libfx runs it again when the parent's turn continues, and the
+ * call attaches to the same child and the same request. The child's own turn
+ * continues like any agent's. One task, one subagent, no matter how many times
+ * the processes die. Cancelling the parent's turn cancels the child's request.
  */
 
 export interface SubagentDefinition {
@@ -45,47 +44,29 @@ export const defineSubagent = (definition: SubagentDefinition): DurableTool => {
   const tool = defineDurableTool({
     name: definition.name,
     description: definition.description,
-    // The key is stable across retries; it names the child and its request.
+    // The key is stable across runs; it names the child and its request.
     replay: { strategy: "idempotent" },
-    resumeOnCall: true,
     inputSchema: {
       type: "object",
       properties: { task: { type: "string", description: "The task for the subagent, with all the context it needs" } },
       required: ["task"]
     },
-    // The recovered turn moved on without this answer: stop the child working on it.
-    abandon: async (call) => {
-      const fx = bound
-      if (!fx) throw new Error(`subagent ${definition.name} is not part of an open DurableFx runtime`)
-      const key = call.idempotencyKey ?? call.taskId
-      // The call may have died before it created the child.
-      const child = await fx.attach(subagentId(call.agentId, definition.name, key)).catch((cause: unknown) => {
-        if (cause instanceof NotFoundError) return null
-        throw cause
-      })
-      await (await child?.submission(key))?.cancel()
-    },
     execute: async (input, context) => {
       const fx = bound
       if (!fx) throw new Error(`subagent ${definition.name} is not part of an open DurableFx runtime`)
       const { task } = decodeInput(input)
-      const key = context.idempotencyKey ?? context.taskId
+      const key = context.idempotencyKey ?? `${context.sessionId}/${context.executionId}`
       const parent = await (await fx.attach(context.agentId)).info()
       const childId = subagentId(context.agentId, definition.name, key)
       const child = await fx.agent(childId, { runtime: definition.runtime, model: definition.model ?? parent.model, cwd: parent.cwd })
       const submission = await child.submit(task, { requestId: key })
 
-      const cancel = () => {
-        // A stopping process leaves the child running: the call resumes it after the restart.
-        if (context.signal.reason === "executor_lost") return
-        void submission.cancel().catch(() => undefined)
-      }
+      const cancel = () => void submission.cancel().catch(() => undefined)
       context.signal.addEventListener("abort", cancel, { once: true })
       // Relay what the child says as this call's progress.
       void (async () => {
         for await (const event of submission.events()) {
-          const text = event.payload.text
-          if (event.type === "model.completed" && Schema.is(Schema.String)(text) && text.length > 0) context.progress(`${text}\n`)
+          if (event.type === "text_delta") context.progress(event.delta)
         }
       })().catch(() => undefined)
       try {

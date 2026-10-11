@@ -23,12 +23,7 @@ export class DurableFxFailedError extends Schema.TaggedError<DurableFxFailedErro
   cause: StorageError
 }) {}
 
-export class CheckpointError extends Schema.TaggedError<CheckpointError>()("CheckpointError", {
-  agentId: Schema.String,
-  message: Schema.String,
-  cause: Schema.optional(Schema.Unknown)
-}) {}
-
+/** libfx could not run a request: no credentials, a rejected prompt, a failed session. */
 export class ModelError extends Schema.TaggedError<ModelError>()("ModelError", {
   agentId: Schema.String,
   message: Schema.String,
@@ -42,10 +37,17 @@ export class ToolBlockedError extends Schema.TaggedError<ToolBlockedError>()("To
 }) {}
 
 export class ToolExecutionError extends Schema.TaggedError<ToolExecutionError>()("ToolExecutionError", {
-  taskId: Schema.String,
+  /** The call's id: its session, libfx execution id, and nested key. */
+  callId: Schema.String,
   tool: Schema.String,
   message: Schema.String,
   cause: Schema.optional(Schema.Unknown)
+}) {}
+
+export class UnknownOutcomeError extends Schema.TaggedError<UnknownOutcomeError>()("UnknownOutcomeError", {
+  callId: Schema.String,
+  tool: Schema.String,
+  message: Schema.String
 }) {}
 
 export class RuntimeConfigurationError extends Schema.TaggedError<RuntimeConfigurationError>()(
@@ -56,25 +58,10 @@ export class RuntimeConfigurationError extends Schema.TaggedError<RuntimeConfigu
   }
 ) {}
 
-export class InterruptedError extends Schema.TaggedError<InterruptedError>()("InterruptedError", {
-  message: Schema.String
-}) {}
-
-export class UnknownOutcomeError extends Schema.TaggedError<UnknownOutcomeError>()("UnknownOutcomeError", {
-  taskId: Schema.String,
-  tool: Schema.String,
-  message: Schema.String
-}) {}
-
+/** A request ended without a result: it failed or was cancelled. */
 export class SubmissionError extends Schema.TaggedError<SubmissionError>()("SubmissionError", {
   submissionId: Schema.String,
   state: Schema.String,
-  message: Schema.String
-}) {}
-
-/** `submit(…, { whenBusy: "reject" })` found a running or queued request. Nothing was submitted. */
-export class AgentBusyError extends Schema.TaggedError<AgentBusyError>()("AgentBusyError", {
-  agentId: Schema.String,
   message: Schema.String
 }) {}
 
@@ -105,11 +92,10 @@ export class DecodeError extends Schema.TaggedError<DecodeError>()("DecodeError"
 
 export type DurableError =
   | StorageError
-  | CheckpointError
   | ModelError
   | ToolExecutionError
+  | ToolBlockedError
   | RuntimeConfigurationError
-  | InterruptedError
   | UnknownOutcomeError
   | SubmissionError
   | NotFoundError

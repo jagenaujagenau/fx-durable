@@ -2,7 +2,7 @@
  * The important case: an unsafe external effect interrupted after it began.
  *
  *   npx tsx examples/unsafe-tool/index.ts --crash   # deploy starts, process dies before the result commits
- *   npx tsx examples/unsafe-tool/index.ts           # outcome_unknown: NOT replayed; the agent inspects state
+ *   npx tsx examples/unsafe-tool/index.ts           # outcome unknown: NOT run again; the agent inspects state
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs"
 import { Schema } from "effect"
@@ -36,21 +36,21 @@ const fx = await DurableFx.open({
   storage: sqlite("./.examples/unsafe-tool.db"),
   runtimes: { ops: { tools: [deploy, status] } },
   ...modelTransport((req) => {
-    if (req.userText.includes("OUTCOME UNKNOWN")) {
-      return req.toolResults.length === 0
-        ? { toolCalls: [{ name: "deployment_status", input: {} }] }
-        : { text: `Inspected production instead of redeploying: ${req.toolResults[0]!.output}` }
-    }
-    return req.toolResults.length === 0
-      ? { toolCalls: [{ name: "deploy", input: { version: "abc123" } }] }
-      : { text: "Deployed abc123." }
+    const results = req.allToolResults
+    const deployed = results.find((r) => r.toolName === "deploy")
+    if (!deployed) return { toolCalls: [{ name: "deploy", input: { version: "abc123" } }] }
+    if (!deployed.isError) return { text: "Deployed abc123." }
+    // The deploy may have partly run: look before doing anything else.
+    const status = results.find((r) => r.toolName === "deployment_status")
+    if (!status) return { toolCalls: [{ name: "deployment_status", input: {} }] }
+    return { text: `Inspected production instead of redeploying: ${status.output}` }
   })
 })
 
 const agent = await fx.agent("ops", { runtime: "ops", model: MODEL })
 const submission = await agent.submit("Deploy abc123 to production.", { requestId: "deploy-abc123" })
 for await (const event of submission.events()) {
-  if (event.type === "tool.outcome_unknown") console.log("⚠ outcome unknown:", event.payload)
+  if (event.type === "tool_end" && event.isError) console.log(`⚠ ${event.name}: ${event.content}`)
 }
 console.log((await submission.result()).text)
 await fx.close()

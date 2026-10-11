@@ -3,18 +3,16 @@ import { mkdirSync } from "node:fs"
 import { dirname } from "node:path"
 import { StorageError } from "../../domain/errors.js"
 import {
-  AgentCheckpoint,
   DocumentRecord,
   DurableAgentRecord,
-  DurableEvent,
   SubmissionRecord,
-  TaskRecord,
-  TurnRecord,
+  ToolCallRecord,
   decodePayloadSync,
   decodeSync,
   encodePayload
 } from "../../domain/schema.js"
-import type { ExecutorRecord, Storage } from "../storage.js"
+import type { Json } from "../../domain/json.js"
+import type { Storage, ToolCallKey } from "../storage.js"
 import { applyMigrations } from "./schema.js"
 
 export interface SqliteOptions {
@@ -28,25 +26,22 @@ export interface SqliteOptions {
 
 const decodeAgent = decodeSync(DurableAgentRecord, "agent row")
 const decodeSubmission = decodeSync(SubmissionRecord, "submission row")
-const decodeTurn = decodeSync(TurnRecord, "turn row")
-const decodeTask = decodeSync(TaskRecord, "task row")
-const decodeCheckpoint = decodeSync(AgentCheckpoint, "checkpoint row")
-const decodeEvent = decodeSync(DurableEvent, "event row")
+const decodeToolCall = decodeSync(ToolCallRecord, "tool call row")
 const decodeDocument = decodeSync(DocumentRecord, "document row")
 
 type Row = Record<string, SQLOutputValue>
-
 type Column = SQLOutputValue | undefined
 
 const str = (v: Column): string | null => (v === null || v === undefined ? null : String(v))
-const num = (v: Column): number | null => (v === null || v === undefined ? null : Number(v))
 const date = (v: Column): Date | null => (v === null || v === undefined ? null : new Date(Number(v)))
 const blobText = (v: Column): string | null => {
   if (v === null || v === undefined) return null
   if (v instanceof Uint8Array) return new TextDecoder().decode(v)
   return String(v)
 }
+const bytes = (v: Column): Uint8Array | null => (v instanceof Uint8Array ? new Uint8Array(v) : null)
 const ms = (d: Date | null | undefined): number | null => (d ? d.getTime() : null)
+const payload = (value: Json | null): string | null => (value === null ? null : encodePayload(value))
 
 const agentFromRow = (r: Row): DurableAgentRecord =>
   decodeAgent({
@@ -54,8 +49,10 @@ const agentFromRow = (r: Row): DurableAgentRecord =>
     runtimeId: r.runtime_id,
     model: r.model,
     cwd: str(r.cwd),
-    state: r.state,
-    stateReason: str(r.state_reason),
+    sessionId: str(r.session_id),
+    sessionStore: str(r.session_store),
+    summary: str(r.summary),
+    startCheckpoint: bytes(r.start_checkpoint),
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at)
   })
@@ -65,63 +62,35 @@ const submissionFromRow = (r: Row): SubmissionRecord =>
     id: r.id,
     agentId: r.agent_id,
     requestId: str(r.request_id),
-    kind: r.kind,
+    sessionId: r.session_id,
+    sessionStore: r.session_store,
+    model: r.model,
     content: decodePayloadSync(blobText(r.content), "submission.content"),
     state: r.state,
     result: decodePayloadSync(blobText(r.result), "submission.result"),
     error: str(r.error),
-    cancelRequested: Number(r.cancel_requested) === 1,
     createdAt: date(r.created_at),
     updatedAt: date(r.updated_at)
   })
 
-const turnFromRow = (r: Row): TurnRecord =>
-  decodeTurn({
-    id: r.id,
+const toolCallFromRow = (r: Row): ToolCallRecord =>
+  decodeToolCall({
+    sessionId: r.session_id,
+    executionId: r.execution_id,
+    callKey: r.call_key,
     agentId: r.agent_id,
-    submissionId: r.submission_id,
-    state: r.state,
-    attempt: Number(r.attempt),
-    executorId: str(r.executor_id),
-    baseCheckpointSeq: num(r.base_checkpoint_seq),
-    startedAt: date(r.started_at),
-    completedAt: date(r.completed_at)
-  })
-
-const taskFromRow = (r: Row): TaskRecord =>
-  decodeTask({
-    id: r.id,
-    turnId: r.turn_id,
-    agentId: r.agent_id,
-    parentTaskId: str(r.parent_task_id),
-    callerTaskId: str(r.caller_task_id),
-    callKey: str(r.call_key),
-    type: r.type,
-    state: r.state,
-    name: str(r.name),
-    input: decodePayloadSync(blobText(r.input), "task.input"),
-    inputHash: str(r.input_hash),
-    output: decodePayloadSync(blobText(r.output), "task.output"),
-    error: str(r.error),
-    replayPolicy: str(r.replay_policy),
+    submissionId: str(r.submission_id),
+    name: r.name,
+    input: decodePayloadSync(blobText(r.input), "tool_call.input"),
+    replayPolicy: r.replay_policy,
     idempotencyKey: str(r.idempotency_key),
-    attempt: Number(r.attempt),
-    acknowledged: Number(r.acknowledged) === 1,
-    metadata: decodePayloadSync(blobText(r.metadata), "task.metadata"),
+    state: r.state,
+    output: decodePayloadSync(blobText(r.output), "tool_call.output"),
+    error: str(r.error),
+    attempts: Number(r.attempts),
+    progress: str(r.progress),
     startedAt: date(r.started_at),
     completedAt: date(r.completed_at)
-  })
-
-const checkpointFromRow = (r: Row): AgentCheckpoint =>
-  decodeCheckpoint({
-    id: r.id,
-    agentId: r.agent_id,
-    sequence: Number(r.sequence),
-    fxCheckpoint: r.data instanceof Uint8Array ? new Uint8Array(r.data) : r.data,
-    summary: str(r.summary),
-    runtimeId: r.runtime_id,
-    model: r.model,
-    createdAt: date(r.created_at)
   })
 
 const documentFromRow = (r: Row): DocumentRecord =>
@@ -131,48 +100,9 @@ const documentFromRow = (r: Row): DocumentRecord =>
     version: Number(r.version),
     revision: Number(r.revision),
     value: decodePayloadSync(blobText(r.value), "document.value"),
-    history: r.history,
     fork: r.fork,
-    checkpointSeq: Number(r.checkpoint_seq),
     updatedAt: date(r.updated_at)
   })
-
-/** Column order of `documentRow`, shared by the documents table and its history. */
-const DOCUMENT_COLUMNS = "owner, kind, version, revision, value, history, fork, checkpoint_seq, updated_at"
-
-const documentRow = (d: DocumentRecord): Array<SQLInputValue> => [
-  d.agentId ?? "",
-  d.kind,
-  d.version,
-  d.revision,
-  encodePayload(d.value),
-  d.history,
-  d.fork,
-  d.checkpointSeq,
-  ms(d.updatedAt)
-]
-
-const eventFromRow = (r: Row): DurableEvent =>
-  decodeEvent({
-    id: r.id,
-    agentId: r.agent_id,
-    submissionId: str(r.submission_id),
-    turnId: str(r.turn_id),
-    taskId: str(r.task_id),
-    sequence: Number(r.sequence),
-    type: r.type,
-    payload: decodePayloadSync(blobText(r.payload), "event.payload"),
-    createdAt: date(r.created_at)
-  })
-
-const executorFromRow = (r: Row): ExecutorRecord => ({
-  id: String(r.id),
-  pid: Number(r.pid),
-  hostname: String(r.hostname),
-  startedAt: new Date(Number(r.started_at)),
-  heartbeatAt: new Date(Number(r.heartbeat_at)),
-  stoppedAt: date(r.stopped_at)
-})
 
 /** Build an `UPDATE ... SET` from a sparse patch. */
 const setClause = (patch: Record<string, SQLInputValue | undefined>): [string, Array<SQLInputValue>] => {
@@ -185,6 +115,10 @@ const setClause = (patch: Record<string, SQLInputValue | undefined>): [string, A
   }
   return [cols.join(", "), vals]
 }
+
+/** `undefined` (leave as is) or the value converted for SQLite. */
+const maybe = <A>(value: A | undefined, convert: (a: A) => SQLInputValue): SQLInputValue | undefined =>
+  value === undefined ? undefined : convert(value)
 
 export const openDatabase = (options: SqliteOptions): DatabaseSync => {
   if (options.path !== ":memory:") mkdirSync(dirname(options.path), { recursive: true })
@@ -265,6 +199,11 @@ export const openSqliteStorage = (options: SqliteOptions): Storage => {
     const row = stmt(sql).get(...params)
     return row ? map(row) : null
   }
+  const update = (table: string, patch: Record<string, SQLInputValue | undefined>, where: string, ...keys: Array<SQLInputValue>) => {
+    const [set, values] = setClause(patch)
+    if (set) db.prepare(`UPDATE ${table} SET ${set} WHERE ${where}`).run(...values, ...keys)
+  }
+  const callKeyParams = (key: ToolCallKey): Array<SQLInputValue> => [key.sessionId, key.executionId, key.callKey]
 
   const service: Storage = {
     transaction,
@@ -275,267 +214,125 @@ export const openSqliteStorage = (options: SqliteOptions): Storage => {
     insertAgent: (a) =>
       op("insertAgent", () => {
         stmt(
-          "INSERT INTO agents (id, runtime_id, model, cwd, state, state_reason, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-        ).run(a.id, a.runtimeId, a.model, a.cwd, a.state, a.stateReason, ms(a.createdAt), ms(a.updatedAt))
+          "INSERT INTO agents (id, runtime_id, model, cwd, session_id, session_store, summary, start_checkpoint, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ).run(a.id, a.runtimeId, a.model, a.cwd, a.sessionId, a.sessionStore, a.summary, a.startCheckpoint, ms(a.createdAt), ms(a.updatedAt))
       }),
-    updateAgent: (id, patch, now) =>
-      op("updateAgent", () => {
-        const [set, vals] = setClause({
-          state: patch.state,
-          state_reason: patch.stateReason,
-          runtime_id: patch.runtimeId,
-          model: patch.model,
-          cwd: patch.cwd,
-          updated_at: now.getTime()
-        })
-        db.prepare(`UPDATE agents SET ${set} WHERE id = ?`).run(...vals, id)
-      }),
-
-    getSubmission: (id) =>
-      op("getSubmission", () => one("SELECT * FROM submissions WHERE id = ?", submissionFromRow, id)),
-    findSubmissionByRequest: (agentId, requestId) =>
-      op("findSubmissionByRequest", () =>
-        one("SELECT * FROM submissions WHERE agent_id = ? AND request_id = ?", submissionFromRow, agentId, requestId)
+    updateAgent: (id, p) =>
+      op("updateAgent", () =>
+        update(
+          "agents",
+          {
+            session_id: p.sessionId,
+            session_store: p.sessionStore,
+            summary: p.summary,
+            start_checkpoint: p.startCheckpoint,
+            model: p.model,
+            runtime_id: p.runtimeId,
+            cwd: p.cwd,
+            updated_at: ms(p.updatedAt)
+          },
+          "id = ?",
+          id
+        )
       ),
-    nextQueuedSubmission: (agentId) =>
-      op("nextQueuedSubmission", () =>
-        one(
-          "SELECT * FROM submissions WHERE agent_id = ? AND state = 'queued' ORDER BY created_at, rowid LIMIT 1",
-          submissionFromRow,
-          agentId
+
+    getSubmission: (agentId, id) =>
+      op("getSubmission", () => one("SELECT * FROM submissions WHERE agent_id = ? AND id = ?", submissionFromRow, agentId, id)),
+    insertSubmission: (s) =>
+      op("insertSubmission", () => {
+        stmt(
+          "INSERT INTO submissions (agent_id, id, request_id, session_id, session_store, model, content, state, result, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ).run(s.agentId, s.id, s.requestId, s.sessionId, s.sessionStore, s.model, encodePayload(s.content), s.state, payload(s.result), s.error, ms(s.createdAt), ms(s.updatedAt))
+      }),
+    updateSubmission: (agentId, id, p) =>
+      op("updateSubmission", () =>
+        update(
+          "submissions",
+          { state: p.state, session_id: p.sessionId, result: maybe(p.result, payload), error: p.error, updated_at: ms(p.updatedAt) },
+          "agent_id = ? AND id = ?",
+          agentId,
+          id
         )
       ),
     listSubmissions: (agentId, limit) =>
       op("listSubmissions", () =>
-        all(
-          "SELECT * FROM submissions WHERE agent_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
-          submissionFromRow,
-          agentId,
-          limit
-        )
+        all("SELECT * FROM submissions WHERE agent_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?", submissionFromRow, agentId, limit)
       ),
-    insertSubmission: (s) =>
-      op("insertSubmission", () => {
-        stmt(
-          "INSERT INTO submissions (id, agent_id, request_id, kind, content, state, result, error, cancel_requested, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        ).run(
-          s.id,
-          s.agentId,
-          s.requestId,
-          s.kind,
-          encodePayload(s.content),
-          s.state,
-          s.result === null ? null : encodePayload(s.result),
-          s.error,
-          s.cancelRequested ? 1 : 0,
-          ms(s.createdAt),
-          ms(s.updatedAt)
-        )
-      }),
-    updateSubmission: (id, patch, now) =>
-      op("updateSubmission", () => {
-        const [set, vals] = setClause({
-          state: patch.state,
-          result: patch.result === undefined ? undefined : encodePayload(patch.result),
-          error: patch.error,
-          cancel_requested: patch.cancelRequested === undefined ? undefined : patch.cancelRequested ? 1 : 0,
-          updated_at: now.getTime()
-        })
-        db.prepare(`UPDATE submissions SET ${set} WHERE id = ?`).run(...vals, id)
-      }),
+    runningSubmissions: () =>
+      op("runningSubmissions", () => all("SELECT * FROM submissions WHERE state = 'running' ORDER BY created_at, rowid", submissionFromRow)),
+    finishedSubmissions: (agentId) =>
+      op("finishedSubmissions", () =>
+        agentId === null
+          ? all("SELECT * FROM submissions WHERE result IS NOT NULL ORDER BY created_at, rowid", submissionFromRow)
+          : all("SELECT * FROM submissions WHERE agent_id = ? AND result IS NOT NULL ORDER BY created_at, rowid", submissionFromRow, agentId)
+      ),
 
-    getTurn: (id) => op("getTurn", () => one("SELECT * FROM turns WHERE id = ?", turnFromRow, id)),
-    activeTurn: (agentId) =>
-      op("activeTurn", () =>
-        one("SELECT * FROM turns WHERE agent_id = ? AND state IN ('running', 'interrupted')", turnFromRow, agentId)
+    getToolCall: (key) =>
+      op("getToolCall", () =>
+        one("SELECT * FROM tool_calls WHERE session_id = ? AND execution_id = ? AND call_key = ?", toolCallFromRow, ...callKeyParams(key))
       ),
-    unfinishedTurns: () =>
-      op("unfinishedTurns", () =>
-        all("SELECT * FROM turns WHERE state IN ('running', 'interrupted') ORDER BY started_at, rowid", turnFromRow)
-      ),
-    listTurns: (agentId, limit) =>
-      op("listTurns", () =>
-        all("SELECT * FROM turns WHERE agent_id = ? ORDER BY started_at DESC, rowid DESC LIMIT ?", turnFromRow, agentId, limit)
-      ),
-    turnForSubmission: (submissionId) =>
-      op("turnForSubmission", () =>
-        one("SELECT * FROM turns WHERE submission_id = ? ORDER BY rowid DESC LIMIT 1", turnFromRow, submissionId)
-      ),
-    insertTurn: (t) =>
-      op("insertTurn", () => {
+    insertToolCall: (c) =>
+      op("insertToolCall", () => {
         stmt(
-          "INSERT INTO turns (id, agent_id, submission_id, state, attempt, executor_id, base_checkpoint_seq, started_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO tool_calls (session_id, execution_id, call_key, agent_id, submission_id, name, input, replay_policy, idempotency_key, state, output, error, attempts, progress, started_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ).run(
-          t.id,
-          t.agentId,
-          t.submissionId,
-          t.state,
-          t.attempt,
-          t.executorId,
-          t.baseCheckpointSeq,
-          ms(t.startedAt),
-          ms(t.completedAt)
+          c.sessionId,
+          c.executionId,
+          c.callKey,
+          c.agentId,
+          c.submissionId,
+          c.name,
+          encodePayload(c.input),
+          c.replayPolicy,
+          c.idempotencyKey,
+          c.state,
+          payload(c.output),
+          c.error,
+          c.attempts,
+          c.progress,
+          ms(c.startedAt),
+          ms(c.completedAt)
         )
       }),
-    updateTurn: (id, patch) =>
-      op("updateTurn", () => {
-        const [set, vals] = setClause({
-          state: patch.state,
-          attempt: patch.attempt,
-          executor_id: patch.executorId,
-          completed_at: patch.completedAt === undefined ? undefined : ms(patch.completedAt)
-        })
-        if (set) db.prepare(`UPDATE turns SET ${set} WHERE id = ?`).run(...vals, id)
-      }),
-
-    getTask: (id) => op("getTask", () => one("SELECT * FROM tasks WHERE id = ?", taskFromRow, id)),
-    tasksForTurn: (turnId) =>
-      op("tasksForTurn", () => all("SELECT * FROM tasks WHERE turn_id = ? ORDER BY rowid", taskFromRow, turnId)),
-    unfinishedTasks: () =>
-      op("unfinishedTasks", () =>
-        all("SELECT * FROM tasks WHERE state IN ('pending', 'running') ORDER BY rowid", taskFromRow)
-      ),
-    abandonedTasks: () =>
-      op("abandonedTasks", () =>
-        all(
-          `SELECT t.* FROM tasks t JOIN turns u ON u.id = t.turn_id
-           WHERE t.state = 'interrupted' AND t.type = 'tool' AND u.state IN ('completed', 'failed', 'cancelled')
-             AND NOT EXISTS (SELECT 1 FROM tasks r WHERE r.parent_task_id = t.id)
-           ORDER BY t.rowid`,
-          taskFromRow
+    updateToolCall: (key, p) =>
+      op("updateToolCall", () =>
+        update(
+          "tool_calls",
+          {
+            state: p.state,
+            output: maybe(p.output, encodePayload),
+            error: p.error,
+            attempts: p.attempts,
+            progress: p.progress,
+            completed_at: maybe(p.completedAt, ms)
+          },
+          "session_id = ? AND execution_id = ? AND call_key = ?",
+          ...callKeyParams(key)
         )
       ),
-    insertTask: (t) =>
-      op("insertTask", () => {
-        stmt(
-          "INSERT INTO tasks (id, turn_id, agent_id, parent_task_id, caller_task_id, call_key, type, state, name, input, input_hash, replay_policy, idempotency_key, attempt, metadata, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        ).run(
-          t.id,
-          t.turnId,
-          t.agentId,
-          t.parentTaskId,
-          t.callerTaskId,
-          t.callKey,
-          t.type,
-          t.state,
-          t.name,
-          t.input === null ? null : encodePayload(t.input),
-          t.inputHash,
-          t.replayPolicy,
-          t.idempotencyKey,
-          t.attempt,
-          t.metadata === null ? null : encodePayload(t.metadata),
-          ms(t.startedAt)
-        )
-      }),
-    updateTask: (id, patch) =>
-      op("updateTask", () => {
-        const [set, vals] = setClause({
-          state: patch.state,
-          output: patch.output === undefined ? undefined : encodePayload(patch.output),
-          error: patch.error,
-          acknowledged: patch.acknowledged === undefined ? undefined : patch.acknowledged ? 1 : 0,
-          metadata: patch.metadata === undefined ? undefined : encodePayload(patch.metadata),
-          completed_at: patch.completedAt === undefined ? undefined : ms(patch.completedAt)
-        })
-        if (set) db.prepare(`UPDATE tasks SET ${set} WHERE id = ?`).run(...vals, id)
-      }),
-
-    latestCheckpoint: (agentId) =>
-      op("latestCheckpoint", () =>
-        one(
-          "SELECT * FROM checkpoints WHERE agent_id = ? ORDER BY sequence DESC LIMIT 1",
-          checkpointFromRow,
-          agentId
-        )
+    runningToolCalls: () =>
+      op("runningToolCalls", () => all("SELECT * FROM tool_calls WHERE state = 'running' ORDER BY started_at, rowid", toolCallFromRow)),
+    toolCallsOf: (sessionId, executionId) =>
+      op("toolCallsOf", () =>
+        all("SELECT * FROM tool_calls WHERE session_id = ? AND execution_id = ? ORDER BY rowid", toolCallFromRow, sessionId, executionId)
       ),
-    getCheckpoint: (agentId, sequence) =>
-      op("getCheckpoint", () =>
-        one("SELECT * FROM checkpoints WHERE agent_id = ? AND sequence = ?", checkpointFromRow, agentId, sequence)
-      ),
-    insertCheckpoint: (c) =>
-      op("insertCheckpoint", () => {
-        stmt(
-          "INSERT INTO checkpoints (id, agent_id, sequence, runtime_id, model, data, summary, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-        ).run(c.id, c.agentId, c.sequence, c.runtimeId, c.model, c.fxCheckpoint, c.summary, ms(c.createdAt))
-      }),
 
     getDocument: (agentId, kind) =>
       op("getDocument", () => one("SELECT * FROM documents WHERE owner = ? AND kind = ?", documentFromRow, agentId ?? "", kind)),
     putDocument: (d) =>
       op("putDocument", () => {
-        stmt(
-          `INSERT OR REPLACE INTO documents (${DOCUMENT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(...documentRow(d))
-      }),
-    insertDocumentRevision: (d) =>
-      op("insertDocumentRevision", () => {
-        stmt(
-          `INSERT INTO document_revisions (${DOCUMENT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(...documentRow(d))
-      }),
-    documentAsOf: (agentId, kind, sequence) =>
-      op("documentAsOf", () =>
-        one(
-          "SELECT * FROM document_revisions WHERE owner = ? AND kind = ? AND checkpoint_seq < ? ORDER BY revision DESC LIMIT 1",
-          documentFromRow,
-          agentId,
-          kind,
-          sequence
+        stmt("INSERT OR REPLACE INTO documents (owner, kind, version, revision, value, fork, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+          d.agentId ?? "",
+          d.kind,
+          d.version,
+          d.revision,
+          encodePayload(d.value),
+          d.fork,
+          ms(d.updatedAt)
         )
-      ),
+      }),
     agentDocuments: (agentId) =>
       op("agentDocuments", () => all("SELECT * FROM documents WHERE owner = ? ORDER BY kind", documentFromRow, agentId)),
-
-    lastEventSequence: (agentId) =>
-      op("lastEventSequence", () =>
-        Number(stmt("SELECT COALESCE(MAX(sequence), 0) AS seq FROM events WHERE agent_id = ?").get(agentId)?.seq ?? 0)
-      ),
-    appendEvent: (e) =>
-      op("appendEvent", () => {
-        const row = stmt("SELECT COALESCE(MAX(sequence), 0) AS seq FROM events WHERE agent_id = ?").get(e.agentId)
-        const sequence = Number(row?.seq ?? 0) + 1
-        stmt(
-          "INSERT INTO events (id, agent_id, submission_id, turn_id, task_id, sequence, type, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        ).run(e.id, e.agentId, e.submissionId, e.turnId, e.taskId, sequence, e.type, encodePayload(e.payload), ms(e.createdAt))
-        return {
-          id: e.id,
-          agentId: e.agentId,
-          submissionId: e.submissionId,
-          turnId: e.turnId,
-          taskId: e.taskId,
-          sequence,
-          type: e.type,
-          payload: e.payload,
-          createdAt: e.createdAt
-        }
-      }),
-    eventsAfter: (agentId, after, limit) =>
-      op("eventsAfter", () =>
-        all(
-          "SELECT * FROM events WHERE agent_id = ? AND sequence > ? ORDER BY sequence LIMIT ?",
-          eventFromRow,
-          agentId,
-          after,
-          limit
-        )
-      ),
-
-    registerExecutor: (x) =>
-      op("registerExecutor", () => {
-        stmt(
-          "INSERT INTO executors (id, pid, hostname, started_at, heartbeat_at, stopped_at) VALUES (?, ?, ?, ?, ?, ?)"
-        ).run(x.id, x.pid, x.hostname, ms(x.startedAt), ms(x.heartbeatAt), ms(x.stoppedAt))
-      }),
-    heartbeatExecutor: (id, now) =>
-      op("heartbeatExecutor", () => {
-        stmt("UPDATE executors SET heartbeat_at = ? WHERE id = ?").run(now.getTime(), id)
-      }),
-    stopExecutor: (id, now) =>
-      op("stopExecutor", () => {
-        stmt("UPDATE executors SET stopped_at = ? WHERE id = ?").run(now.getTime(), id)
-      }),
-    getExecutor: (id) => op("getExecutor", () => one("SELECT * FROM executors WHERE id = ?", executorFromRow, id)),
 
     close: () => {
       if (db.isOpen) db.close()

@@ -1,277 +1,123 @@
 /**
  * The crash matrix. Each case runs a real application process, SIGKILLs it at
- * a deterministic boundary, restarts it, and checks the core invariants:
+ * a deterministic boundary, runs it again, and checks the invariants:
  *
- *   unsafe effect occurs <= 1 time automatically
- *   safe effect may replay
- *   submission requestId never creates duplicate logical work
+ *   an unsafe effect occurs at most once automatically
+ *   a safe effect may run again; an idempotent one runs again with the same key
+ *   a requestId never creates duplicate logical work
  *   unknown external state is represented as unknown
- *   completed committed work is never unnecessarily repeated
- *   recovery can itself be restarted
+ *   completed work is never repeated
+ *   a tool's document writes happen exactly when its result does
  */
 import { describe, expect, it } from "vitest"
-import { assertInvariants, crashAt, eventTypes, sandbox, type Sandbox } from "./harness.js"
+import { assertInvariants, crashAt, sandbox, toolCalls, type Sandbox } from "./harness.js"
+import type { CrashPlan } from "../../src/runtime/crash.js"
 
-const crashThenRecover = (box: Sandbox, plan: ReturnType<typeof crashAt>, scenario?: string) => {
-  const crashed = box.run({ crash: plan, scenario })
+const crashThenRecover = (box: Sandbox, plan: CrashPlan) => {
+  const crashed = box.run({ crash: plan })
   expect(crashed.signal, `expected SIGKILL at ${plan.point}\n${crashed.stderr}`).toBe("SIGKILL")
-  const recovered = box.run({ scenario })
+  const recovered = box.run()
   expect(recovered.status, recovered.stderr).toBe(0)
   expect(recovered.output?.ok, JSON.stringify(recovered.output)).toBe(true)
   assertInvariants(box, expect)
   return recovered
 }
 
-const unknownTasks = (box: Sandbox, tool: string) =>
-  box.query("SELECT id FROM tasks WHERE state = 'outcome_unknown' AND name = ?", tool)
-
-describe("crash matrix: model boundaries", () => {
-  it("before model request: the model call is redone, nothing else repeats", () => {
-    const box = sandbox()
-    crashThenRecover(box, crashAt("model.before-request", undefined, 1))
-    expect(box.count("read_file")).toBe(1)
-    expect(box.count("deploy")).toBe(1)
-    expect(unknownTasks(box, "deploy")).toEqual([])
-    expect(eventTypes(box)).toContain("model.interrupted")
-  })
-
-  it("during model stream: the partial response is discarded and redone", () => {
-    const box = sandbox()
-    crashThenRecover(box, crashAt("model.during-stream", undefined, 2))
+describe("crash matrix: requests", () => {
+  it("after the request is recorded, before libfx stores it: it is prompted again and runs once", () => {
+    const box = sandbox("deploy")
+    crashThenRecover(box, crashAt("submission.after-persist"))
     expect(box.count("read_file")).toBe(1)
     expect(box.count("deploy")).toBe(1)
   })
 
-  it("after model response: committed tool work is reused, not re-executed", () => {
-    const box = sandbox()
-    crashThenRecover(box, crashAt("model.after-response", undefined, 2))
-    expect(box.count("read_file")).toBe(1)
+  it("after libfx stored the request: the turn runs once", () => {
+    const box = sandbox("deploy")
+    crashThenRecover(box, crashAt("submission.after-accept"))
     expect(box.count("deploy")).toBe(1)
-    expect(eventTypes(box)).toContain("tool.reused")
   })
 })
 
-describe("crash matrix: reuse", () => {
-  it("a safe tool with reuse: false runs again after a crash instead of returning its old result", () => {
-    const box = sandbox()
-    const env = { FXD_TEST_READ_REUSE: "0" }
-    const crashed = box.run({ crash: crashAt("model.after-response", undefined, 2), env })
-    expect(crashed.signal).toBe("SIGKILL")
-    const recovered = box.run({ env })
-    expect(recovered.output?.ok, recovered.stderr).toBe(true)
-    assertInvariants(box, expect)
-    expect(box.count("read_file")).toBe(2)
+describe("crash matrix: tool calls", () => {
+  it("during an unsafe call: it is never run again, and is recorded and reported as unknown", () => {
+    const box = sandbox("deploy")
+    const recovered = crashThenRecover(box, crashAt("test.during-unsafe-tool", "deploy"))
     expect(box.count("deploy")).toBe(1)
-    expect(box.query("SELECT id FROM events WHERE type = 'tool.reused' AND payload LIKE '%read_file%'")).toEqual([])
+    expect(toolCalls(box).find((c) => c.name === "deploy")).toMatchObject({ state: "outcome_unknown" })
+    expect(recovered.output?.result?.text).toContain("may have partly run")
+  })
+
+  it("after an unsafe call returned, before its result was stored: unknown, never run again", () => {
+    const box = sandbox("deploy")
+    crashThenRecover(box, crashAt("tool.after-execute", "deploy"))
+    expect(box.count("deploy")).toBe(1)
+    expect(toolCalls(box).find((c) => c.name === "deploy")).toMatchObject({ state: "outcome_unknown" })
+  })
+
+  it("after an unsafe call's result was stored: it does not run again, and keeps its recorded result", () => {
+    const box = sandbox("deploy")
+    const recovered = crashThenRecover(box, crashAt("tool.after-result-persist", "deploy"))
+    expect(box.count("deploy")).toBe(1)
+    expect(toolCalls(box).find((c) => c.name === "deploy")).toMatchObject({ state: "completed", attempts: 1 })
+    // libfx never runs an unsafe call again; it tells the model the call may have partly run.
+    expect(recovered.output?.result?.text).toContain("may have partly run")
+  })
+
+  it("during a safe call: it runs again and completes", () => {
+    const box = sandbox("deploy")
+    crashThenRecover(box, crashAt("test.during-safe-tool", "read_file"))
+    expect(box.count("read_file")).toBe(2)
+    expect(toolCalls(box).find((c) => c.name === "read_file")).toMatchObject({ state: "completed", attempts: 2 })
+    expect(box.count("deploy")).toBe(1)
+  })
+
+  it("during an idempotent call: it runs again with the same idempotency key", () => {
+    const box = sandbox("charge")
+    crashThenRecover(box, crashAt("test.during-idempotent-tool", "charge"))
+    const charges = box.ledgerEntries().filter((e) => e.effect === "charge")
+    expect(charges).toHaveLength(2)
+    expect(charges[0]!.detail.key).toBe(charges[1]!.detail.key)
+  })
+})
+
+describe("crash matrix: documents", () => {
+  it("a write staged by a call cut off by a crash is not stored; the rerun stores it once", () => {
+    const box = sandbox("note")
+    crashThenRecover(box, crashAt("test.after-document-update", "note"))
+    expect(box.count("note")).toBe(2)
+    const [doc] = box.query("SELECT value FROM documents WHERE kind = 'test.notes'")
+    expect(JSON.parse(String(doc!.value)).data).toEqual({ lines: ["remember"] })
+  })
+})
+
+describe("crash matrix: nested calls", () => {
+  it("a crash after a nested unsafe call completed: the caller runs again and gets the stored result", () => {
+    const box = sandbox("nested")
+    crashThenRecover(box, crashAt("test.in-release", "release"))
+    expect(box.count("release")).toBe(2)
+    expect(box.count("deploy")).toBe(1)
+    expect(toolCalls(box)).toEqual([
+      { name: "release", key: "", state: "completed", attempts: 2 },
+      { name: "deploy", key: "0", state: "completed", attempts: 1 }
+    ])
+  })
+
+  it("a crash during a nested unsafe call: the caller runs again and the nested call is refused as unknown", () => {
+    const box = sandbox("nested")
+    crashThenRecover(box, crashAt("test.during-unsafe-tool", "deploy"))
+    expect(box.count("deploy")).toBe(1)
+    expect(toolCalls(box)).toEqual([
+      { name: "release", key: "", state: "failed", attempts: 2 },
+      { name: "deploy", key: "0", state: "outcome_unknown", attempts: 1 }
+    ])
   })
 })
 
 describe("crash matrix: subagents", () => {
-  it("a crash inside a subagent resumes the same subagent instead of starting another", () => {
-    const box = sandbox()
-    const crashed = box.run({ crash: crashAt("test.in-subagent-work", "work"), scenario: "subagent" })
-    expect(crashed.signal).toBe("SIGKILL")
-    const recovered = box.run({ scenario: "subagent" })
-    expect(recovered.output?.ok, recovered.stderr).toBe(true)
-    expect(recovered.output?.result?.text).toContain("work done")
-    assertInvariants(box, expect)
-    const children = box.query("SELECT id FROM agents WHERE id LIKE 'engineer/delegate/%'")
-    expect(children).toHaveLength(1)
-    expect(box.query("SELECT id FROM submissions WHERE agent_id LIKE 'engineer/delegate/%'")).toHaveLength(1)
-    // The child's safe work replayed once after the crash; nothing else repeated.
+  it("a crash inside a subagent's work continues the same subagent instead of starting another", () => {
+    const box = sandbox("subagent")
+    crashThenRecover(box, crashAt("test.during-work", "work"))
     expect(box.count("work")).toBe(2)
-  })
-
-  it("without a crash, the parent gets the subagent's answer", () => {
-    const box = sandbox()
-    const run = box.run({ scenario: "subagent" })
-    expect(run.output?.ok, run.stderr).toBe(true)
-    expect(run.output?.result?.text).toContain("work done")
-    expect(box.count("work")).toBe(1)
-  })
-})
-
-describe("crash matrix: nested tool calls", () => {
-  it("a safe caller replayed after a crash gets its committed nested call back instead of running it again", () => {
-    const box = sandbox()
-    const recovered = crashThenRecover(box, crashAt("test.in-release", "release"), "nested")
-    expect(recovered.output?.result?.text).toContain("Release: done")
-    expect(box.count("release")).toBe(2)
-    expect(box.count("deploy")).toBe(1)
-    expect(box.query("SELECT id FROM events WHERE type = 'tool.reused' AND payload LIKE '%deploy%'")).toHaveLength(1)
-  })
-
-  it("an unsafe nested call cut off by a crash is outcome_unknown, and the replayed caller is refused it", () => {
-    const box = sandbox()
-    crashThenRecover(box, crashAt("test.during-unsafe-tool", "deploy"), "nested")
-    expect(box.count("deploy")).toBe(1)
-    expect(unknownTasks(box, "deploy")).toHaveLength(1)
-    expect(eventTypes(box)).toContain("tool.outcome_unknown_refused")
-  })
-})
-
-describe("crash matrix: hooks", () => {
-  it("a crash while beforeTool decides leaves nothing unknown: the call never started", () => {
-    const box = sandbox()
-    const env = { FXD_TEST_HOOKS: "1" }
-    const crashed = box.run({ crash: crashAt("test.in-before-tool", "deploy"), env })
-    expect(crashed.signal).toBe("SIGKILL")
-    expect(box.count("deploy")).toBe(0)
-    const recovered = box.run({ env })
-    expect(recovered.output?.ok, recovered.stderr).toBe(true)
-    assertInvariants(box, expect)
-    expect(box.count("deploy")).toBe(1)
-    expect(unknownTasks(box, "deploy")).toEqual([])
-    expect(box.count("before_tool")).toBeGreaterThanOrEqual(2) // asked again after the crash
-  })
-})
-
-describe("crash matrix: tool boundaries", () => {
-  it("before tool intent commit: the effect never started, so it runs once after recovery", () => {
-    const box = sandbox()
-    crashThenRecover(box, crashAt("tool.before-persist", "deploy"))
-    expect(box.count("deploy")).toBe(1)
-    expect(box.count("read_file")).toBe(1)
-    expect(unknownTasks(box, "deploy")).toEqual([])
-  })
-
-  it("after tool intent commit: unsafe intent without result is outcome_unknown, never replayed", () => {
-    const box = sandbox()
-    crashThenRecover(box, crashAt("tool.after-persist", "deploy"))
-    // The effect did not actually run, but the runtime cannot know that: unknown means unknown.
-    expect(box.count("deploy")).toBe(0)
-    expect(unknownTasks(box, "deploy")).toHaveLength(1)
-    expect(eventTypes(box)).toContain("tool.outcome_unknown_refused")
-    expect(box.count("check_deploy")).toBe(1)
-  })
-
-  it("during safe tool: the safe tool is replayed", () => {
-    const box = sandbox("tests")
-    crashThenRecover(box, crashAt("test.during-safe-tool", "run_tests"))
-    expect(box.count("run_tests")).toBe(2)
-    expect(eventTypes(box)).toContain("tool.replayed")
-  })
-
-  it("after safe tool execution before result commit: replayed exactly once more", () => {
-    const box = sandbox("tests")
-    crashThenRecover(box, crashAt("tool.after-execute", "run_tests"))
-    expect(box.count("run_tests")).toBe(2)
-    const replays = box.query("SELECT id FROM tasks WHERE name = 'run_tests' AND parent_task_id IS NOT NULL AND state = 'completed'")
-    expect(replays).toHaveLength(1)
-  })
-
-  it("during unsafe tool: outcome_unknown, effect not repeated", () => {
-    const box = sandbox()
-    crashThenRecover(box, crashAt("test.during-unsafe-tool", "deploy"))
-    expect(box.count("deploy")).toBe(1)
-    expect(unknownTasks(box, "deploy")).toHaveLength(1)
-  })
-
-  it("after unsafe effect before result commit: outcome_unknown, the model inspects instead of repeating", () => {
-    const box = sandbox()
-    const recovered = crashThenRecover(box, crashAt("tool.after-execute", "deploy"))
-    expect(box.count("deploy")).toBe(1)
-    expect(box.count("check_deploy")).toBe(1)
-    expect(unknownTasks(box, "deploy")).toHaveLength(1)
-    expect(recovered.output?.result?.text).toContain("inspected")
-    const types = eventTypes(box)
-    expect(types).toContain("tool.outcome_unknown")
-    expect(types).toContain("tool.outcome_unknown_refused")
-    expect(types).toContain("turn.recovered")
-  })
-
-  it("after tool result commit: completed work is never repeated", () => {
-    const box = sandbox()
-    crashThenRecover(box, crashAt("tool.after-result-persist", "deploy"))
-    expect(box.count("deploy")).toBe(1)
-    expect(box.count("read_file")).toBe(1)
-    expect(unknownTasks(box, "deploy")).toEqual([])
-  })
-
-  it("idempotent tool: retried with the same idempotency key", () => {
-    const box = sandbox("idempotent")
-    crashThenRecover(box, crashAt("tool.after-execute", "charge"), "idempotent")
-    const charges = box.ledgerEntries().filter((e) => e.effect === "charge")
-    expect(charges).toHaveLength(2)
-    expect(charges[0]!.detail.key).toBe(charges[1]!.detail.key)
-    expect(charges[1]!.detail.replay).toBe(true)
-  })
-})
-
-describe("crash matrix: checkpoint boundaries", () => {
-  it("before checkpoint: the turn is redone from journal, tools reused", () => {
-    const box = sandbox()
-    crashThenRecover(box, crashAt("checkpoint.before-write"))
-    expect(box.count("deploy")).toBe(1)
-    expect(box.count("read_file")).toBe(1)
-  })
-
-  it("during checkpoint: the uncommitted checkpoint transaction rolls back", () => {
-    const box = sandbox()
-    crashThenRecover(box, crashAt("checkpoint.during-write"))
-    expect(box.count("deploy")).toBe(1)
-    expect(box.query("SELECT id FROM checkpoints")).toHaveLength(1)
-  })
-
-  it("after checkpoint: the committed turn is not recovered or repeated", () => {
-    const box = sandbox()
-    crashThenRecover(box, crashAt("checkpoint.after-write"))
-    expect(box.count("deploy")).toBe(1)
-    expect(eventTypes(box)).not.toContain("recovery.started")
-  })
-})
-
-describe("crash matrix: submissions and turns", () => {
-  it("after submission persist: restart with the same requestId attaches to the same submission", () => {
-    const box = sandbox()
-    const recovered = crashThenRecover(box, crashAt("submission.after-persist"))
-    const subs = box.query("SELECT id FROM submissions")
-    expect(subs).toHaveLength(1)
-    expect(recovered.output?.submissionId).toBe(subs[0]!.id)
-  })
-
-  it("after turn start: the turn resumes on restart", () => {
-    const box = sandbox()
-    crashThenRecover(box, crashAt("turn.after-start"))
-    expect(box.count("deploy")).toBe(1)
-  })
-})
-
-describe("crash matrix: recovery itself", () => {
-  for (const point of ["recovery.started", "recovery.after-classify", "recovery.before-continue"]) {
-    it(`crash at ${point} during recovery: recovery restarts cleanly`, () => {
-      const box = sandbox()
-      expect(box.run({ crash: crashAt("tool.after-execute", "deploy") }).signal).toBe("SIGKILL")
-      expect(box.run({ crash: crashAt(point) }).signal).toBe("SIGKILL")
-      const final = box.run()
-      expect(final.output?.ok, final.stderr).toBe(true)
-      assertInvariants(box, expect)
-      expect(box.count("deploy")).toBe(1)
-      expect(unknownTasks(box, "deploy")).toHaveLength(1)
-    })
-  }
-
-  it("crash during a safe replay: the replay is replayed again", () => {
-    const box = sandbox("tests")
-    expect(box.run({ crash: crashAt("tool.after-execute", "run_tests") }).signal).toBe("SIGKILL")
-    expect(box.run({ crash: crashAt("recovery.during-replay", "run_tests") }).signal).toBe("SIGKILL")
-    const final = box.run()
-    expect(final.output?.ok, final.stderr).toBe(true)
-    assertInvariants(box, expect)
-    expect(box.count("run_tests")).toBeGreaterThanOrEqual(2)
-    const completed = box.query("SELECT id FROM tasks WHERE name = 'run_tests' AND state = 'completed'")
-    expect(completed).toHaveLength(1)
-  })
-
-  it("repeated crashes give up into needs_input instead of looping forever", () => {
-    const box = sandbox()
-    for (let i = 0; i < 4; i++) {
-      expect(box.run({ crash: crashAt("model.before-request") }).signal).toBe("SIGKILL")
-    }
-    const final = box.run()
-    expect(final.output?.ok).toBe(false)
-    const agent = box.query("SELECT state FROM agents WHERE id = 'engineer'")
-    expect(agent[0]!.state).toBe("needs_input")
-    expect(eventTypes(box)).toContain("recovery.failed")
+    expect(box.query("SELECT id FROM agents ORDER BY id").map((r) => String(r.id))).toHaveLength(2)
   })
 })

@@ -14,65 +14,28 @@ Agents should outlive their processes.
 
 ## What is this?
 
-fx-durable is a durability layer for [libfx](https://github.com/vercel-labs/fx/tree/main/sdk) agents. When the process
-crashes, the machine restarts, or the client disconnects, the agent recovers and carries on. It never reports an
-uncertain side effect as a success.
+fx-durable builds durable agents on [libfx](https://github.com/vercel-labs/fx/tree/main/sdk). When the process
+crashes, the machine restarts, or the client disconnects, the agent carries on, and it never reports an uncertain side
+effect as a success.
 
-libfx still runs the agent loop, model calls and checkpoints. fx-durable adds the persistence around it: an execution
-journal in SQLite, crash recovery, replay rules for tools, stable agent identity, and an event log clients can
-reconnect to.
+libfx keeps each conversation as a durable session: it stores every step of a turn, continues a turn a crash cut off,
+queues requests, and replays events from any point. fx-durable adds what an agent runtime needs around those
+sessions:
 
-> **libfx decides. Effect executes. Journal transitions. Storage persists.**
+- **Tools with replay policies.** A journal of tool calls, keyed by libfx's call id, gives each call exactly one
+  recorded outcome: completed work is never redone, a safe call runs again, and an unsafe one that may have run is
+  reported as unknown instead of being retried.
+- **Typed documents** that tools write in the same transaction as their result.
+- **Tools calling tools**, **subagents**, and **extensions** that bundle tools, instructions, and hooks.
+- **Stable agents** that move between sessions on reset, fork, or a change of tools.
+- **Usage and cost**, ready-made **coding tools**, and a **test kit** with a scripted model and a crash matrix.
+
+> fx-durable builds on the durable sessions of the next libfx release. Until it ships, it pins
+> `libfx@0.0.13-dev.1432.g1df91f0b4ebf`.
 
 ## Quick Start
 
 Requires Node.js 22.13+ (for the built-in `node:sqlite`) and pnpm.
-
-```bash
-pnpm install
-pnpm build
-node dist/cli/main.js demo
-```
-
-The demo runs an agent that builds a small Hacker News client and then deploys it. It prints its pid. Run
-`kill -9 <pid>` at any point, then start it again:
-
-```text
-Recovering agent engineer...
-
-✗ npm test interrupted
-✓ bash was replay-safe — replaying
-✓ restored checkpoint
-✓ recovered interrupted turn
-
-Continuing...
-```
-
-To see the important case, kill it after the deploy has started but before its result is saved:
-
-```bash
-node dist/cli/main.js demo --reset --crash-at tool.after-execute:deploy
-node dist/cli/main.js demo
-```
-
-```text
-⚠ Interrupted external operation
-
-  deploy
-  environment: production
-  version: abc123
-
-  Outcome unknown.
-  Operation will NOT be replayed automatically.
-
-● model
-  The previous deploy may or may not have happened. Inspecting deployment state before doing anything.
-```
-
-The demo uses a scripted model that speaks the AI Gateway protocol, so it runs offline and gives the same output every
-time. The libfx kernel underneath is real.
-
-## Usage
 
 ```ts
 import { Schema } from "effect"
@@ -94,28 +57,37 @@ const deploy = defineDurableTool({
 
 const fx = await DurableFx.open({
   storage: sqlite("./fx.db"),
-  runtimes: { "coding-v1": { tools: [search, deploy] } }
+  runtimes: { coding: { tools: [search, deploy], instructions: "You are a careful engineer." } }
 })
 
-const agent = await fx.agent("engineer", { runtime: "coding-v1", model: "anthropic/claude-sonnet-4.5" })
+const agent = await fx.agent("engineer", { runtime: "coding", model: "anthropic/claude-sonnet-4.5" })
 const submission = await agent.submit("Fix issue #382", { requestId: "github-382" })
 
-for await (const event of submission.events()) console.log(event.type)
+for await (const event of submission.events()) if (event.type === "text_delta") process.stdout.write(event.delta)
 const result = await submission.result() // { text, stopReason, usage }
 ```
 
-Credentials come from `AI_GATEWAY_API_KEY` or `DurableFx.open({ apiKey })`. Opening the runtime recovers interrupted
-work. Pass `recovery: "manual"` to do that later with `fx.resume()`.
+Credentials come from `AI_GATEWAY_API_KEY` or `DurableFx.open({ apiKey })`. Opening fx-durable continues every
+request a previous process left unfinished; pass `recovery: "manual"` to do that later with `fx.resume()`.
+
+The examples run offline with a scripted model (or against the AI Gateway when `AI_GATEWAY_API_KEY` is set):
+
+```bash
+pnpm install && pnpm build
+npx tsx examples/unsafe-tool/index.ts --crash   # the deploy starts, then the process is killed
+npx tsx examples/unsafe-tool/index.ts           # the deploy is not run again; the agent inspects production
+```
+
+## Usage
 
 ### Without Effect
 
 fx-durable is built on Effect, but the main `fx-durable` entry doesn't require it. Every call returns a Promise or an
-AsyncIterable, errors are ordinary `Error` subclasses with a `_tag`, and records are plain objects. Tool input can
-be validated with any [Standard Schema](https://standardschema.dev) library:
+AsyncIterable, errors are ordinary `Error` subclasses with a `_tag`, and records are plain objects. Tool input can be
+validated with Effect Schema, any [Standard Schema](https://standardschema.dev) library, or a plain JSON Schema:
 
 ```ts
 import { z } from "zod"
-import { DurableFx, defineDurableTool, sqlite } from "fx-durable"
 
 const forecast = defineDurableTool({
   name: "forecast",
@@ -126,90 +98,85 @@ const forecast = defineDurableTool({
 ```
 
 The JSON Schema the model sees comes from the validator when it implements Standard JSON Schema, as Zod 4 does.
-Otherwise pass `jsonSchema` yourself. A plain JSON Schema object works as `inputSchema` too.
+Otherwise pass `jsonSchema` yourself.
 
-### With Effect
-
-`fx-durable/effect` exposes the Effect-native side:
-- `durableFxLayer(options)`: the whole service graph as one `Layer`.
-- `Database`: the durability boundary. `run(journal => …)`, `read(storage => …)` and `executors(registry => …)` turn
-  synchronous journal calls into Effects with typed storage errors.
-- The service tags: `EventLog`, `AgentSupervisor`, `RecoveryManager` and others.
-- `openDurableFx(options, { ids, clock })`: open with your own id generator or clock.
-
-Effect Schema works as a tool `inputSchema` directly.
+`fx-durable/effect` exposes the Effect-native side: the service graph as one `Layer` (`durableFxLayer`), the service
+tags, and the `Database` boundary.
 
 ### Replay policies
 
-Each tool declares what may happen to it after a crash.
+Each tool declares what may happen to a call that a crash cut off.
 
-| Policy | After an interrupted execution | Examples |
-|--------|--------------------------------|----------|
-| `"safe"` | Replayed automatically | read file, grep, git status |
-| `{ strategy: "idempotent", key }` | Retried with the same idempotency key | payment APIs that accept idempotency keys |
-| `"unsafe"` | Marked `outcome_unknown` and never replayed automatically | deploy, send email, git push |
+| Policy | A call cut off by a crash | Examples |
+|--------|---------------------------|----------|
+| `"safe"` | Runs again | read file, grep, git status |
+| `{ strategy: "idempotent", key }` | Runs again with the same idempotency key | payment APIs that take idempotency keys |
+| `"unsafe"` | Recorded as `outcome_unknown`, never run again on its own | deploy, send email, git push |
 
-When a recovered turn repeats a call that already completed before the crash, fx-durable answers it from the journal
-instead of executing again. That is what keeps a finished deploy from running twice. For a replay-safe tool that
-observes changing state, such as reading a file the agent later edited, the journaled answer can be stale. Set
-`reuse: false` on such tools and they run again. It is only allowed with `replay: "safe"`.
+A call that completed is never run again, whatever its policy: when libfx continues the turn, the call's recorded
+result is used. An unsafe call that may have run reaches the model as an error saying it may have partly run, so the
+model checks before acting. A tool that knows its request went out but can't tell whether it took effect can throw
+`new OutcomeUnknown(message)`.
 
-A tool that knows its request went out but can't tell whether it took effect can throw `new OutcomeUnknown(message)`.
-MCP tools plug in through a runtime's `createMcpClients`. They default to `"unsafe"`; you can change that per server
-with `replay` or per tool with `replayOverrides`.
+Tools that write shared state, such as files, can set `writes: true`: libfx then never runs them alongside the other
+calls of the same model response.
 
-Tool inputs and results are stored in the journal, so they must be JSON. Inputs are decoded with the tool's
-`inputSchema`, and returning nothing records `null`.
-
-### Reconnect and cancel
+### Requests, reconnecting, and cancelling
 
 ```ts
-const agent = await fx.attach("engineer")
-for await (const event of agent.events({ after: lastSeenSequence })) {
-  // saved events after the cursor, then live events, with no gap
+const submission = await agent.submit("Fix the failing tests", { requestId: "ci-1234" })
+await agent.submit("Fix the failing tests", { requestId: "ci-1234" }) // the same request: nothing new runs
+
+for await (const line of agent.events({ after: lastCursor })) {
+  // the session's events after the cursor, then live ones; each line has a `cursor`
 }
 
+await agent.steer("Use pnpm, not npm.") // reaches the model at its next request
 await submission.cancel()
 ```
 
-A client that disconnects doesn't cancel the agent.
+A request is recorded, then stored by libfx, before `submit()` resolves. It runs after the agent's earlier requests,
+and a client that disconnects doesn't stop it. `steer()` adds guidance to the turn that is running (or to the next
+one). Cancelling a turn aborts its tool calls; an unsafe call that was running is recorded as `outcome_unknown`,
+because stopping it locally doesn't prove the external effect stopped.
 
-"Cancel requested" and "cancelled" are separate facts. A queued submission is cancelled immediately. A running one
-first records `submission.cancel_requested` and becomes `cancelled` when execution actually stops. In the owning
-process that's immediate. When another process asks (`fxd cancel`), it happens at the owner's next model or tool
-call. An unsafe tool that was running is recorded as `outcome_unknown`, because stopping it locally doesn't prove
-the external effect was stopped.
-
-### Steering
+### Reset, handoff, and forks
 
 ```ts
-const submission = await agent.submit("Fix the failing tests")
-// …while it works:
-await agent.steer("Use pnpm, not npm.")
+await agent.reset()                                        // the next request starts a new conversation
+await agent.reset({ summary: "We are migrating to v2." })  // a handoff: the model sees this in its instructions
+
+const variant = await agent.fork("engineer-variant", { model: "anthropic/claude-opus-4.6" })
 ```
 
-`steer()` adds guidance to the turn that is running, the way you type to a coding agent while it works. fx-durable
-journals it first (`turn.steered`), then libfx hands it to the model at the next safe boundary without discarding
-work already done. If the process dies, the recovered attempt receives the guidance in its prompt. When no turn is
-running, or the turn finishes before the guidance reaches it, the text is submitted as a new request instead.
+A fork continues from the conversation as it is now, in a session of its own; the source is not touched. It keeps the
+runtime, model, and working directory unless you override them, and its documents follow their fork policies.
 
-When you'd rather refuse than queue, pass `whenBusy: "reject"`: if the agent is working or has requests queued,
-`submit()` submits nothing and rejects with `AgentBusyError`. The check and the insert are one transaction.
+### Tools calling tools
 
 ```ts
-await agent.submit("Only if you're free", { whenBusy: "reject" })
+const release = defineDurableTool({
+  name: "release",
+  replay: "safe",
+  execute: async ({ version }, { executeTool }) => {
+    await executeTool("run_tests", {})
+    return executeTool("deploy", { version }) // a journaled call of its own
+  }
+})
 ```
+
+A nested call is journaled under its caller, runs the hooks (which see `call.caller`), and keeps its own replay
+policy. When the caller runs again after a crash, a nested call with the same key, tool, and input gets its recorded
+outcome back instead of running again, so a safe `release` reruns without deploying twice. Each nested call is keyed
+by its position, or by `executeTool(name, input, { key })`. Set `callers: "tools"` on a tool that only other tools may
+call: the model is not offered it.
 
 ### Subagents
 
 ```ts
 import { defineSubagent } from "fx-durable"
 
-const research = defineSubagent({
-  name: "research",
-  description: "Investigate a question in the codebase and report back",
-  runtime: "researcher" // its own tools and instructions
-})
+const research = defineSubagent({ name: "research", description: "Investigate a question and report back", runtime: "researcher" })
 
 const fx = await DurableFx.open({
   storage: sqlite("./fx.db"),
@@ -220,166 +187,41 @@ const fx = await DurableFx.open({
 })
 ```
 
-A subagent is a tool that hands a task to a child durable agent and returns its answer. The child is an ordinary
-agent (`fx.attach(childId)` shows its events), named after the parent and the call's idempotency key, and it
-reports what it says as the call's progress. After a crash, the child's own work is recovered like any agent's, and
-the recovered parent calls the tool again and attaches to **the same child and the same request**. One task, one
-subagent, however many times the process dies.
-
-This uses a tool option you can use too: `resumeOnCall: true` (idempotent tools only). Such a call isn't replayed
-during recovery, which would block it while it waits on other durable work. When the recovered turn calls it again,
-it is retried with its original idempotency key.
-
-If the recovered turn finishes without calling it again (the model moved on), the call is **abandoned** and the
-child's request is cancelled, so no subagent keeps working for an answer nobody waits for. Stopping the process
-(`fx.close()`) leaves the child running for the restart to pick up; cancelling the parent's request cancels it.
-
-Your own tools can clean up the same way with `abandon`:
-
-```ts
-const startJob = defineDurableTool({
-  name: "start_job",
-  replay: { strategy: "idempotent" },
-  resumeOnCall: true,
-  execute: ({ spec }, { idempotencyKey, signal }) => jobs.runAndWait(spec, { key: idempotencyKey, signal }),
-  // Interrupted, and the turn ended without calling it again.
-  abandon: ({ idempotencyKey }) => jobs.cancel(idempotencyKey)
-})
-```
-
-An interrupted call is abandoned when its turn ends (completed, failed, or cancelled) without a retry. The hook runs
-then, or at the next `resume()` if the process died first, and again at each `resume()` until it succeeds, so make it
-idempotent. The call is then recorded as cancelled (`tool.abandoned`). A failed attempt is recorded as
-`tool.abandon_failed`. A tool's `signal.reason` is `"cancelled"` when the call is cancelled, and `"executor_lost"`
-when the process is stopping and the call may resume after a restart.
-
-### Tools calling tools
-
-```ts
-const release = defineDurableTool({
-  name: "release",
-  replay: "safe",
-  inputSchema: Schema.Struct({ version: Schema.String }),
-  execute: async ({ version }, { executeTool }) => {
-    const deployed = await executeTool("deploy", { version }) // its own durable task
-    await executeTool("announce", { text: `${version} is live` })
-    return deployed
-  }
-})
-const deploy = defineDurableTool({ name: "deploy", replay: "unsafe", callers: "tools", /* … */ })
-```
-
-`context.executeTool(name, input, { key })` is for code-mode scripts, MCP bridges, and tools built from other tools.
-A nested call is a task of its own, owned by its caller: it runs the runtime's hooks (`call.caller` tells them who
-called), keeps its own replay policy, and is journaled like the model's calls (`TaskRecord.callerTaskId`). It
-resolves with the tool's result, or rejects with `ToolExecutionError`, `UnknownOutcomeError`, or `ToolBlockedError`.
-
-Each nested call has a key: its position among the caller's nested calls, unless you pass one. When the caller runs
-again after a crash (a replay-safe caller is replayed; a recovered turn may call it again), a nested call with the
-same key, tool, and input gets its journaled outcome back: a finished `deploy` is not repeated, and an interrupted
-unsafe one is refused once as `outcome_unknown`. Nested calls are never replayed on their own. Calls still running
-when the caller returns are aborted.
-
-`callers` says who may call a tool: `"model"`, `"tools"`, or `"both"` (the default). A `"tools"` tool is left out of
-the model's tool list.
-
-### Task graph
-
-`fx.taskGraph()` returns the running work of every agent as one graph: turns, model and tool calls, nested calls
-under their callers, and a subagent's turn under the tool call that started it. Each node has an `owner`, and owners
-come before what they own. `queued` lists the requests waiting for their agent. It is a snapshot of what is
-committed; re-read it on events to keep a task panel current.
-
-### Forks
-
-```ts
-const first = await agent.submit("Plan the migration")
-await first.result()
-// …later, try a different direction from that point:
-const alternative = await agent.fork("engineer-alt", { after: first.id, model: "anthropic/claude-opus-4.5" })
-```
-
-`fork()` starts a new agent from this one's conversation. By default it starts from the latest checkpoint; `after`
-picks the checkpoint written when that request completed, and `checkpoint` picks a sequence number. The fork keeps
-the runtime, model and working directory unless you override them, and the source agent is not touched. Forks
-start at turn boundaries, because libfx only checkpoints between turns.
-
-### Reset, handoff and compaction
-
-```ts
-await agent.reset()                                        // new context: the model no longer sees the conversation
-await agent.reset({ summary: "We are migrating to v2." })  // a handoff: the model sees this instead
-const summary = await (await agent.compact()).result()     // the model summarizes; the summary replaces the context
-
-const fx = await DurableFx.open({
-  storage: sqlite("./fx.db"),
-  runtimes: { coding: { tools, compaction: { maxContextTokens: 150_000 } } } // or compact automatically
-})
-```
-
-The conversation is never deleted: it stays in the journal and in older checkpoints, so `fork({ after })` can still
-start from it. A summary travels in the agent's instructions (after the runtime's own), where the model sees it on
-every request until the next reset replaces it; libfx doesn't store instructions in its checkpoints, so nothing is
-rewritten.
-
-Resets and compactions are queued like requests and are turns of their own: they wait for the work already queued,
-appear in `submissions()` with their `kind`, and record `context.reset`. A compaction's summary is one model request,
-counted in `usage()`. It sees the agent's tools, but can't run them. If the process dies during the summary, the
-recovered turn summarizes again. Automatic compaction runs after the turn whose last model request reached
-`maxContextTokens`, before anything else queued. Steering sent during a reset or compaction becomes a new request.
+A subagent is a tool that hands a task to a child agent and returns its answer. The child is an ordinary agent named
+after the parent and the call (`fx.attach(childId)` shows its events), and it reports what it says as the call's
+progress. When a crash cuts the call off, libfx runs it again under the same id, and it attaches to **the same child
+and the same request**. Cancelling the parent's turn cancels the child's request.
 
 ### Documents
-
-Documents are your app's own state: a todo list, a plan, settings. They are typed JSON stored next to the journal.
-A tool's writes commit **in the same transaction as its result**. A call that fails or is cut off by a crash writes
-nothing, and a replayed call writes once.
 
 ```ts
 import { defineDocument } from "fx-durable"
 
-const Todos = defineDocument<{ items: string[] }>({
-  kind: "app.todos", // the stored name; keep it stable
-  version: 1,
-  scope: "agent", // one per agent; "global" is one for the whole runtime
-  initial: () => ({ items: [] })
-})
+const Todos = defineDocument<{ items: string[] }>({ kind: "app.todos", version: 1, scope: "agent", initial: () => ({ items: [] }) })
 
 const addTodo = defineDurableTool({
   name: "add_todo",
   replay: "safe",
   inputSchema: Schema.Struct({ item: Schema.String }),
   execute: async ({ item }, { documents }) => {
-    await documents.update(Todos, (todos) => void todos.items.push(item)) // edit the draft, or return a new value
+    await documents.update(Todos, (todos) => void todos.items.push(item))
     return `added ${item}`
   }
 })
 
-await agent.document(Todos)                                  // { items: [...] }; the initial value if never written
-await agent.updateDocument(Todos, (todos) => ({ items: [] }))
+await agent.document(Todos)
+await agent.updateDocument(Todos, () => ({ items: [] }))
 for await (const todos of agent.watchDocument(Todos)) render(todos)
-await fx.document(Settings)                                  // global documents live on `fx`
 ```
 
-- **Reads inside a tool:** `documents.get()` returns the committed value with the call's own changes applied.
-- **Updates run twice:** when the tool makes them, and again at commit on the value current then. So parallel calls
-  that each add an item all keep their item. Keep updates pure and synchronous. An update that throws at commit
-  fails the call.
-- **Events:** each write is recorded as a `document.updated` event, carrying the tool call that made it.
-
-**Changing a document's shape:** raise `version` and add `migrate(value, fromVersion)`. Values written by an older
-version are migrated when read and stored in the new shape at the next write. A value stored by a newer version than
-the code knows is refused.
-
-**History and forks:** `history: "rewindable"` keeps every value of an agent document, so you can read it as of a
-checkpoint: `agent.document(Notes, { checkpoint: 3 })`. `fork` picks what a fork starts with:
-- `"copy"` (default): the current value;
-- `"initial"`: the initial value;
-- `"asOf"` (rewindable only): the value at the checkpoint the fork starts from, which matches its conversation.
+Documents are typed JSON stored with fx-durable's records, one per agent (`scope: "agent"`) or one for the whole
+runtime (`scope: "global"`, through `fx.document()`). A tool's writes commit **in the same transaction as its
+result**: a call that fails or is cut off by a crash writes nothing, and a call that runs again writes once. Updates
+run again at commit on the value current then, so parallel calls compose; keep them pure and synchronous. To change a
+document's shape, raise `version` and add `migrate(value, fromVersion)`. A fork gets a copy of each agent document, or
+its initial value with `fork: "initial"`.
 
 ### Extensions
-
-An extension bundles tools, instructions and hooks under a name. A runtime lists the extensions its agents get by
-default, and each agent can choose its own.
 
 ```ts
 import { defineExtension } from "fx-durable"
@@ -387,7 +229,7 @@ import { defineExtension } from "fx-durable"
 const todo = defineExtension({
   name: "todo",
   tools: [addTodo],
-  // Text, or a function rendered before each turn; here the model sees the current list.
+  // Text, or a function rendered before each request: here the model sees the current list.
   instructions: async ({ document }) => {
     const { items } = await document(Todos)
     return items.length ? `Your todo list:\n${items.map((i) => `- ${i}`).join("\n")}` : undefined
@@ -396,232 +238,138 @@ const todo = defineExtension({
 })
 
 const fx = await DurableFx.open({ storage, runtimes: { coding: { tools: [readFile], extensions: [todo] } } })
-
-await agent.setExtensions([todo, "web"])        // this agent's choice, in order; null goes back to the runtime's
-await agent.extensions()                        // ["todo", "web"]: what its next turn runs with
-await fx.installExtension(defineExtension({ name: "todo", tools: [addTodoV2] })) // reload: replaces "todo" by name
-await fx.uninstallExtension("todo")             // runtimes that list a "todo" fall back to theirs
+await agent.setExtensions([todo, "web"])      // this agent's choice, in order; null goes back to the runtime's
+await fx.installExtension(defineExtension({ name: "todo", tools: [addTodoV2] })) // a reload: replaces "todo"
 ```
 
-- **When changes apply:** an agent's tools, instructions and hooks are its runtime's, followed by those of its
-  extensions in order. A change applies from the agent's next turn. A call already running finishes with the code it
-  started with.
-- **What is stored:** only the agent's choice of names. It is kept with the agent and copied to its forks. A chosen
-  extension that isn't installed is skipped until it is.
-- **Instructions:** text that changes rebuilds the agent's libfx session, which also restarts the provider's prompt
-  cache, so keep it stable when you can.
-- **Hooks:** they run in order. Each `beforeTool` sees the input the previous one settled on, and the first `block`
-  wins. Each `afterTool` can replace the result.
-- **Configuration errors:** two tools with the same name, or instructions that throw, park the turn with the agent in
-  `configuration_error`. Nothing is lost. Fix the extensions, then call `fx.resume()`.
+An agent's tools, instructions, and hooks are its runtime's, then those of its extensions in order. A reload takes
+effect at once for the calls that start after it. When an agent's set of tools changes, its next request (once none of
+its requests is running) continues the conversation in a new session. Only the agent's choice of names is stored;
+forks copy it. Two extensions bringing a tool of the same name make `submit()` reject until that is fixed.
 
 ### Hooks
 
 ```ts
-const fx = await DurableFx.open({
-  storage: sqlite("./fx.db"),
-  runtimes: {
-    coding: {
-      tools: [readFile, editFile, bash],
-      hooks: {
-        beforeTool: async (call, { signal }) =>
-          call.name === "bash" && !(await askUser(call.input, signal)) ? { block: "The user said no." } : undefined,
-        afterTool: (call, output) => redactSecrets(output)
-      }
+runtimes: {
+  coding: {
+    tools: [readFile, editFile, bash],
+    hooks: {
+      beforeTool: async (call, { signal }) => (call.name === "bash" && !(await askUser(call.input, signal)) ? { block: "The user said no." } : undefined),
+      afterTool: (call, output) => redactSecrets(output)
     }
   }
-})
+}
 ```
 
 `beforeTool` runs before a call's intent is journaled. It can block the call (the model receives the message as the
-tool's error, and `tool.blocked` is recorded) or replace its input. Until it allows the call, nothing has started:
-a crash during a slow decision, such as a permission prompt, leaves no `outcome_unknown` behind, and the recovered
-turn asks again. `afterTool` can replace a result before it is journaled. Replays of interrupted calls and calls
-answered from the journal skip both hooks.
-
-### Progress
-
-Tools can report output while they run with `context.progress(chunk)`, and fx-durable records a model's partial text
-as it streams. Both are kept in the running task's `metadata.progress`, updated at most every 100 ms, so a viewer
-that attaches in the middle of a call can read them from `agent.currentTurn()`. Progress is not history: it is not
-an event, and the task's result replaces it.
+tool's error) or replace its input. Until it allows the call, nothing has started: a crash during a slow decision, such
+as a permission prompt, leaves nothing behind, and the call asks again when libfx runs it again. `afterTool` can
+replace a result before it is journaled. Calls answered from the journal skip both.
 
 ### Coding tools
-
-`fx-durable/tools` has file and shell tools for coding agents, with replay policies already chosen:
 
 ```ts
 import { createCodingTools } from "fx-durable/tools"
 
 const tools = createCodingTools() // works in the agent's cwd
-const fx = await DurableFx.open({
-  storage: sqlite("./fx.db"),
-  runtimes: { coding: { tools: tools.all }, explorer: { tools: tools.readOnly } }
-})
+const fx = await DurableFx.open({ storage: sqlite("./fx.db"), runtimes: { coding: { tools: tools.all }, explorer: { tools: tools.readOnly } } })
 await fx.agent("engineer", { runtime: "coding", model: "anthropic/claude-sonnet-4.5", cwd: "/path/to/repo" })
 ```
 
 | Tool | Replay | After a crash |
 |------|--------|---------------|
-| `read_file`, `list_files`, `glob`, `grep` | safe, `reuse: false` | read again, never a stale answer |
-| `write_file` | safe | writing the same content twice is harmless |
-| `edit_file` | safe | an edit that is already applied reports `alreadyApplied` |
-| `bash` | unsafe | `outcome_unknown`; never run again on its own |
+| `read_file`, `list_files`, `glob`, `grep` | safe | read again |
+| `write_file` | safe, `writes` | writing the same content twice is harmless |
+| `edit_file` | safe, `writes` | an edit that is already applied reports `alreadyApplied` |
+| `bash` | unsafe, `writes` | `outcome_unknown`; never run again on its own |
 
-`bash` streams its output through `context.progress` and runs without environment variables whose names look like
-credentials (`env` overrides that). Paths outside the workspace are refused, which keeps a model on track but is not a
-sandbox. `workspace` picks a directory other than the agent's `cwd`, as a string or per call.
+`bash` streams its output through `context.progress` (kept in the call's journal entry while it runs) and runs without
+environment variables whose names look like credentials. Paths outside the workspace are refused, which keeps a model
+on track but is not a sandbox.
 
 ### Usage and cost
 
 ```ts
 const usage = await agent.usage({ prices: { "anthropic/claude-sonnet-4.5": { input: 3, output: 15, cacheRead: 0.3 } } })
-usage.total // { requests, failedRequests, inputTokens, outputTokens, cacheReadTokens, ..., costUsd }
-usage.byModel.get("anthropic/claude-sonnet-4.5")
+usage.total // { turns, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens, costUsd }
 await fx.usage() // every agent
 ```
 
-Totals are folded from the journaled `model.completed` events, so nothing extra is stored and any price table can be
-applied later. Prices are USD per million tokens; cache prices default to the input price. `costUsd` is `null` when
-a model that made requests has no price. Failed and interrupted requests are counted, but their tokens are unknown.
-A fork counts only its own requests.
+Totals add up the usage libfx reports for each finished turn, so any price table can be applied later. Prices are USD
+per million tokens; cache prices default to the input price.
 
-### When storage fails
+### Where things are stored
 
-A storage error closes fx-durable: the in-memory view may no longer match what is stored, so it stops instead of
-carrying on. The call that hit the error rejects with the `StorageError`, calls that were waiting or come later
-reject with `DurableFxFailedError`, and `fx.closed` settles:
+fx-durable keeps its own records (agents, requests, the tool-call journal, documents) in `storage`: `sqlite(path)`,
+`openMemoryStorage()`, or your own `Storage`. libfx keeps the conversations in session stores. The libfx agents that
+share a store share its work, so fx-durable keeps one store per set of tools: by default a directory next to the
+database (`<db>.sessions/<store>`), or memory. Pass `durability: (store) => …` to put them elsewhere, such as a
+Workflow World through libfx's `world()`. A single durability, such as `vercel()`, holds the sessions of one tool set.
 
-```ts
-fx.closed.then((end) => {
-  if (end.reason === "failed") restartLater(end.error) // a new open() recovers from what was committed
-})
-```
-
-Errors in your own code stay local: a throwing tool gives the model an error result, and a throwing hook blocks or
-skips that call.
+A storage error closes fx-durable, since the in-memory view may no longer match what is stored: the call that hit it
+rejects with the `StorageError`, later calls reject with `DurableFxFailedError`, and `fx.closed` settles. Opening again
+continues from what was committed.
 
 ## Guarantees
 
 The [crash suite](tests/crash/crash-matrix.test.ts) checks each of these by killing real processes with SIGKILL.
 
-- **Intent is saved before the effect.** Every tool and model call is saved as `running`, then executed, then its
-  result is saved.
-- **Unknown stays unknown.** If an unsafe tool started and no result was saved, it becomes `outcome_unknown` in both
-  the task table and the event log.
-- **Unsafe calls aren't replayed blindly.** The recovered agent is told the outcome is unknown and asked to check the
-  current state. If the model repeats the same call anyway, the first repeat is refused and the second runs normally.
-- **Finished work isn't redone.** A recovered turn that repeats a completed call gets the saved result back, and the
-  tool doesn't run again.
-- **Identity and idempotency live in the database.** `fx.agent("engineer")` is the same agent after every restart.
-  `UNIQUE(agent_id, request_id)` dedupes submissions, and a partial unique index allows one active turn per agent.
-- **Recovery can itself crash.** Every recovery step is a saved transition, so the next start picks up where it left
-  off. A turn that keeps crashing moves to `needs_input` instead of retrying forever.
+- **Intent is saved before the effect.** A tool call is journaled as running, then executed, then its result is
+  journaled.
+- **Unknown stays unknown.** An unsafe call that started and has no recorded result becomes `outcome_unknown`, and the
+  model is told it may have partly run.
+- **Completed work isn't redone.** A completed call is answered from the journal, nested calls included.
+- **A tool's document writes happen exactly when its result does.**
+- **Requests are idempotent.** The same `requestId` is the same request, across processes.
+- **Agents are stable.** `fx.agent("engineer")` is the same agent, in the same conversation, after every restart.
+
+libfx `0.0.13-dev.1432` starts a call to a tool that may run twice before storing it. A crash in that instant loses
+the call, and the model calls again with a new id; fx-durable matches such a call to the journal entry of the lost one
+(same request, tool, and input), so its nested calls and idempotency key carry over. libfx's main branch stores those
+calls first; the matching becomes unnecessary once that ships.
 
 ## How it works
 
 ```text
-            IMPURE / ASYNC
-
-                 libfx            agent loop, model calls, tools
-                   │
-                Effect            supervisor, turn attempts, tool executor,
-                   │              cancellation, resource scopes, live fan-out
-               Database           run(journal => …) · read(storage => …) · executors(…)
-                   │
-       ── durability boundary ──
-                   │
-                Journal           every durable transition, its event, checkpoints,
-                   │              turn and recovery bookkeeping
-                Storage           synchronous transactions
-                   │
-                SQLite
-
-             SYNC / DURABLE
+               libfx              durable sessions: turns, steps, model calls,
+                 │                queue, leases, event streams
+               Effect             request follow-up, tool executor, session stores
+                 │
+              Database            run(journal => …) · read(storage => …)
+                 │
+     ── durability boundary ──
+                 │
+              Journal             every durable transition of fx-durable's records
+                 │
+              Storage             synchronous transactions (SQLite in WAL mode)
 ```
 
-The central invariant: **all durable state transitions are synchronous and transactional; no asynchronous operation
-may occur inside a Journal transaction.** And the rule that keeps it honest: **all durable writes are named domain
-transitions; durable reads may use a read-only view.**
+**libfx owns the conversation.** Each fx-durable agent points at a libfx session. A request is recorded, then prompted
+into that session under a `messageId`; this process follows the turn to record its answer and outcome. After a crash,
+fx-durable prompts every unfinished request again under the same `messageId`, and libfx continues the turn from its
+last step (or reports how it already ended).
 
-**The durable core is plain synchronous code.** `Storage` is a synchronous interface; the built-in implementation
-uses Node's `node:sqlite` in WAL mode with `synchronous=FULL`. A transaction is a function,
-`storage.transaction(() => { … })`. Its body must be synchronous (a Promise is rejected), so nothing can interleave
-with it, and nested transactions join the outer one. The `Journal` sits on top and holds every durable transition
-the system can make: validated state changes, the event that describes each one, checkpoints, and turn and recovery
-bookkeeping. Open `src/durable/journal.ts` to see all of them. The Journal holds its storage privately; reads go
-through `journal.reader`, a separate object with no write methods. Executor liveness (heartbeats, which process owns
-a turn) is process metadata rather than domain state, so it lives in a small `ExecutorRegistry` beside the Journal.
+**fx-durable owns the tool calls.** Every tool is wrapped: the wrapper journals the call (keyed by session, libfx's
+`executionId`, and the nested key) before it runs, and its result after. When libfx runs a call again, the journal
+decides what that means. Unsafe tools are declared to libfx as not idempotent, so libfx never runs them twice; when
+a turn ends, any of its calls still marked running are recorded as `outcome_unknown`.
 
-**Effect runs execution.** The supervisor, turn attempts, tool execution, cancellation, resource scopes and live
-event fan-out are Effect code. They reach durable state only through the `Database` service, which keeps storage
-errors typed and turns programmer errors (such as an invalid state transition) into defects. A lint rule forbids
-runtime code from importing the journal or storage directly. libfx's transport callback, which is plain Promise
-code, journals model calls through a narrow `ModelJournal` interface instead of bridging into Effect.
-
-**Turns and checkpoints.** libfx can only take a checkpoint while it's idle. So fx-durable writes the checkpoint in
-the same transaction that marks the turn complete, which means a checkpoint never exists for an unfinished turn.
-When a process dies mid-turn, recovery:
-
-1. finds turns whose process is gone, by pid on the same host or heartbeat timeout elsewhere,
-2. sorts the unfinished calls by their saved replay policy (replay, retry with the same key, or `outcome_unknown`),
-3. restores the checkpoint from before the turn into a fresh libfx agent, and
-4. re-prompts with the original request, every saved call and its outcome, and a warning for each unknown outcome.
+**The durable core is plain synchronous code.** `Storage` is a synchronous interface with a transaction function
+whose body must be synchronous, and the `Journal` on top holds every durable transition as a named method. Runtime
+code reaches it only through the `Database` service, which a lint rule enforces.
 
 ### Custom storage
 
-`DurableFx.open({ storage })` accepts any object implementing `Storage`, and fx-durable closes it when it closes.
-The implementation must keep the durability contract documented on the interface:
-- transactions are atomic,
-- nested transactions join the outer one,
-- an exception rolls back everything,
-- async bodies are rejected,
-- reads see the transaction's own writes,
-- `afterCommit` runs only after the outermost commit,
-- committed writes survive a crash,
-- and the uniqueness and sequencing constraints hold.
-
-`openMemoryStorage()` keeps everything in process memory. It passes the contract except durability, so use it for
-tests and short-lived agents, or as a reference for your own backend.
-
-Run the conformance suite against your backend:
+`DurableFx.open({ storage })` accepts any object implementing `Storage`. It must keep the durability contract
+documented on the interface (atomic and nesting transactions, rollback on exceptions, no async bodies, reads that see
+their own writes, `afterCommit` after the outermost commit, durable commits, and the uniqueness constraints). Check it
+with the conformance suite:
 
 ```ts
 import { storageContract } from "fx-durable/testing"
 
-for (const check of storageContract) {
-  test(check.name, () => check.run(openMyStorage()))
-}
+for (const check of storageContract) test(check.name, () => check.run(openMyStorage()))
 ```
-
-## CLI
-
-`fxd` reads and controls the same database. It doesn't run agents itself.
-
-```text
-$ fxd agents --db fx.db
-NAME      STATE    CURRENT TASK
-engineer  running  deploy
-
-$ fxd trace engineer
-TURN #1 turn_… completed attempts: 2
-├─ model                    0.09s 100→29 tok
-├─ bash                     0.24s interrupted
-├─ bash                     0.31s replay
-└─ deploy                   0.30s attempt 2
-```
-
-| Command | What it does |
-|---------|--------------|
-| `fxd agents` | List agents and their current task |
-| `fxd inspect <agent>` | Show state, current turn and its task journal |
-| `fxd events <agent> [--after N] [--follow]` | Print the event log from a cursor |
-| `fxd trace <agent> [--turn ID]` | Show the execution trace of a turn |
-| `fxd recover` | Classify work left by dead processes without running anything |
-| `fxd cancel <submission-id>` | Cancel a queued submission, or request cancellation of a running one (honored at its next model or tool call) |
-| `fxd demo [--reset] [--crash-at POINT[:NAME]]` | Run the demo |
-
-All commands take `--db PATH` (default `$FXD_DB` or `./fx.db`).
 
 ## Testing
 
@@ -629,36 +377,17 @@ All commands take `--db PATH` (default `$FXD_DB` or `./fx.db`).
 pnpm test
 ```
 
-It runs four kinds of tests:
-- **Journal tests** (`tests/journal/`): plain synchronous tests of every state transition, rollback, checkpoint
-  ordering, `outcome_unknown` and recovery. They need no Effect runtime and run in about a second.
-- **The storage contract** (`tests/storage/`): the conformance suite any `Storage` backend must pass.
-- **Runtime tests:** concurrency, cancellation, reconnect, and use from code that doesn't use Effect.
-- **The crash suite** (`tests/crash/`), described below.
+- **Journal and storage** (`tests/journal/`, `tests/storage/`): every transition, and the storage contract against
+  SQLite and memory.
+- **libfx assumptions** (`tests/libfx/`): what fx-durable relies on in libfx, checked against libfx alone.
+- **Agents, documents, extensions, nested calls, subagents, usage, coding tools.**
+- **The crash suite** (`tests/crash/`): it runs a real app process, kills it at a named crash point, runs it again,
+  and checks a side-effect ledger and the records: the unsafe effect ran at most once, one request per `requestId`,
+  nothing left running, unknown outcomes recorded as unknown.
 
-The crash suite starts a real app process, kills it at a named crash point, restarts it, and checks the database and
-a side-effect ledger. It covers model, tool, checkpoint, submission and recovery boundaries. After each case it
-checks that:
-
-- the unsafe effect ran at most once,
-- there is one submission per `requestId`,
-- no task is left running,
-- every unknown outcome has its event,
-- there is one checkpoint per completed turn, and
-- event sequences have no gaps.
-
-### Against the real model
-
-`pnpm test:live` runs the crash scenarios against the real AI Gateway, the real libfx kernel and `kill -9`:
-- an unsafe deploy that happens just before the process dies,
-- a safe tool killed mid-run,
-- and conversation memory across a restart.
-
-It needs `AI_GATEWAY_API_KEY`, and `FXD_TEST_MODEL` picks the model. It asserts what fx-durable guarantees, such as
-`outcome_unknown` and no automatic replay. What the model chooses to do next is logged, not asserted. Without a key,
-the suite is skipped.
-
-You can inject crashes into your own app the same way:
+`scriptedModel(script)` from `fx-durable/testing` answers libfx's model requests from a function, so the real libfx
+runs offline. Scripts that should survive a crash decide from `request.allToolResults`: when libfx continues a turn, it
+adds user messages of its own. You can inject crashes into your own app the same way the suite does:
 
 ```bash
 FXD_CRASH_AT=tool.after-execute FXD_CRASH_NAME=deploy node app.js
@@ -668,75 +397,35 @@ FXD_CRASH_AT=tool.after-execute FXD_CRASH_NAME=deploy node app.js
 
 ```
 fx-durable/
-├── examples/
-│   ├── crash-recovery/      # crash during a safe tool, replay on restart
-│   ├── hello-durable/       # smallest durable agent; history survives restarts
-│   ├── reconnect/           # resume an event stream from a saved cursor
-│   ├── unsafe-tool/         # interrupted deploy becomes outcome_unknown
-│   ├── web-ui/              # Claude Code-style coding agent: AI SDK harness + AI Elements
-│   └── model.ts
+├── examples/                # runnable examples (offline with a scripted model)
 ├── src/
-│   ├── cli/                 # fxd and the demo
-│   ├── domain/              # schemas, event taxonomy, state machines, errors
-│   ├── durable/             # Journal, ExecutorRegistry, Storage, Clock, SQLite, memory (plain sync code)
-│   ├── runtime/             # Database boundary, supervisor, recovery, tool executor (Effect)
-│   ├── testing/             # scripted model, storage contract, manual clock
-│   ├── tools/               # defineDurableTool, replay policies, coding tools (fx-durable/tools)
-│   ├── types/               # libfx type declarations
+│   ├── domain/              # schemas, documents, usage, errors
+│   ├── durable/             # Journal, Storage, SQLite, memory (plain synchronous code)
+│   ├── runtime/             # Database boundary, agents and sessions, tool executor, registries (Effect)
+│   ├── testing/             # scripted model, storage contract
+│   ├── tools/               # defineDurableTool, hooks, subagents, extensions, coding tools
 │   ├── effect.ts            # Effect-native entry
 │   └── index.ts             # main entry, no Effect required
 ├── tests/
-│   ├── boundary/            # using fx-durable without Effect
-│   ├── context/             # reset, handoff, compaction
+│   ├── agents/              # requests, sessions, reset, forks, events, steering, cancelling
 │   ├── crash/               # SIGKILL crash matrix
-│   ├── documents/           # typed documents
-│   ├── extensions/          # extensions: selection, reload, instructions, hooks
+│   ├── documents/
+│   ├── extensions/
 │   ├── fixtures/            # app process the crash suite kills
-│   ├── failure/             # storage errors close the runtime; reopening recovers
-│   ├── idempotency/
-│   ├── journal/             # exhaustive synchronous tests of durable state
-│   ├── libfx/               # what fx-durable assumes about libfx checkpoints
-│   ├── nested/              # tools calling tools, task graph, abandoned calls
-│   ├── live/                # crash scenarios against the real AI Gateway (opt-in)
-│   ├── reconnect/
-│   ├── recovery/
-│   ├── state-machine/
+│   ├── journal/
+│   ├── libfx/               # libfx behavior fx-durable relies on
+│   ├── nested/              # tools calling tools, progress, subagents
 │   ├── storage/             # storage contract, SQLite and memory
 │   ├── tools/               # coding tools
-│   ├── usage/               # token and cost totals
-│   └── helpers.ts
-├── tools/
-│   └── oxlint/              # anti-slop lint rules
-├── LICENSE
-├── package.json
-├── tsconfig.check.json
-├── tsconfig.json
-└── vitest.config.ts
+│   └── usage/
+└── tools/oxlint/            # lint rules
 ```
-
-## Documentation
-
-| Resource | Description |
-|----------|-------------|
-| [src/index.ts](src/index.ts) | Public API exports |
-| [src/durable/journal.ts](src/durable/journal.ts) | Every durable state transition |
-| [src/durable/storage.ts](src/durable/storage.ts) | Storage interface and its durability contract |
-| [src/runtime/recovery.ts](src/runtime/recovery.ts) | Recovery procedure |
-| [src/runtime/tool-executor.ts](src/runtime/tool-executor.ts) | Write-ahead tool execution and replay |
-| [src/durable/sqlite/migrations/001_initial.ts](src/durable/sqlite/migrations/001_initial.ts) | Database schema and constraints |
-| [tests/crash/crash-matrix.test.ts](tests/crash/crash-matrix.test.ts) | Crash matrix |
-| [examples/](examples) | Runnable examples (`npx tsx examples/<name>/index.ts` after `pnpm build`) |
-| [examples/web-ui/](examples/web-ui) | A Claude Code-style coding agent UI: fx-durable as an AI SDK harness adapter, with AI Elements |
 
 ## Contributing
 
-Run `pnpm typecheck && pnpm lint && pnpm test` before opening a change.
-- New durable behavior belongs in the Journal, with tests in `tests/journal/` that need no Effect runtime.
-- Changes to recovery or tool execution need a case in the crash suite, and the suite should pass on repeated runs
-  before you build anything on top of it.
-
-Out of scope for v1: Postgres or Redis, distributed workers, agent forks, durable subagents, approval workflows, and
-Effect Workflow or Cluster.
+Run `pnpm typecheck && pnpm lint && pnpm test` before opening a change. New durable behavior belongs in the Journal,
+with tests in `tests/journal/`; changes to tool execution or recovery need a case in the crash suite, and the suite
+should pass on repeated runs.
 
 ## License
 

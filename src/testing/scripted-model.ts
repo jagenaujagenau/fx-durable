@@ -1,12 +1,16 @@
+import { randomUUID } from "node:crypto"
 import { Schema } from "effect"
 import { isJsonString, jsonText, type JsonObject } from "../domain/json.js"
-import type { Transport } from "../domain/transport.js"
+import type { FxFetch } from "libfx"
 
 /**
  * A scripted language model that speaks the AI Gateway streaming protocol
  * libfx uses. Passed as `DurableFx.open({ fetch })`, it lets the real libfx
- * kernel (agent loop, tool calls, checkpoints) run deterministically offline:
- * for the crash suite, examples, and `fx-durable demo` without an API key.
+ * kernel (agent loop, tool calls, durable sessions) run deterministically
+ * offline: for the crash suite and examples, without an API key.
+ *
+ * Tool call ids are unique across processes, as a provider's are: libfx
+ * identifies a call by its id when it continues a turn after a crash.
  */
 
 export interface ScriptedToolResult {
@@ -20,6 +24,12 @@ export interface ScriptedRequest {
   readonly userText: string
   /** Tool results since that user message, in order. */
   readonly toolResults: ReadonlyArray<ScriptedToolResult>
+  /**
+   * Every tool result in the conversation, in order. When libfx continues a
+   * turn after a crash it adds its own user messages, so scripts that should
+   * survive a crash decide from these.
+   */
+  readonly allToolResults: ReadonlyArray<ScriptedToolResult>
   /** Number of model steps already taken since that user message. */
   readonly step: number
   readonly tools: ReadonlyArray<string>
@@ -79,7 +89,6 @@ const usage = ({ input, output, cacheRead = 0, cacheWrite = 0, reasoning = 0 }: 
   outputTokens: { total: output, text: output - reasoning, reasoning }
 })
 
-let callCounter = 0
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -95,21 +104,25 @@ const parseRequest = (body: string, model: string): ScriptedRequest => {
   const userText =
     lastUser >= 0 ? partsOf(messages[lastUser]).map((c) => (c.type === "text" ? (c.text ?? "") : "")).join("\n") : ""
   const after = messages.slice(lastUser + 1)
-  const toolResults: Array<ScriptedToolResult> = []
-  for (const m of after) {
-    if (m.role !== "tool") continue
-    for (const c of partsOf(m)) {
-      if (c.type !== "tool-result" || c.toolName === undefined) continue
-      toolResults.push({
-        toolName: c.toolName,
-        output: c.output ? jsonText(c.output.value) : "",
-        isError: c.output !== undefined && isErrorOutput(c.output.type)
-      })
+  const resultsIn = (list: ReadonlyArray<GatewayMessage>) => {
+    const results: Array<ScriptedToolResult> = []
+    for (const m of list) {
+      if (m.role !== "tool") continue
+      for (const c of partsOf(m)) {
+        if (c.type !== "tool-result" || c.toolName === undefined) continue
+        results.push({
+          toolName: c.toolName,
+          output: c.output ? jsonText(c.output.value) : "",
+          isError: c.output !== undefined && isErrorOutput(c.output.type)
+        })
+      }
     }
+    return results
   }
   return {
     userText,
-    toolResults,
+    toolResults: resultsIn(after),
+    allToolResults: resultsIn(messages),
     step: after.filter((m) => m.role === "assistant").length,
     tools: (parsed.tools ?? []).map((t) => t.name),
     model,
@@ -128,7 +141,7 @@ const encodeParts = (response: ScriptedResponse, step: number) => {
     parts.push({ type: "text-end", id })
   }
   for (const call of response.toolCalls ?? []) {
-    const id = `call_${++callCounter}_${Date.now().toString(36)}`
+    const id = `call_${randomUUID().replaceAll("-", "")}`
     const input = JSON.stringify(call.input)
     parts.push({ type: "tool-input-start", id, toolName: call.name })
     parts.push({ type: "tool-input-delta", id, delta: input })
@@ -150,12 +163,12 @@ const encodeParts = (response: ScriptedResponse, step: number) => {
 }
 
 /** Build a `fetch` implementation that answers model requests from `script`. */
-export const scriptedModel = (script: Script, options: ScriptedModelOptions = {}): Transport => {
-  const fake: Transport = async (input, init) => {
-    const url = input instanceof Request ? input.url : input instanceof URL ? input.href : input
-    if (!new URL(url).pathname.endsWith("/ai/language-model")) {
-      return new Response(JSON.stringify({ error: "not available offline" }), { status: 404 })
-    }
+export const scriptedModel = (script: Script, options: ScriptedModelOptions = {}): FxFetch => {
+  const fake: FxFetch = async (input, init) => {
+    const path = new URL(input).pathname
+    // The model catalog: empty, so libfx assumes nothing about the scripted model.
+    if (path.endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { headers: { "content-type": "application/json" } })
+    if (!path.endsWith("/ai/language-model")) return new Response(JSON.stringify({ error: "not available offline" }), { status: 404 })
     const headers = new Headers(init?.headers)
     const model = headers.get("ai-language-model-id") ?? "scripted"
     const raw = await new Response(init?.body ?? null).text()

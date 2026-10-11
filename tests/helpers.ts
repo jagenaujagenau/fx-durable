@@ -1,23 +1,19 @@
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { Effect, Layer, ManagedRuntime } from "effect"
 import { DurableFx, sqlite, type DurableFxOptions } from "../src/index.js"
 import { scriptedModel, type Script } from "../src/testing/index.js"
-import { EventLog, layer as eventLogLayer } from "../src/runtime/events.js"
-import { IdGenerator } from "../src/runtime/ids.js"
 import { Journal } from "../src/durable/journal.js"
-import { Database, databaseLayer } from "../src/runtime/database.js"
 import { openSqliteStorage } from "../src/durable/sqlite/storage.js"
 
 export const tempDb = (name = "fx.db") => join(mkdtempSync(join(tmpdir(), "fxd-test-")), name)
 
+/** Open fx-durable on a SQLite database (sessions in files beside it) with a scripted model. */
 export const openFx = (db: string, script: Script, options: Partial<DurableFxOptions> = {}) =>
   DurableFx.open({
     storage: sqlite(db),
     fetch: scriptedModel(script),
     crash: "off",
-    idlePollMillis: 100,
     ...options
   })
 
@@ -27,22 +23,7 @@ export const openFx = (db: string, script: Script, options: Partial<DurableFxOpt
  */
 export const openTestJournal = (db: string) => {
   const storage = openSqliteStorage({ path: db })
-  return { journal: new Journal({ storage, nextId: sequentialIds() }), storage }
-}
-
-const sequentialIds = () => {
-  let n = 0
-  return (prefix: string) => `${prefix}_${String(++n).padStart(6, "0")}`
-}
-
-/** Database + EventLog in an Effect runtime, for live-subscription tests. */
-export const eventRuntime = (db: string) => {
-  const layer = eventLogLayer.pipe(Layer.provideMerge(databaseLayer(sqlite(db))), Layer.provideMerge(IdGenerator.layer))
-  const runtime = ManagedRuntime.make(layer)
-  return {
-    runtime,
-    run: <A, E>(effect: Effect.Effect<A, E, Database | EventLog | IdGenerator>) => runtime.runPromise(effect)
-  }
+  return { journal: new Journal({ storage }), storage }
 }
 
 export const deferred = <T = void>() => {

@@ -3,7 +3,11 @@ import { DecodeError } from "./errors.js"
 import type { Json } from "./json.js"
 
 /**
- * Domain schemas for every structure fx-durable owns and persists.
+ * Domain schemas for everything fx-durable persists. libfx keeps each
+ * conversation (its turns, steps, and tool results) in its own session
+ * store; fx-durable keeps what libfx does not know about: which session an
+ * agent is in, the requests made to it, a journal of tool calls keyed by
+ * libfx's `executionId`, and documents.
  *
  * storage → decode → validate/migrate → domain object
  *
@@ -14,88 +18,49 @@ import type { Json } from "./json.js"
 export const PAYLOAD_VERSION = 1
 
 // ---------------------------------------------------------------------------
-// States
+// Values
 // ---------------------------------------------------------------------------
 
-export const AgentState = Schema.Literals([
-  "idle",
-  "running",
-  "failed",
-  "needs_input",
-  "recovering",
-  "configuration_error"
-])
-export type AgentState = typeof AgentState.Type
-
-export const SubmissionState = Schema.Literals([
-  "queued",
-  "running",
-  "completed",
-  "failed",
-  "cancelled",
-  "needs_input"
-])
-export type SubmissionState = typeof SubmissionState.Type
-
-/**
- * What a submission asks for: `input` is a request for the model; `reset`
- * starts a new context (optionally with a summary); `compaction` asks the
- * model to summarize the context, then starts a new one from that summary.
- */
-export const SubmissionKind = Schema.Literals(["input", "reset", "compaction"])
-export type SubmissionKind = typeof SubmissionKind.Type
-
-export const TurnState = Schema.Literals(["running", "completed", "failed", "cancelled", "interrupted"])
-export type TurnState = typeof TurnState.Type
-
-export const TaskType = Schema.Literals(["turn", "model", "tool", "checkpoint"])
-export type TaskType = typeof TaskType.Type
-
-export const TaskState = Schema.Literals([
-  "pending",
-  "running",
-  "completed",
-  "failed",
-  "cancelled",
-  "interrupted",
-  "outcome_unknown"
-])
-export type TaskState = typeof TaskState.Type
-
-export const ReplayPolicyName = Schema.Literals(["safe", "unsafe", "idempotent"])
-export type ReplayPolicyName = typeof ReplayPolicyName.Type
-
-export const UnknownOutcomeReason = Schema.Literals([
-  "process_terminated",
-  "connection_lost",
-  "executor_lost",
-  "cancelled"
-])
-export type UnknownOutcomeReason = typeof UnknownOutcomeReason.Type
-
-// ---------------------------------------------------------------------------
-// Owned JSON payloads used by records
-// ---------------------------------------------------------------------------
-
+/** Token counts libfx reported for a turn. */
 export const TurnUsage = Schema.Struct({
-  inputTokens: Schema.Number,
-  outputTokens: Schema.Number,
+  inputTokens: Schema.optional(Schema.Number),
+  outputTokens: Schema.optional(Schema.Number),
+  cacheReadTokens: Schema.optional(Schema.Number),
+  cacheWriteTokens: Schema.optional(Schema.Number),
   reasoningTokens: Schema.optional(Schema.Number)
 })
 // Type aliases (not interfaces) so these stay assignable to `Json` when persisted.
 export type TurnUsage = typeof TurnUsage.Type
 
 export const SubmissionResult = Schema.Struct({
+  /** The model's final answer: the text after its last tool call. */
   text: Schema.String,
   stopReason: Schema.String,
   usage: Schema.NullOr(TurnUsage)
 })
 export type SubmissionResult = typeof SubmissionResult.Type
 
-/** Content accepted by `agent.submit()`: a string or libfx text blocks. */
+/** Content accepted by `agent.submit()`: a string or text blocks. */
 export const TextBlock = Schema.Struct({ type: Schema.Literal("text"), text: Schema.String })
 export const SubmissionContent = Schema.Union([Schema.String, Schema.Array(TextBlock)])
 export type SubmissionContent = typeof SubmissionContent.Type
+
+export const SubmissionState = Schema.Literals(["running", "completed", "failed", "cancelled"])
+export type SubmissionState = typeof SubmissionState.Type
+
+export const ReplayPolicyName = Schema.Literals(["safe", "unsafe", "idempotent"])
+export type ReplayPolicyName = typeof ReplayPolicyName.Type
+
+/**
+ * A tool call in fx-durable's journal. `running` means its intent was
+ * recorded and it started; after a crash that state is what tells fx-durable
+ * the call may have had effects.
+ */
+export const ToolCallState = Schema.Literals(["running", "completed", "failed", "outcome_unknown"])
+export type ToolCallState = typeof ToolCallState.Type
+
+export const DocumentForkPolicy = Schema.Literals(["copy", "initial"])
+export type DocumentForkPolicy = typeof DocumentForkPolicy.Type
 
 // ---------------------------------------------------------------------------
 // Records (decoded rows)
@@ -106,91 +71,63 @@ export const DurableAgentRecord = Schema.Struct({
   runtimeId: Schema.String,
   model: Schema.String,
   cwd: Schema.NullOr(Schema.String),
-  state: AgentState,
-  stateReason: Schema.NullOr(Schema.String),
+  /** The libfx session the agent's requests go to; null until its first request, and after a reset. */
+  sessionId: Schema.NullOr(Schema.String),
+  /** The session store that holds it (one per tool set; see `Sessions`). */
+  sessionStore: Schema.NullOr(Schema.String),
+  /** A handoff summary the model sees in its instructions, until the next reset. */
+  summary: Schema.NullOr(Schema.String),
+  /** For a fork: the libfx checkpoint its first session starts from. Cleared once that session exists. */
+  startCheckpoint: Schema.NullOr(Schema.Uint8Array),
   createdAt: Schema.Date,
   updatedAt: Schema.Date
 })
 export interface DurableAgentRecord extends Schema.Schema.Type<typeof DurableAgentRecord> {}
 
+/** A request made to an agent: one libfx turn, identified by its `messageId`. */
 export const SubmissionRecord = Schema.Struct({
+  /** The libfx `messageId`: the caller's `requestId`, or one fx-durable chose. */
   id: Schema.String,
   agentId: Schema.String,
   requestId: Schema.NullOr(Schema.String),
-  kind: SubmissionKind,
+  /** "" until libfx accepts a fork's first request and names the session it starts. */
+  sessionId: Schema.String,
+  /** The session store that holds the session. */
+  sessionStore: Schema.String,
+  model: Schema.String,
   content: SubmissionContent,
   state: SubmissionState,
   result: Schema.NullOr(SubmissionResult),
   error: Schema.NullOr(Schema.String),
-  cancelRequested: Schema.Boolean,
   createdAt: Schema.Date,
   updatedAt: Schema.Date
 })
 export interface SubmissionRecord extends Schema.Schema.Type<typeof SubmissionRecord> {}
 
-export const TurnRecord = Schema.Struct({
-  id: Schema.String,
+export const ToolCallRecord = Schema.Struct({
+  sessionId: Schema.String,
+  /** libfx's id for the model's call; nested calls share their top-level call's. */
+  executionId: Schema.String,
+  /** "" for the model's call; for a nested call, the path of keys from it (`"0"`, `"0/deploy"`). */
+  callKey: Schema.String,
   agentId: Schema.String,
-  submissionId: Schema.String,
-  state: TurnState,
-  attempt: Schema.Number,
-  executorId: Schema.NullOr(Schema.String),
-  baseCheckpointSeq: Schema.NullOr(Schema.Number),
-  startedAt: Schema.NullOr(Schema.Date),
-  completedAt: Schema.NullOr(Schema.Date)
-})
-export interface TurnRecord extends Schema.Schema.Type<typeof TurnRecord> {}
-
-export const TaskRecord = Schema.Struct({
-  id: Schema.String,
-  turnId: Schema.String,
-  agentId: Schema.String,
-  /** The task this one replays or retries. */
-  parentTaskId: Schema.NullOr(Schema.String),
-  /** For a nested call: the tool task that made it (`context.executeTool`). */
-  callerTaskId: Schema.NullOr(Schema.String),
-  /** For a nested call: its key among the caller's calls. */
-  callKey: Schema.NullOr(Schema.String),
-  type: TaskType,
-  state: TaskState,
-  name: Schema.NullOr(Schema.String),
-  input: Schema.NullOr(Schema.Json),
-  inputHash: Schema.NullOr(Schema.String),
+  /** The request whose turn made the call, when known. */
+  submissionId: Schema.NullOr(Schema.String),
+  name: Schema.String,
+  input: Schema.Json,
+  replayPolicy: ReplayPolicyName,
+  idempotencyKey: Schema.NullOr(Schema.String),
+  state: ToolCallState,
   output: Schema.NullOr(Schema.Json),
   error: Schema.NullOr(Schema.String),
-  replayPolicy: Schema.NullOr(ReplayPolicyName),
-  idempotencyKey: Schema.NullOr(Schema.String),
-  attempt: Schema.Number,
-  acknowledged: Schema.Boolean,
-  metadata: Schema.NullOr(Schema.Json),
-  startedAt: Schema.NullOr(Schema.Date),
+  /** How many times it started: more than 1 after a crash made libfx run it again. */
+  attempts: Schema.Number,
+  /** Output reported while it runs (`context.progress`), capped. */
+  progress: Schema.NullOr(Schema.String),
+  startedAt: Schema.Date,
   completedAt: Schema.NullOr(Schema.Date)
 })
-export interface TaskRecord extends Schema.Schema.Type<typeof TaskRecord> {}
-
-export const AgentCheckpoint = Schema.Struct({
-  id: Schema.String,
-  agentId: Schema.String,
-  sequence: Schema.Number,
-  /** libfx's checkpoint. Empty: a new context, with no history. */
-  fxCheckpoint: Schema.Uint8Array,
-  /**
-   * The summary of earlier context the model sees in its instructions from
-   * this checkpoint on (a handoff, or a compaction's result). Each checkpoint
-   * carries over the previous one's until a reset replaces it.
-   */
-  summary: Schema.NullOr(Schema.String),
-  runtimeId: Schema.String,
-  model: Schema.String,
-  createdAt: Schema.Date
-})
-export interface AgentCheckpoint extends Schema.Schema.Type<typeof AgentCheckpoint> {}
-
-export const DocumentHistory = Schema.Literals(["latest", "rewindable"])
-export type DocumentHistory = typeof DocumentHistory.Type
-
-export const DocumentForkPolicy = Schema.Literals(["copy", "initial", "asOf"])
-export type DocumentForkPolicy = typeof DocumentForkPolicy.Type
+export interface ToolCallRecord extends Schema.Schema.Type<typeof ToolCallRecord> {}
 
 /** One stored value of a typed document (`defineDocument`). */
 export const DocumentRecord = Schema.Struct({
@@ -202,39 +139,10 @@ export const DocumentRecord = Schema.Struct({
   /** Counts the document's writes, from 1. */
   revision: Schema.Number,
   value: Schema.JsonObject,
-  history: DocumentHistory,
   fork: DocumentForkPolicy,
-  /** The agent's latest checkpoint sequence when this was written (0 before its first). */
-  checkpointSeq: Schema.Number,
   updatedAt: Schema.Date
 })
 export interface DocumentRecord extends Schema.Schema.Type<typeof DocumentRecord> {}
-
-export const DurableEvent = Schema.Struct({
-  id: Schema.String,
-  agentId: Schema.String,
-  submissionId: Schema.NullOr(Schema.String),
-  turnId: Schema.NullOr(Schema.String),
-  taskId: Schema.NullOr(Schema.String),
-  sequence: Schema.Number,
-  type: Schema.String,
-  payload: Schema.JsonObject,
-  createdAt: Schema.Date
-})
-export interface DurableEvent extends Schema.Schema.Type<typeof DurableEvent> {}
-
-// ---------------------------------------------------------------------------
-// Owned payloads
-// ---------------------------------------------------------------------------
-
-export const UnknownOutcome = Schema.Struct({
-  taskId: Schema.String,
-  tool: Schema.String,
-  input: Schema.Json,
-  startedAt: Schema.Date,
-  reason: UnknownOutcomeReason
-})
-export interface UnknownOutcome extends Schema.Schema.Type<typeof UnknownOutcome> {}
 
 // ---------------------------------------------------------------------------
 // Versioned envelope for JSON blobs

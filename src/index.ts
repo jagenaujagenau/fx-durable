@@ -1,21 +1,21 @@
 /**
  * fx-durable — agents should outlive their processes.
  *
- * Effect models execution. SQLite models durability. libfx models the agent.
+ * libfx keeps the conversations durable. fx-durable adds what an agent
+ * runtime needs around them: tool calls with replay policies and exactly-once
+ * results, documents, tools calling tools, subagents, extensions, and usage.
  */
 export { DurableFx, DurableAgent, Submission } from "./runtime/durable-fx.js"
 export type {
   AgentOptions,
   CloseReason,
-  CompactOptions,
-  DocumentReadOptions,
   DurableFxOptions,
   EventsOptions,
+  ForkOptions,
   ResetOptions,
   SubmitOptions,
   UsageOptions
 } from "./runtime/durable-fx.js"
-export type { CompactionOptions } from "./domain/context.js"
 export { defineDocument } from "./domain/documents.js"
 export type {
   AgentDocument,
@@ -26,21 +26,20 @@ export type {
   GlobalDocument,
   GlobalDocumentDefinition
 } from "./domain/documents.js"
-export type { QueuedWork, TaskGraph, TaskGraphNode } from "./domain/task-graph.js"
+export type { TaskGraph, TaskGraphNode } from "./domain/task-graph.js"
 export { usageOf } from "./domain/usage.js"
 export type { ModelPrice, ModelPrices, UsageReport, UsageTotals } from "./domain/usage.js"
 export { defineDurableTool, OutcomeUnknown } from "./tools/define-tool.js"
 export { defineSubagent, subagentId } from "./tools/subagent.js"
+export type { SubagentDefinition } from "./tools/subagent.js"
 export { defineExtension } from "./tools/extension.js"
 export type { Extension, ExtensionDefinition, ExtensionInstructions, InstructionsInput } from "./tools/extension.js"
-export type { SubagentDefinition } from "./tools/subagent.js"
 export type {
   DurableTool,
   DurableToolContext,
   DocumentAccess,
   NestedCallOptions,
   ToolCallers,
-  AbandonedCall,
   JsonToolDefinition,
   SchemaToolDefinition,
   StandardToolDefinition,
@@ -48,42 +47,32 @@ export type {
 } from "./tools/define-tool.js"
 export type { StandardSchemaV1 } from "./tools/standard-schema.js"
 export type { Json, JsonArray, JsonObject } from "./domain/json.js"
-export type { Transport, TransportContext } from "./domain/transport.js"
 export type { ReplayPolicy } from "./tools/replay-policy.js"
 export type { BeforeToolDecision, ToolCall, ToolHookContext, ToolHooks } from "./tools/hooks.js"
-export type { McpClientSpec, RuntimeDefinition } from "./runtime/runtime-registry.js"
-export type { RecoveryReport } from "./runtime/recovery.js"
+export type { RuntimeDefinition } from "./runtime/runtime-registry.js"
 export { CRASH_POINTS, crashPoint } from "./runtime/crash.js"
 export type { CrashPoint, CrashPlan } from "./runtime/crash.js"
-export { EVENT_TYPES } from "./domain/events.js"
-export type { EventType } from "./domain/events.js"
 export * from "./domain/errors.js"
 export type {
-  AgentCheckpoint,
-  AgentState,
   DocumentForkPolicy,
-  DocumentHistory,
   DocumentRecord,
   DurableAgentRecord,
-  DurableEvent,
+  ReplayPolicyName,
   SubmissionContent,
-  SubmissionKind,
   SubmissionRecord,
   SubmissionResult,
   SubmissionState,
-  TaskRecord,
-  TaskState,
-  TaskType,
-  TurnRecord,
-  TurnState,
-  UnknownOutcome
+  ToolCallRecord,
+  ToolCallState,
+  TurnUsage
 } from "./domain/schema.js"
 export { openSqliteStorage, sqlite } from "./durable/sqlite/storage.js"
 export type { SqliteOptions, SqliteStorageConfig } from "./durable/sqlite/storage.js"
 export { openMemoryStorage } from "./durable/memory/storage.js"
 export { Journal } from "./durable/journal.js"
-export { ExecutorRegistry } from "./durable/executor-registry.js"
-export type { AgentConfig, ForkSpec, JournalOptions } from "./durable/journal.js"
+export type { AgentConfig, CommittedChange, ForkSpec, JournalOptions } from "./durable/journal.js"
 export { SystemClock } from "./durable/clock.js"
 export type { Clock } from "./durable/clock.js"
-export type { ExecutorRecord, NewEvent, NewTask, Storage, StorageReader, TaskPatch } from "./durable/storage.js"
+export type { AgentPatch, Storage, StorageReader, SubmissionPatch, ToolCallKey, ToolCallPatch } from "./durable/storage.js"
+// libfx types fx-durable's API uses.
+export type { Durability, FxStreamLine } from "libfx"

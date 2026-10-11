@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest"
 import { z } from "zod"
-import { defineDurableTool, openMemoryStorage, type DurableEvent } from "../../src/index.js"
+import { defineDurableTool, openMemoryStorage, type FxStreamLine } from "../../src/index.js"
 import { isJsonString } from "../../src/domain/json.js"
 import type { ScriptedRequest } from "../../src/testing/index.js"
 import { openFx } from "../helpers.js"
 
-const eventsOf = async (iterable: AsyncIterable<DurableEvent>) => {
-  const out: Array<DurableEvent> = []
-  for await (const event of iterable) out.push(event)
+const collect = async (iterable: AsyncIterable<FxStreamLine>) => {
+  const out: Array<FxStreamLine> = []
+  for await (const line of iterable) out.push(line)
   return out
 }
 
@@ -26,21 +26,24 @@ const add = defineDurableTool({
   execute: (input) => ({ sum: input.a + input.b })
 })
 
-describe("DurableFx on memory storage", () => {
-  it("runs tool-using turns, keeps the conversation, and forks", async () => {
+describe("DurableFx on memory storage (sessions in memory)", () => {
+  it("runs tool-using turns, keeps the conversation, replays its events, and forks", async () => {
     const fx = await openFx("unused", script, { storage: openMemoryStorage(), runtimes: { calc: { tools: [add] } } })
     const agent = await fx.agent("a", { runtime: "calc", model: "test/model" })
 
     expect((await (await agent.submit("add")).result()).text).toBe('sum: {"sum":5}')
     expect((await (await agent.submit("hello")).result()).text).toBe("add | hello")
 
-    const types = (await eventsOf(agent.events({ follow: false }))).map((e) => e.type)
-    expect(types).toContain("tool.completed")
-    expect(types).toContain("checkpoint.created")
-    expect(types.filter((t) => t === "submission.completed")).toHaveLength(2)
+    const lines = await collect(agent.events({ follow: false }))
+    expect(lines.filter((l) => l.type === "turn_end")).toHaveLength(2)
+    expect(lines.find((l) => l.type === "tool_start")).toMatchObject({ name: "add" })
+    // Each line carries a cursor to reconnect from.
+    const cursor = lines.find((l) => l.type === "turn_end")?.cursor ?? 0
+    expect((await collect(agent.events({ after: cursor, follow: false }))).every((l) => (l.cursor ?? 0) > cursor)).toBe(true)
 
     const fork = await agent.fork("b")
     expect((await (await fork.submit("again")).result()).text).toBe("add | hello | again")
+    expect((await (await agent.submit("original")).result()).text).toBe("add | hello | original")
     await fx.close()
   })
 })

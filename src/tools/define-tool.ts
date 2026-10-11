@@ -2,24 +2,27 @@ import { Schema } from "effect"
 import type { Json, JsonObject } from "../domain/json.js"
 import type { DocumentUpdate, DurableDocument } from "../domain/documents.js"
 import { formatIssues, type StandardSchemaV1 } from "./standard-schema.js"
-import { policyName, type ReplayPolicy } from "./replay-policy.js"
+import type { ReplayPolicy } from "./replay-policy.js"
 
 export interface DurableToolContext {
   readonly agentId: string
-  readonly turnId: string
-  readonly taskId: string
+  /** The libfx session the call belongs to. */
+  readonly sessionId: string
+  /** libfx's id for the model's call. It stays the same when the call runs again after a crash. */
+  readonly executionId: string
+  /** The request whose turn made the call, when known. */
+  readonly submissionId: string | null
   /** The agent's working directory (`agent(id, { cwd })`), or null when it has none. */
   readonly cwd: string | null
-  /** Present for idempotent tools: pass it to the downstream system. */
+  /** Present for idempotent tools: pass it to the downstream system. Stable across runs of the call. */
   readonly idempotencyKey: string | null
   /**
-   * Aborted when the call stops early. `signal.reason` is `"cancelled"` when
-   * it was cancelled and `"executor_lost"` when this process is stopping:
-   * then the call may run again after a restart, so leave work it started
-   * elsewhere running. Aborting does not prove an external effect was cancelled.
+   * Aborted when the call stops early: the turn was cancelled, or the nested
+   * call's caller returned. Aborting does not prove an external effect was
+   * cancelled.
    */
   readonly signal: AbortSignal
-  /** True when this execution is an automatic replay after a crash. */
+  /** True when this run repeats a call that started before a crash. */
   readonly replay: boolean
   /**
    * Report output while the tool runs (for example a command's stdout). The
@@ -37,10 +40,10 @@ export interface DurableToolContext {
    * `UnknownOutcomeError`, `ToolBlockedError`).
    *
    * Each nested call has a key: its position among this call's nested calls,
-   * unless you pass one. When this tool runs again after a crash (it is
-   * replay-safe, or the recovered turn retries it), calls with the same key,
-   * tool, and input get their journaled outcome back instead of running
-   * again. Nested calls still running when this tool returns are aborted.
+   * unless you pass one. When this tool runs again after a crash, calls with
+   * the same key, tool, and input get their journaled outcome back instead of
+   * running again. Nested calls still running when this tool returns are
+   * aborted.
    */
   readonly executeTool: (name: string, input: Json, options?: NestedCallOptions) => Promise<Json>
   /** Read and change typed documents (`defineDocument`): the agent's own, and global ones. */
@@ -68,16 +71,6 @@ export interface NestedCallOptions {
   readonly key?: string
 }
 
-/** A call that was interrupted and that nobody will call again. */
-export interface AbandonedCall {
-  readonly agentId: string
-  readonly turnId: string
-  readonly taskId: string
-  readonly input: Json
-  /** The key the interrupted call ran with (idempotent tools). */
-  readonly idempotencyKey: string | null
-}
-
 /** Who may call a tool: the model, other tools (`context.executeTool`), or both. */
 export type ToolCallers = "model" | "tools" | "both"
 
@@ -94,36 +87,16 @@ interface ToolBase {
   readonly description?: string
   readonly replay: ReplayPolicy
   /**
-   * When a recovered turn repeats a call that already completed before the
-   * crash, return the journaled result instead of executing again (default
-   * `true`). Set `false` on replay-safe tools that observe changing state
-   * (reading files, listing, checking status): a stale observation from
-   * before the crash can mislead the model. Only allowed with `replay: "safe"`.
+   * Calls must not overlap others: libfx starts it after every earlier call
+   * of the same model response has finished. For tools that write shared
+   * state, such as files.
    */
-  readonly reuse?: boolean
-  /**
-   * Do not replay an interrupted call during recovery; retry it, with the same
-   * idempotency key, when the recovered turn calls it again. For tools that
-   * wait on other durable work (a subagent's answer, a long job) and must not
-   * block recovery. Only allowed with the idempotent replay policy.
-   */
-  readonly resumeOnCall?: boolean
+  readonly writes?: boolean
   /**
    * Who may call this tool (default `"both"`). `"tools"` keeps it out of the
    * model's tool list, for tools that only scripts and other tools use.
    */
   readonly callers?: ToolCallers
-  /**
-   * Clean up after a call that was interrupted and will not run again: its
-   * turn ended (the recovered turn finished without calling it again, failed,
-   * or was cancelled). For calls that started work which goes on without
-   * them, such as a subagent or a background job, which would otherwise keep
-   * running with nobody waiting for the answer. Runs at least once per such
-   * call, after the turn ends or at the next `resume()` if the process died
-   * first, until it resolves; make it idempotent. Then the call is recorded
-   * as cancelled.
-   */
-  readonly abandon?: (call: AbandonedCall) => void | Promise<void>
 }
 
 /** A tool whose input is decoded and validated with an Effect Schema. */
@@ -154,12 +127,8 @@ export interface DurableTool {
   readonly name: string
   readonly description: string
   readonly replay: ReplayPolicy
-  /** Whether a completed call is answered from the journal when a recovered turn repeats it. */
-  readonly reuse: boolean
-  /** Interrupted calls are retried when the turn calls them again, not replayed during recovery. */
-  readonly resumeOnCall: boolean
+  readonly writes: boolean
   readonly callers: ToolCallers
-  readonly abandon: ((call: AbandonedCall) => void | Promise<void>) | null
   readonly jsonSchema: JsonObject
   /** Validate the input and execute. Rejects on invalid input or tool failure. */
   readonly run: (input: Json, context: DurableToolContext) => Promise<Json>
@@ -218,23 +187,13 @@ export function defineDurableTool<S extends StandardSchemaV1>(definition: Standa
 export function defineDurableTool(definition: JsonToolDefinition): DurableTool
 export function defineDurableTool(definition: AnyDefinition): DurableTool {
   validateName(definition.name)
-  const reuse = definition.reuse ?? true
-  if (!reuse && definition.replay !== "safe") {
-    throw new TypeError(`tool ${definition.name}: reuse: false requires replay: "safe" (running it again must be harmless)`)
-  }
-  const resumeOnCall = definition.resumeOnCall ?? false
-  if (resumeOnCall && policyName(definition.replay) !== "idempotent") {
-    throw new TypeError(`tool ${definition.name}: resumeOnCall requires the idempotent replay policy (the retry reuses its key)`)
-  }
   const base = {
     _tag: "DurableTool" as const,
     name: definition.name,
     description: definition.description ?? definition.name,
     replay: definition.replay,
-    reuse,
-    resumeOnCall,
-    callers: definition.callers ?? "both",
-    abandon: definition.abandon ?? null
+    writes: definition.writes ?? false,
+    callers: definition.callers ?? "both"
   }
   if (isSchemaDefinition(definition)) {
     const decode = Schema.decodeUnknownSync(definition.inputSchema)

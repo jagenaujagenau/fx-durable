@@ -2,7 +2,7 @@
  * Crash in the middle of a safe tool, then restart.
  *
  *   npx tsx examples/crash-recovery/index.ts --crash   # dies during `npm test`
- *   npx tsx examples/crash-recovery/index.ts           # recovers: replays the safe tool, continues
+ *   npx tsx examples/crash-recovery/index.ts           # recovers: libfx continues the turn, the safe tool runs again
  */
 import { Schema } from "effect"
 import { DurableFx, defineDurableTool, sqlite } from "fx-durable"
@@ -27,10 +27,10 @@ const fx = await DurableFx.open({
   storage: sqlite("./.examples/crash-recovery.db"),
   runtimes: { coding: { tools: [runTests] } },
   ...modelTransport((req) =>
-    // After recovery the same call returns the journaled (replayed) result without re-running.
-    req.toolResults.length === 0
+    // libfx's resume adds its own user messages: decide from every result in the conversation.
+    req.allToolResults.length === 0
       ? { toolCalls: [{ name: "run_tests", input: { command: "npm test" } }] }
-      : { text: `Tests: ${req.toolResults[0]!.output}` }
+      : { text: `Tests: ${req.allToolResults[0]!.output}` }
   )
 })
 const agent = await fx.agent("engineer", { runtime: "coding", model: MODEL })

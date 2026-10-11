@@ -1,32 +1,28 @@
-import type { Json, JsonObject } from "../domain/json.js"
+import type { Json } from "../domain/json.js"
 import type {
-  AgentCheckpoint,
-  AgentState,
-  DurableAgentRecord,
   DocumentRecord,
-  DurableEvent,
-  ReplayPolicyName,
+  DurableAgentRecord,
   SubmissionRecord,
   SubmissionResult,
   SubmissionState,
-  TaskRecord,
-  TaskState,
-  TaskType,
-  TurnRecord,
-  TurnState
+  ToolCallRecord,
+  ToolCallState
 } from "../domain/schema.js"
 
 /**
  * The narrow persistence boundary: plain synchronous code, no Effect runtime.
  * Storage is deliberately dumb: the Journal defines meaning, Storage provides
- * atomic persistence. SQLite is the only built-in implementation.
+ * atomic persistence. SQLite and memory are built in.
+ *
+ * libfx stores the conversations themselves (in its own session store); this
+ * holds fx-durable's records around them.
  *
  * Every method is synchronous and throws `StorageError` on failure.
  *
  * ## Durability contract
  *
- * fx-durable's correctness guarantees hold only if an implementation keeps
- * all of these (`storageContract` in `fx-durable/testing` checks them):
+ * fx-durable's guarantees hold only if an implementation keeps all of these
+ * (`storageContract` in `fx-durable/testing` checks them):
  *
  * 1. `transaction(fn)` is atomic: all of its writes commit, or none do.
  * 2. A transaction opened inside another joins the outer one.
@@ -40,59 +36,43 @@ import type {
  * 7. `afterCommit` callbacks run only after the outermost commit, never after a
  *    rollback; outside a transaction they run immediately.
  * 8. Committed writes are durable: they survive a process crash.
- * 9. Constraints hold: one submission per `(agentId, requestId)`, one active
- *    (running or interrupted) turn per agent, one checkpoint per
- *    `(agentId, sequence)`, one current document per `(agentId, kind)` and one
- *    history entry per `(agentId, kind, revision)`, and event sequences per
- *    agent start at 1 and have no gaps.
+ * 9. Constraints hold: one agent per id, one submission per `(agentId, id)`,
+ *    one tool call per `(sessionId, executionId, callKey)`, and one document
+ *    per `(agentId, kind)`.
  */
 
-export interface ExecutorRecord {
-  readonly id: string
-  readonly pid: number
-  readonly hostname: string
-  readonly startedAt: Date
-  readonly heartbeatAt: Date
-  readonly stoppedAt: Date | null
+export interface AgentPatch {
+  readonly sessionId?: string | null
+  readonly sessionStore?: string | null
+  readonly summary?: string | null
+  readonly startCheckpoint?: Uint8Array | null
+  readonly model?: string
+  readonly runtimeId?: string
+  readonly cwd?: string | null
+  readonly updatedAt: Date
 }
 
-export interface NewTask {
-  readonly id: string
-  readonly turnId: string
-  readonly agentId: string
-  readonly parentTaskId: string | null
-  readonly callerTaskId: string | null
-  readonly callKey: string | null
-  readonly type: TaskType
-  readonly state: TaskState
-  readonly name: string | null
-  readonly input: Json
-  readonly inputHash: string | null
-  readonly replayPolicy: ReplayPolicyName | null
-  readonly idempotencyKey: string | null
-  readonly attempt: number
-  readonly metadata: Json
-  readonly startedAt: Date | null
+export interface SubmissionPatch {
+  readonly state?: SubmissionState
+  readonly sessionId?: string
+  readonly result?: SubmissionResult | null
+  readonly error?: string | null
+  readonly updatedAt: Date
 }
 
-export interface TaskPatch {
-  readonly state?: TaskState
+export interface ToolCallKey {
+  readonly sessionId: string
+  readonly executionId: string
+  readonly callKey: string
+}
+
+export interface ToolCallPatch {
+  readonly state?: ToolCallState
   readonly output?: Json
   readonly error?: string | null
-  readonly acknowledged?: boolean
-  readonly metadata?: Json
+  readonly attempts?: number
+  readonly progress?: string | null
   readonly completedAt?: Date | null
-}
-
-export interface NewEvent {
-  readonly id: string
-  readonly agentId: string
-  readonly submissionId: string | null
-  readonly turnId: string | null
-  readonly taskId: string | null
-  readonly type: string
-  readonly payload: JsonObject
-  readonly createdAt: Date
 }
 
 export interface Storage {
@@ -104,103 +84,38 @@ export interface Storage {
   readonly getAgent: (id: string) => DurableAgentRecord | null
   readonly listAgents: () => ReadonlyArray<DurableAgentRecord>
   readonly insertAgent: (agent: DurableAgentRecord) => void
-  readonly updateAgent: (
-    id: string,
-    patch: {
-      readonly state?: AgentState
-      readonly stateReason?: string | null
-      readonly runtimeId?: string
-      readonly model?: string
-      readonly cwd?: string | null
-    },
-    now: Date
-  ) => void
+  readonly updateAgent: (id: string, patch: AgentPatch) => void
 
   // submissions
-  readonly getSubmission: (id: string) => SubmissionRecord | null
-  readonly findSubmissionByRequest: (
-    agentId: string,
-    requestId: string
-  ) => SubmissionRecord | null
-  readonly nextQueuedSubmission: (agentId: string) => SubmissionRecord | null
-  readonly listSubmissions: (agentId: string, limit: number) => ReadonlyArray<SubmissionRecord>
+  readonly getSubmission: (agentId: string, id: string) => SubmissionRecord | null
   readonly insertSubmission: (submission: SubmissionRecord) => void
-  readonly updateSubmission: (
-    id: string,
-    patch: {
-      readonly state?: SubmissionState
-      readonly result?: SubmissionResult
-      readonly error?: string | null
-      readonly cancelRequested?: boolean
-    },
-    now: Date
-  ) => void
+  readonly updateSubmission: (agentId: string, id: string, patch: SubmissionPatch) => void
+  /** An agent's latest submissions, newest first. */
+  readonly listSubmissions: (agentId: string, limit: number) => ReadonlyArray<SubmissionRecord>
+  /** Every submission still running, oldest first, across agents. */
+  readonly runningSubmissions: () => ReadonlyArray<SubmissionRecord>
+  /** Every finished submission with a result, across agents (for usage totals). */
+  readonly finishedSubmissions: (agentId: string | null) => ReadonlyArray<SubmissionRecord>
 
-  // turns
-  readonly getTurn: (id: string) => TurnRecord | null
-  readonly activeTurn: (agentId: string) => TurnRecord | null
-  readonly unfinishedTurns: () => ReadonlyArray<TurnRecord>
-  readonly listTurns: (agentId: string, limit: number) => ReadonlyArray<TurnRecord>
-  readonly turnForSubmission: (submissionId: string) => TurnRecord | null
-  readonly insertTurn: (turn: TurnRecord) => void
-  readonly updateTurn: (
-    id: string,
-    patch: {
-      readonly state?: TurnState
-      readonly attempt?: number
-      readonly executorId?: string | null
-      readonly completedAt?: Date | null
-    }
-  ) => void
-
-  // tasks
-  readonly getTask: (id: string) => TaskRecord | null
-  readonly tasksForTurn: (turnId: string) => ReadonlyArray<TaskRecord>
-  readonly unfinishedTasks: () => ReadonlyArray<TaskRecord>
-  /**
-   * Interrupted tool calls nobody will call again: their turn has ended
-   * (completed, failed, or cancelled) and no later task retries them.
-   */
-  readonly abandonedTasks: () => ReadonlyArray<TaskRecord>
-  readonly insertTask: (task: NewTask) => void
-  readonly updateTask: (id: string, patch: TaskPatch) => void
-
-  // checkpoints
-  readonly latestCheckpoint: (agentId: string) => AgentCheckpoint | null
-  readonly getCheckpoint: (agentId: string, sequence: number) => AgentCheckpoint | null
-  readonly insertCheckpoint: (checkpoint: AgentCheckpoint) => void
+  // tool calls
+  readonly getToolCall: (key: ToolCallKey) => ToolCallRecord | null
+  readonly insertToolCall: (call: ToolCallRecord) => void
+  readonly updateToolCall: (key: ToolCallKey, patch: ToolCallPatch) => void
+  /** Tool calls still running, oldest first, across agents. */
+  readonly runningToolCalls: () => ReadonlyArray<ToolCallRecord>
+  /** The nested calls under one model call, in the order they started. */
+  readonly toolCallsOf: (sessionId: string, executionId: string) => ReadonlyArray<ToolCallRecord>
 
   // documents
   /** The current value of a document (`agentId` null: a global one). */
   readonly getDocument: (agentId: string | null, kind: string) => DocumentRecord | null
-  /** Insert or replace the current value of the document at `(agentId, kind)`. */
+  /** Insert or replace the document at `(agentId, kind)`. */
   readonly putDocument: (document: DocumentRecord) => void
-  /** Keep a value in the document's history (rewindable documents). */
-  readonly insertDocumentRevision: (document: DocumentRecord) => void
-  /** From a document's history: the latest value written before checkpoint `sequence` existed (`checkpointSeq < sequence`). */
-  readonly documentAsOf: (agentId: string, kind: string, sequence: number) => DocumentRecord | null
-  /** The current values of an agent's documents, by kind. */
+  /** An agent's documents, by kind. */
   readonly agentDocuments: (agentId: string) => ReadonlyArray<DocumentRecord>
-
-  // events
-  readonly appendEvent: (event: NewEvent) => DurableEvent
-  readonly eventsAfter: (
-    agentId: string,
-    after: number,
-    limit: number
-  ) => ReadonlyArray<DurableEvent>
-  /** The sequence of the agent's latest event; 0 when it has none. */
-  readonly lastEventSequence: (agentId: string) => number
-
-  // executors
-  readonly registerExecutor: (executor: ExecutorRecord) => void
-  readonly heartbeatExecutor: (id: string, now: Date) => void
-  readonly stopExecutor: (id: string, now: Date) => void
-  readonly getExecutor: (id: string) => ExecutorRecord | null
 
   readonly close: () => void
 }
-
 
 /** The read-only view of storage handed to runtime code through `Database.read`. */
 export type StorageReader = Pick<
@@ -208,26 +123,14 @@ export type StorageReader = Pick<
   | "getAgent"
   | "listAgents"
   | "getSubmission"
-  | "findSubmissionByRequest"
-  | "nextQueuedSubmission"
   | "listSubmissions"
-  | "getTurn"
-  | "activeTurn"
-  | "unfinishedTurns"
-  | "listTurns"
-  | "turnForSubmission"
-  | "getTask"
-  | "tasksForTurn"
-  | "unfinishedTasks"
-  | "abandonedTasks"
-  | "latestCheckpoint"
-  | "getCheckpoint"
+  | "runningSubmissions"
+  | "finishedSubmissions"
+  | "getToolCall"
+  | "runningToolCalls"
+  | "toolCallsOf"
   | "getDocument"
-  | "documentAsOf"
   | "agentDocuments"
-  | "eventsAfter"
-  | "lastEventSequence"
-  | "getExecutor"
 >
 
 /**
@@ -237,25 +140,13 @@ export type StorageReader = Pick<
 export const readerOf = (storage: Storage): StorageReader => ({
   getAgent: (id) => storage.getAgent(id),
   listAgents: () => storage.listAgents(),
-  getSubmission: (id) => storage.getSubmission(id),
-  findSubmissionByRequest: (agentId, requestId) => storage.findSubmissionByRequest(agentId, requestId),
-  nextQueuedSubmission: (agentId) => storage.nextQueuedSubmission(agentId),
+  getSubmission: (agentId, id) => storage.getSubmission(agentId, id),
   listSubmissions: (agentId, limit) => storage.listSubmissions(agentId, limit),
-  getTurn: (id) => storage.getTurn(id),
-  activeTurn: (agentId) => storage.activeTurn(agentId),
-  unfinishedTurns: () => storage.unfinishedTurns(),
-  listTurns: (agentId, limit) => storage.listTurns(agentId, limit),
-  turnForSubmission: (submissionId) => storage.turnForSubmission(submissionId),
-  getTask: (id) => storage.getTask(id),
-  tasksForTurn: (turnId) => storage.tasksForTurn(turnId),
-  unfinishedTasks: () => storage.unfinishedTasks(),
-  abandonedTasks: () => storage.abandonedTasks(),
-  latestCheckpoint: (agentId) => storage.latestCheckpoint(agentId),
-  getCheckpoint: (agentId, sequence) => storage.getCheckpoint(agentId, sequence),
+  runningSubmissions: () => storage.runningSubmissions(),
+  finishedSubmissions: (agentId) => storage.finishedSubmissions(agentId),
+  getToolCall: (key) => storage.getToolCall(key),
+  runningToolCalls: () => storage.runningToolCalls(),
+  toolCallsOf: (sessionId, executionId) => storage.toolCallsOf(sessionId, executionId),
   getDocument: (agentId, kind) => storage.getDocument(agentId, kind),
-  documentAsOf: (agentId, kind, sequence) => storage.documentAsOf(agentId, kind, sequence),
-  agentDocuments: (agentId) => storage.agentDocuments(agentId),
-  eventsAfter: (agentId, after, limit) => storage.eventsAfter(agentId, after, limit),
-  lastEventSequence: (agentId) => storage.lastEventSequence(agentId),
-  getExecutor: (id) => storage.getExecutor(id)
+  agentDocuments: (agentId) => storage.agentDocuments(agentId)
 })

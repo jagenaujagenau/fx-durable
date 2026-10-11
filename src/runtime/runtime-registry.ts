@@ -1,32 +1,13 @@
-// oxlint-disable-next-line typescript/triple-slash-reference -- ambient `declare module "libfx"` types (libfx ships none) can only be attached by reference, not imported
-/// <reference path="../types/libfx.d.ts" preserve="true" />
 import { Context, Effect, Layer } from "effect"
-import type { McpClient } from "libfx/mcp"
 import type { DurableTool } from "../tools/define-tool.js"
 import type { ToolHooks } from "../tools/hooks.js"
 import type { Extension } from "../tools/extension.js"
-import type { ReplayPolicy } from "../tools/replay-policy.js"
 import { RuntimeConfigurationError } from "../domain/errors.js"
-import type { DurableAgentRecord } from "../domain/schema.js"
-import type { CompactionOptions } from "../domain/context.js"
 
 /**
- * A checkpoint cannot serialize executable TypeScript, so agents persist a
- * stable runtime id and recovery resolves it through the current registry.
+ * Sessions cannot store executable code, so agents persist a stable runtime
+ * id, and each process resolves it through its own registry.
  */
-
-export interface McpClientSpec {
-  /** A host-owned MCP client (MCP TypeScript SDK v1 `Client`). */
-  readonly client: McpClient
-  readonly prefix?: string
-  readonly resources?: ReadonlyArray<string>
-  readonly prompts?: ReadonlyArray<string>
-  /** Replay policy for this server's tools. MCP tools default to `unsafe`. */
-  readonly replay?: ReplayPolicy
-  /** Per-tool replay policies, keyed by tool name; these win over `replay`. */
-  readonly replayOverrides?: Readonly<Record<string, ReplayPolicy>>
-  readonly close?: () => Promise<void>
-}
 
 export interface RuntimeDefinition {
   readonly tools?: ReadonlyArray<DurableTool>
@@ -39,9 +20,6 @@ export interface RuntimeDefinition {
    * (`fx.installExtension()`) is used instead of the one listed here.
    */
   readonly extensions?: ReadonlyArray<Extension>
-  /** Compact automatically once the context reaches a size (see `agent.compact()`). */
-  readonly compaction?: CompactionOptions
-  readonly createMcpClients?: (agent: DurableAgentRecord) => Promise<ReadonlyArray<McpClientSpec>>
 }
 
 export interface RuntimeRegistryInterface {

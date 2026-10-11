@@ -4,15 +4,17 @@ import type { Json } from "../domain/json.js"
 export interface ToolCall {
   readonly name: string
   readonly input: Json
-  /** For a nested call (`context.executeTool`), the tool task that made it; null for the model's calls. */
-  readonly caller: { readonly taskId: string; readonly tool: string } | null
+  /** For a nested call (`context.executeTool`), the tool call that made it; null for the model's calls. */
+  readonly caller: { readonly tool: string; readonly callId: string } | null
 }
 
 export interface ToolHookContext {
   readonly agentId: string
-  readonly submissionId: string
-  readonly turnId: string
-  /** Aborted when the turn is cancelled or its executor stops. */
+  readonly sessionId: string
+  /** libfx's id for the model's call (nested calls share their top-level call's). */
+  readonly executionId: string
+  readonly submissionId: string | null
+  /** Aborted when the turn is cancelled. */
   readonly signal: AbortSignal
 }
 
@@ -28,10 +30,10 @@ export type BeforeToolDecision = { readonly block: string } | { readonly input: 
  *
  * `beforeTool` runs before the call's intent is journaled, so a call it is
  * still deciding about has not started: a crash during a slow decision (such
- * as a permission prompt) leaves no task behind, and the recovered turn asks
- * again. Replays of interrupted calls skip it, because their intent was only
- * journaled after it allowed them. Calls answered from the journal skip both
- * hooks.
+ * as a permission prompt) leaves nothing behind, and when libfx runs the call
+ * again it asks again. Reruns of calls that started skip it, because their
+ * intent was only journaled after it allowed them. Calls answered from the
+ * journal skip both hooks.
  */
 export interface ToolHooks {
   readonly beforeTool?: (call: ToolCall, context: ToolHookContext) => BeforeToolDecision | Promise<BeforeToolDecision>

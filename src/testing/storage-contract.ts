@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert"
 import { StorageError } from "../domain/errors.js"
-import type { DocumentRecord, DurableAgentRecord, SubmissionRecord, TaskRecord, TurnRecord } from "../domain/schema.js"
+import type { DocumentRecord, DurableAgentRecord, SubmissionRecord, ToolCallRecord } from "../domain/schema.js"
 import type { Storage } from "../durable/storage.js"
 
 /**
@@ -18,182 +18,139 @@ export interface StorageContractCase {
 }
 
 const at = new Date(1_700_000_000_000)
+const later = (seconds: number) => new Date(at.getTime() + seconds * 1000)
 
 const agent = (id = "a"): DurableAgentRecord => ({
   id,
-  runtimeId: "runtime",
-  model: "model",
+  runtimeId: "r",
+  model: "m",
   cwd: null,
-  state: "idle",
-  stateReason: null,
+  sessionId: null,
+  sessionStore: null,
+  summary: null,
+  startCheckpoint: null,
   createdAt: at,
   updatedAt: at
 })
 
-const submission = (id: string, requestId: string | null = null): SubmissionRecord => ({
+const submission = (id: string, agentId = "a", createdAt = at): SubmissionRecord => ({
   id,
-  agentId: "a",
-  requestId,
-  kind: "input",
+  agentId,
+  requestId: null,
+  sessionId: "s1",
+  sessionStore: "t1",
+  model: "m",
   content: "hello",
-  state: "queued",
+  state: "running",
   result: null,
   error: null,
-  cancelRequested: false,
-  createdAt: at,
-  updatedAt: at
+  createdAt,
+  updatedAt: createdAt
 })
 
-const turn = (id: string, state: TurnRecord["state"]): TurnRecord => ({
-  id,
+const toolCall = (executionId: string, callKey = "", startedAt = at): ToolCallRecord => ({
+  sessionId: "s1",
+  executionId,
+  callKey,
   agentId: "a",
-  submissionId: "s1",
-  state,
-  attempt: 1,
-  executorId: null,
-  baseCheckpointSeq: null,
-  startedAt: at,
+  submissionId: "q1",
+  name: "deploy",
+  input: { version: "v2", tags: ["a", null] },
+  replayPolicy: "idempotent",
+  idempotencyKey: `s1/${executionId}`,
+  state: "running",
+  output: null,
+  error: null,
+  attempts: 1,
+  progress: null,
+  startedAt,
   completedAt: null
 })
 
-const event = (id: string, agentId = "a") => ({
-  id,
+const document = (agentId: string | null, kind: string, revision = 1): DocumentRecord => ({
   agentId,
-  submissionId: null,
-  turnId: null,
-  taskId: null,
-  type: "agent.idle",
-  payload: {},
-  createdAt: at
+  kind,
+  version: 2,
+  revision,
+  value: { n: revision, nested: { list: [1, "two", null] } },
+  fork: "copy",
+  updatedAt: at
 })
 
 class Rollback extends Error {}
 
-const rolledBack = (storage: Storage, fn: () => void) =>
-  assert.throws(() => storage.transaction(fn), Rollback)
+const rolledBack = (storage: Storage, fn: () => void) => assert.throws(() => storage.transaction(fn), Rollback)
 
 export const storageContract: ReadonlyArray<StorageContractCase> = [
   {
-    name: "records round-trip unchanged",
+    name: "agents round-trip, and patches change only what they name",
     run: (storage) => {
-      storage.insertAgent(agent())
-      assert.deepEqual(storage.getAgent("a"), agent())
-      storage.insertSubmission(submission("s1", "r1"))
-      assert.deepEqual(storage.getSubmission("s1"), submission("s1", "r1"))
+      const checkpoint = new Uint8Array([1, 2, 3])
+      storage.insertAgent({ ...agent(), startCheckpoint: checkpoint, summary: "before" })
+      assert.deepEqual(storage.getAgent("a"), { ...agent(), startCheckpoint: checkpoint, summary: "before" })
+      storage.updateAgent("a", { sessionId: "s9", sessionStore: "t1", startCheckpoint: null, updatedAt: later(1) })
+      assert.deepEqual(storage.getAgent("a"), { ...agent(), summary: "before", sessionId: "s9", sessionStore: "t1", updatedAt: later(1) })
+      storage.insertAgent(agent("b"))
+      assert.deepEqual(storage.listAgents().map((a) => a.id), ["a", "b"])
+      assert.equal(storage.getAgent("missing"), null)
     }
   },
   {
-    name: "tasks round-trip, with their replay and caller links",
+    name: "submissions round-trip; running and finished ones are listed in order",
     run: (storage) => {
       storage.insertAgent(agent())
-      storage.insertSubmission(submission("s1"))
-      storage.insertTurn(turn("t1", "running"))
-      const task = (id: string, links: { parentTaskId: string | null; callerTaskId: string | null; callKey: string | null }) => ({
-        id,
-        turnId: "t1",
-        agentId: "a",
-        ...links,
-        type: "tool" as const,
-        state: "running" as const,
-        name: "tool",
-        input: { x: 1 },
-        inputHash: "h",
-        replayPolicy: "safe" as const,
-        idempotencyKey: null,
-        attempt: 1,
-        metadata: null,
-        startedAt: at
-      })
-      storage.insertTask(task("k1", { parentTaskId: null, callerTaskId: null, callKey: null }))
-      storage.insertTask(task("k2", { parentTaskId: null, callerTaskId: "k1", callKey: "0" }))
-      storage.insertTask(task("k3", { parentTaskId: "k2", callerTaskId: "k1", callKey: "0" }))
-      assert.deepEqual(
-        storage.tasksForTurn("t1").map((t) => [t.id, t.parentTaskId, t.callerTaskId, t.callKey]),
-        [
-          ["k1", null, null, null],
-          ["k2", null, "k1", "0"],
-          ["k3", "k2", "k1", "0"]
-        ]
-      )
-      storage.updateTask("k2", { state: "completed", output: 3, completedAt: at })
-      assert.equal(storage.getTask("k2")?.output, 3)
-      assert.deepEqual(storage.unfinishedTasks().map((t) => t.id), ["k1", "k3"])
+      storage.insertSubmission(submission("q1", "a", at))
+      storage.insertSubmission(submission("q2", "a", later(1)))
+      storage.insertSubmission({ ...submission("q3", "a", later(2)), content: [{ type: "text", text: "blocks" }] })
+      assert.deepEqual(storage.getSubmission("a", "q1"), submission("q1", "a", at))
+      const result = { text: "done", stopReason: "end_turn", usage: { inputTokens: 3, outputTokens: 2 } }
+      storage.updateSubmission("a", "q2", { state: "completed", result, updatedAt: later(5) })
+      assert.deepEqual(storage.getSubmission("a", "q2"), { ...submission("q2", "a", later(1)), state: "completed", result, updatedAt: later(5) })
+      assert.deepEqual(storage.listSubmissions("a", 2).map((s) => s.id), ["q3", "q2"])
+      assert.deepEqual(storage.runningSubmissions().map((s) => s.id), ["q1", "q3"])
+      assert.deepEqual(storage.finishedSubmissions("a").map((s) => s.id), ["q2"])
+      assert.deepEqual(storage.finishedSubmissions(null).map((s) => s.id), ["q2"])
     }
   },
   {
-    name: "abandoned tasks: interrupted tool calls of ended turns that nothing retries",
+    name: "tool calls round-trip by (session, execution, key); running ones and a call's nested ones are listed",
     run: (storage) => {
       storage.insertAgent(agent())
-      storage.insertSubmission(submission("s1"))
-      storage.insertTurn(turn("ended", "completed"))
-      storage.insertTurn(turn("recovering", "interrupted"))
-      const task = (id: string, turnId: string, state: TaskRecord["state"], parentTaskId: string | null = null, type: TaskRecord["type"] = "tool") => ({
-        id,
-        turnId,
-        agentId: "a",
-        parentTaskId,
-        callerTaskId: null,
-        callKey: null,
-        type,
-        state,
-        name: "tool",
-        input: null,
-        inputHash: null,
-        replayPolicy: "idempotent" as const,
-        idempotencyKey: null,
-        attempt: 1,
-        metadata: null,
-        startedAt: at
+      storage.insertToolCall(toolCall("e1", "", at))
+      storage.insertToolCall(toolCall("e1", "0", later(1)))
+      storage.insertToolCall(toolCall("e2", "", later(2)))
+      assert.deepEqual(storage.getToolCall({ sessionId: "s1", executionId: "e1", callKey: "0" }), toolCall("e1", "0", later(1)))
+      storage.updateToolCall({ sessionId: "s1", executionId: "e1", callKey: "0" }, { state: "completed", output: { ok: true }, completedAt: later(3) })
+      assert.deepEqual(storage.getToolCall({ sessionId: "s1", executionId: "e1", callKey: "0" }), {
+        ...toolCall("e1", "0", later(1)),
+        state: "completed",
+        output: { ok: true },
+        completedAt: later(3)
       })
-      storage.insertTask(task("left", "ended", "interrupted"))
-      storage.insertTask(task("retried", "ended", "interrupted"))
-      storage.insertTask(task("retry", "ended", "completed", "retried"))
-      storage.insertTask(task("model", "ended", "interrupted", null, "model"))
-      storage.insertTask(task("awaiting", "recovering", "interrupted"))
-      storage.insertTask(task("left2", "ended", "interrupted"))
-      assert.deepEqual(storage.abandonedTasks().map((t) => t.id), ["left", "left2"])
+      storage.updateToolCall({ sessionId: "s1", executionId: "e2", callKey: "" }, { attempts: 2, progress: "50%" })
+      assert.deepEqual(storage.runningToolCalls().map((c) => [c.executionId, c.callKey, c.attempts]), [
+        ["e1", "", 1],
+        ["e2", "", 2]
+      ])
+      assert.deepEqual(storage.toolCallsOf("s1", "e1").map((c) => c.callKey), ["", "0"])
+      assert.equal(storage.getToolCall({ sessionId: "s2", executionId: "e1", callKey: "" }), null)
     }
   },
   {
-    name: "documents: current values, history as of a checkpoint, and an agent's documents",
+    name: "documents: per agent and global, replaced in place, listed by kind",
     run: (storage) => {
       storage.insertAgent(agent())
-      const doc = (agentId: string | null, kind: string, revision: number, checkpointSeq: number): DocumentRecord => ({
-        agentId,
-        kind,
-        version: 2,
-        revision,
-        value: { n: revision, nested: { list: [1, "two", null] } },
-        history: "rewindable",
-        fork: "asOf",
-        checkpointSeq,
-        updatedAt: at
-      })
       assert.equal(storage.getDocument("a", "notes"), null)
-      for (const [revision, checkpointSeq] of [[1, 0], [2, 1], [3, 1], [4, 2]] as const) {
-        storage.putDocument(doc("a", "notes", revision, checkpointSeq))
-        storage.insertDocumentRevision(doc("a", "notes", revision, checkpointSeq))
-      }
-      storage.putDocument(doc(null, "notes", 1, 0))
-      storage.putDocument(doc("a", "board", 1, 0))
-      assert.deepEqual(storage.getDocument("a", "notes"), doc("a", "notes", 4, 2))
-      assert.deepEqual(storage.getDocument(null, "notes"), doc(null, "notes", 1, 0))
-      assert.equal(storage.documentAsOf("a", "notes", 1)?.revision, 1)
-      assert.equal(storage.documentAsOf("a", "notes", 2)?.revision, 3)
-      assert.equal(storage.documentAsOf("a", "notes", 0), null)
-      assert.deepEqual(storage.agentDocuments("a").map((d) => [d.kind, d.revision]), [["board", 1], ["notes", 4]])
-      assert.throws(() => storage.insertDocumentRevision(doc("a", "notes", 4, 2)), StorageError)
-    }
-  },
-  {
-    name: "lastEventSequence is the agent's latest event sequence, 0 without events",
-    run: (storage) => {
-      assert.equal(storage.lastEventSequence("a"), 0)
-      storage.appendEvent(event("e1"))
-      storage.appendEvent(event("e2"))
-      storage.appendEvent(event("x1", "b"))
-      assert.equal(storage.lastEventSequence("a"), 2)
-      assert.equal(storage.lastEventSequence("b"), 1)
+      storage.putDocument(document("a", "notes", 1))
+      storage.putDocument(document("a", "notes", 2))
+      storage.putDocument(document(null, "notes", 1))
+      storage.putDocument(document("a", "board", 1))
+      assert.deepEqual(storage.getDocument("a", "notes"), document("a", "notes", 2))
+      assert.deepEqual(storage.getDocument(null, "notes"), document(null, "notes", 1))
+      assert.deepEqual(storage.agentDocuments("a").map((d) => [d.kind, d.revision]), [
+        ["board", 1],
+        ["notes", 2]
+      ])
     }
   },
   {
@@ -201,10 +158,10 @@ export const storageContract: ReadonlyArray<StorageContractCase> = [
     run: (storage) => {
       storage.transaction(() => {
         storage.insertAgent(agent())
-        storage.appendEvent(event("e1"))
+        storage.insertSubmission(submission("q1"))
       })
-      assert.equal(storage.getAgent("a")?.id, "a")
-      assert.equal(storage.eventsAfter("a", 0, 10).length, 1)
+      assert.ok(storage.getAgent("a"))
+      assert.ok(storage.getSubmission("a", "q1"))
     }
   },
   {
@@ -212,14 +169,14 @@ export const storageContract: ReadonlyArray<StorageContractCase> = [
     run: (storage) => {
       storage.insertAgent(agent())
       rolledBack(storage, () => {
-        storage.updateAgent("a", { state: "running" }, at)
-        storage.insertSubmission(submission("s1"))
-        storage.appendEvent(event("e1"))
+        storage.insertSubmission(submission("q1"))
+        storage.updateAgent("a", { sessionId: "s1", updatedAt: later(1) })
+        storage.putDocument(document("a", "notes"))
         throw new Rollback()
       })
-      assert.equal(storage.getAgent("a")?.state, "idle")
-      assert.equal(storage.getSubmission("s1"), null)
-      assert.deepEqual(storage.eventsAfter("a", 0, 10), [])
+      assert.equal(storage.getSubmission("a", "q1"), null)
+      assert.equal(storage.getAgent("a")?.sessionId, null)
+      assert.equal(storage.getDocument("a", "notes"), null)
     }
   },
   {
@@ -227,10 +184,10 @@ export const storageContract: ReadonlyArray<StorageContractCase> = [
     run: (storage) => {
       storage.insertAgent(agent())
       rolledBack(storage, () => {
-        storage.transaction(() => storage.updateAgent("a", { state: "running" }, at))
+        storage.transaction(() => storage.insertSubmission(submission("q1")))
         throw new Rollback()
       })
-      assert.equal(storage.getAgent("a")?.state, "idle")
+      assert.equal(storage.getSubmission("a", "q1"), null)
     }
   },
   {
@@ -239,11 +196,11 @@ export const storageContract: ReadonlyArray<StorageContractCase> = [
       storage.insertAgent(agent())
       assert.throws(() =>
         storage.transaction(() => {
-          storage.updateAgent("a", { state: "running" }, at)
+          storage.insertSubmission(submission("q1"))
           return Promise.resolve()
         })
       )
-      assert.equal(storage.getAgent("a")?.state, "idle")
+      assert.equal(storage.getSubmission("a", "q1"), null)
     }
   },
   {
@@ -251,88 +208,43 @@ export const storageContract: ReadonlyArray<StorageContractCase> = [
     run: (storage) => {
       storage.transaction(() => {
         storage.insertAgent(agent())
-        storage.updateAgent("a", { state: "running" }, at)
-        assert.equal(storage.getAgent("a")?.state, "running")
-        storage.appendEvent(event("e1"))
-        assert.equal(storage.eventsAfter("a", 0, 10).length, 1)
+        assert.ok(storage.getAgent("a"))
+        storage.insertSubmission(submission("q1"))
+        assert.deepEqual(storage.runningSubmissions().map((s) => s.id), ["q1"])
       })
     }
   },
   {
     name: "7. afterCommit runs after the outermost commit, never after a rollback",
     run: (storage) => {
-      const seen: Array<string> = []
-      storage.afterCommit(() => seen.push("outside"))
-      assert.deepEqual(seen, ["outside"])
+      const ran: Array<string> = []
       storage.transaction(() => {
-        storage.transaction(() => storage.afterCommit(() => seen.push("nested")))
-        assert.deepEqual(seen, ["outside"], "must not run before the outer commit")
+        storage.afterCommit(() => ran.push("committed"))
+        storage.transaction(() => storage.afterCommit(() => ran.push("nested")))
+        assert.deepEqual(ran, [])
       })
-      assert.deepEqual(seen, ["outside", "nested"])
+      assert.deepEqual(ran, ["committed", "nested"])
       rolledBack(storage, () => {
-        storage.afterCommit(() => seen.push("rolled back"))
+        storage.afterCommit(() => ran.push("rolled back"))
         throw new Rollback()
       })
-      assert.deepEqual(seen, ["outside", "nested"])
+      storage.afterCommit(() => ran.push("outside"))
+      assert.deepEqual(ran, ["committed", "nested", "outside"])
     }
   },
   {
-    name: "9. one submission per (agentId, requestId); null request ids do not collide",
+    name: "9. one agent per id, one submission per (agent, id), one tool call per key",
     run: (storage) => {
       storage.insertAgent(agent())
-      storage.insertSubmission(submission("s1", "same"))
-      assert.throws(() => storage.insertSubmission(submission("s2", "same")), StorageError)
-      storage.insertSubmission(submission("s3"))
-      storage.insertSubmission(submission("s4"))
-      assert.equal(storage.findSubmissionByRequest("a", "same")?.id, "s1")
-    }
-  },
-  {
-    name: "9. one active turn per agent",
-    run: (storage) => {
-      storage.insertAgent(agent())
-      storage.insertSubmission(submission("s1"))
-      storage.insertTurn(turn("t1", "running"))
-      assert.throws(() => storage.insertTurn(turn("t2", "interrupted")), StorageError)
-      storage.insertTurn(turn("t3", "completed"))
-      assert.equal(storage.activeTurn("a")?.id, "t1")
-    }
-  },
-  {
-    name: "9. one checkpoint per (agentId, sequence); latest is the highest sequence",
-    run: (storage) => {
-      storage.insertAgent(agent())
-      const checkpoint = (id: string, sequence: number) => ({
-        id,
-        agentId: "a",
-        sequence,
-        fxCheckpoint: new Uint8Array([sequence]),
-        summary: sequence === 2 ? "earlier work" : null,
-        runtimeId: "runtime",
-        model: "model",
-        createdAt: at
-      })
-      storage.insertCheckpoint(checkpoint("c1", 1))
-      storage.insertCheckpoint(checkpoint("c2", 2))
-      assert.throws(() => storage.insertCheckpoint(checkpoint("c3", 2)), StorageError)
-      assert.equal(storage.latestCheckpoint("a")?.id, "c2")
-      assert.deepEqual(Array.from(storage.latestCheckpoint("a")?.fxCheckpoint ?? []), [2])
-      assert.equal(storage.latestCheckpoint("a")?.summary, "earlier work")
-      assert.equal(storage.getCheckpoint("a", 1)?.summary, null)
-      assert.equal(storage.getCheckpoint("a", 1)?.id, "c1")
-      assert.equal(storage.getCheckpoint("a", 3), null)
-    }
-  },
-  {
-    name: "9. event sequences are per agent, start at 1, and have no gaps",
-    run: (storage) => {
-      for (let i = 0; i < 3; i++) {
-        storage.appendEvent(event(`a${i}`, "a"))
-        storage.appendEvent(event(`b${i}`, "b"))
-      }
-      assert.deepEqual(storage.eventsAfter("a", 0, 10).map((e) => e.sequence), [1, 2, 3])
-      assert.deepEqual(storage.eventsAfter("b", 1, 10).map((e) => e.sequence), [2, 3])
-      assert.deepEqual(storage.eventsAfter("a", 0, 2).map((e) => e.sequence), [1, 2])
+      assert.throws(() => storage.insertAgent(agent()), StorageError)
+      storage.insertAgent(agent("b"))
+      storage.insertSubmission(submission("q1"))
+      assert.throws(() => storage.insertSubmission(submission("q1")), StorageError)
+      // The same id under another agent is another submission.
+      storage.insertSubmission(submission("q1", "b"))
+      storage.insertToolCall(toolCall("e1"))
+      assert.throws(() => storage.insertToolCall(toolCall("e1")), StorageError)
+      storage.insertToolCall(toolCall("e1", "0"))
     }
   }
 ]

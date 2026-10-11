@@ -1,44 +1,28 @@
+import { dirname, join, basename } from "node:path"
+import { Cause, Effect, Exit, Layer, ManagedRuntime, Queue, Stream } from "effect"
+import { memory, type Durability, type FxFetch, type FxModelCatalogEntry, type FxStreamLine } from "libfx"
+import { local } from "libfx/durable-local"
 import { bindTools } from "../tools/subagent.js"
 import { ExtensionSelection, type Extension } from "../tools/extension.js"
-import { ToolRegistry } from "./tool-registry.js"
-import type { ForkSpec } from "../durable/journal.js"
-import { Cause, Effect, Exit, Layer, ManagedRuntime, Option, Stream } from "effect"
-import type * as Sqlite from "../durable/sqlite/storage.js"
 import * as Executor from "./tool-executor.js"
 import * as Registry from "./tool-registry.js"
-import { AgentSupervisor, layer as supervisorLayer } from "./supervisor.js"
+import * as SessionsModule from "./sessions.js"
+import type { DurabilityFor } from "./sessions.js"
+import * as AgentsModule from "./agents.js"
+import { Agents } from "./agents.js"
+import { ToolRegistry } from "./tool-registry.js"
 import { CrashInjector, type CrashPlan } from "./crash.js"
-import { AgentBusyError, AgentExistsError, DurableFxFailedError, NotFoundError, SubmissionError, type StorageError } from "../domain/errors.js"
-import { EventLog, layer as eventLogLayer } from "./events.js"
+import { AgentExistsError, DurableFxFailedError, NotFoundError, SubmissionError, type StorageError } from "../domain/errors.js"
 import { IdGenerator } from "./ids.js"
 import { Database, databaseLayer } from "./database.js"
 import type { Clock } from "../durable/clock.js"
-import * as LibFxModule from "./libfx.js"
-import { RecoveryManager, layer as recoveryLayer, type RecoveryReport } from "./recovery.js"
 import { RuntimeRegistry, type RuntimeDefinition } from "./runtime-registry.js"
-import {
-  SubmissionContent,
-  decodeWith,
-  type DurableAgentRecord,
-  type DurableEvent,
-  type SubmissionKind,
-  type SubmissionRecord,
-  type SubmissionResult,
-  type TaskRecord,
-  type TurnRecord
-} from "../domain/schema.js"
-import type { Storage } from "../durable/storage.js"
-import type { Transport } from "../domain/transport.js"
+import { SubmissionContent, decodeWith, type DurableAgentRecord, type SubmissionRecord, type SubmissionResult, type ToolCallRecord } from "../domain/schema.js"
+import type { SqliteStorageConfig } from "../durable/sqlite/storage.js"
+import type { Storage, StorageReader } from "../durable/storage.js"
 import { usageOf, type ModelPrices, type UsageReport } from "../domain/usage.js"
 import { buildTaskGraph, type TaskGraph } from "../domain/task-graph.js"
-import {
-  DocumentUpdateFailed,
-  documentValue,
-  type AgentDocument,
-  type DocumentUpdate,
-  type DurableDocument,
-  type GlobalDocument
-} from "../domain/documents.js"
+import { DocumentUpdateFailed, documentValue, type AgentDocument, type DocumentUpdate, type DurableDocument, type GlobalDocument } from "../domain/documents.js"
 import { isJsonString, type JsonObject } from "../domain/json.js"
 
 /**
@@ -48,23 +32,31 @@ import { isJsonString, type JsonObject } from "../domain/json.js"
 
 export interface DurableFxOptions {
   /**
-   * `sqlite(path)`, or any object implementing the synchronous `Storage`
-   * interface. fx-durable closes the storage when it closes.
+   * fx-durable's own records: `sqlite(path)`, or any object implementing the
+   * synchronous `Storage` interface. fx-durable closes it when it closes.
    */
-  readonly storage: Sqlite.SqliteStorageConfig | Storage
+  readonly storage: SqliteStorageConfig | Storage
+  /**
+   * Where libfx keeps the conversations. libfx agents that share a store
+   * share its work, so fx-durable keeps one store per tool set: pass a
+   * function from a store's name to its durability. Defaults to files next to
+   * the SQLite database (`local({ dir: "<db>.sessions/<store>" })`), or
+   * `memory()` for storage passed as an object. A single durability (such as
+   * `vercel()`) can hold the sessions of one tool set.
+   */
+  readonly durability?: Durability | DurabilityFor
   readonly runtimes?: Readonly<Record<string, RuntimeDefinition>>
   /** AI Gateway key. Defaults to `AI_GATEWAY_API_KEY`. */
   readonly apiKey?: string
   /** Model transport override (e.g. a scripted model for tests and offline demos). */
-  readonly fetch?: Transport
+  readonly fetch?: FxFetch
+  /** The Gateway model catalog, so libfx makes no catalog request. */
+  readonly modelCatalog?: ReadonlyArray<FxModelCatalogEntry>
   readonly backend?: "auto" | "native" | "wasm"
-  /** `auto` (default) recovers interrupted work during `open()`; `manual` waits for `resume()`. */
+  /** `auto` (default) continues unfinished requests during `open()`; `manual` waits for `resume()`. */
   readonly recovery?: "auto" | "manual"
-  readonly maxRecoveryAttempts?: number
   /** Crash injection. Defaults to reading `FXD_CRASH_AT` from the environment (no-op when unset). */
   readonly crash?: (CrashPlan & { readonly onCrash?: (point: string) => void }) | "env" | "off"
-  readonly heartbeatMillis?: number
-  readonly idlePollMillis?: number
 }
 
 export interface AgentOptions {
@@ -76,31 +68,24 @@ export interface AgentOptions {
 export interface SubmitOptions {
   /** External idempotency key: repeated submissions resolve to the same logical submission. */
   readonly requestId?: string
-  /**
-   * When the agent is already working: `"queue"` (default) runs this request
-   * after the current ones; `"reject"` submits nothing and rejects with
-   * `AgentBusyError`. To join the work in progress, use `agent.steer()`.
-   */
-  readonly whenBusy?: "queue" | "reject"
 }
 
 export interface ResetOptions {
   /** A handoff: what the model should know in the new context. */
   readonly summary?: string
-  readonly requestId?: string
 }
 
-export interface CompactOptions {
-  /** Extra guidance for the summary, e.g. "keep the list of failing tests". */
-  readonly instructions?: string
-  readonly requestId?: string
+export interface ForkOptions {
+  readonly runtime?: string
+  readonly model?: string
+  readonly cwd?: string | null
 }
 
 export interface EventsOptions {
+  /** Deliver events after this cursor (each line's `cursor`). Default 0: everything. */
   readonly after?: number
-  /** Stop after replaying persisted events instead of following live. */
+  /** Stop at the end of the agent's latest request instead of following live. Default true. */
   readonly follow?: boolean
-  readonly pollInterval?: number
 }
 
 export interface UsageOptions {
@@ -108,15 +93,7 @@ export interface UsageOptions {
   readonly prices?: ModelPrices
 }
 
-/** How many of an agent's latest submissions `taskGraph()` looks through for queued ones. */
-const QUEUED_LIMIT = 500
-
-/** libfx's limit for one steering message. */
-const MAX_STEERING_BYTES = 64 * 1024
-
-const TERMINAL_EVENTS = new Set(["submission.completed", "submission.failed", "submission.cancelled"])
-
-type Services = Database | EventLog | IdGenerator | RuntimeRegistry | ToolRegistry | AgentSupervisor | RecoveryManager | CrashInjector
+type Services = Database | IdGenerator | RuntimeRegistry | ToolRegistry | Agents | CrashInjector
 
 const decodeContent = decodeWith(SubmissionContent, "submission content")
 
@@ -125,6 +102,25 @@ export interface DurableFxLayers {
   readonly ids?: Layer.Layer<IdGenerator>
   /** The journal's clock (defaults to the system clock). */
   readonly clock?: Clock
+}
+
+const isSqliteConfig = (storage: SqliteStorageConfig | Storage): storage is SqliteStorageConfig =>
+  "_tag" in storage && storage._tag === "SqliteStorageConfig"
+
+/** Where libfx keeps sessions unless told: beside the SQLite file (a directory per store), or in memory. */
+const defaultDurability = (storage: SqliteStorageConfig | Storage): DurabilityFor => {
+  if (!isSqliteConfig(storage) || storage.options.path === ":memory:") {
+    const stores = new Map<string, Durability>()
+    return (store) => {
+      const existing = stores.get(store)
+      if (existing) return existing
+      const created = memory()
+      stores.set(store, created)
+      return created
+    }
+  }
+  const path = storage.options.path
+  return (store) => local({ dir: join(dirname(path), `${basename(path)}.sessions`, store) })
 }
 
 /** The complete fx-durable service graph as one Effect `Layer`. */
@@ -136,24 +132,28 @@ export const buildLayer = (options: DurableFxOptions, layers: DurableFxLayers = 
         ? CrashInjector.fromEnv()
         : CrashInjector.make({
             ...options.crash,
-            onCrash: options.crash.onCrash ?? ((point) => {
-              throw new Error(`crash injected at ${point}`)
-            })
+            onCrash:
+              options.crash.onCrash ??
+              ((point) => {
+                throw new Error(`crash injected at ${point}`)
+              })
           })
-  const ids = layers.ids ?? IdGenerator.layer
   const base = Layer.mergeAll(
-    databaseLayer(options.storage, layers.clock).pipe(Layer.provideMerge(ids)),
+    databaseLayer(options.storage, layers.clock),
     crash,
-    RuntimeRegistry.layer(options.runtimes ?? {}),
-    LibFxModule.layer({ apiKey: options.apiKey, fetch: options.fetch, backend: options.backend })
+    layers.ids ?? IdGenerator.layer,
+    RuntimeRegistry.layer(options.runtimes ?? {})
   )
-  const events = eventLogLayer.pipe(Layer.provideMerge(Registry.layer.pipe(Layer.provideMerge(base))))
-  const journal = Executor.layer.pipe(Layer.provideMerge(events))
-  const supervisor = supervisorLayer({
-    heartbeatMillis: options.heartbeatMillis,
-    idlePollMillis: options.idlePollMillis
-  }).pipe(Layer.provideMerge(journal))
-  return recoveryLayer({ maxAttempts: options.maxRecoveryAttempts }).pipe(Layer.provideMerge(supervisor))
+  const tools = Registry.layer.pipe(Layer.provideMerge(base))
+  const executor = Executor.layer.pipe(Layer.provideMerge(tools))
+  const sessions = SessionsModule.layer({
+    durability: options.durability ?? defaultDurability(options.storage),
+    apiKey: options.apiKey,
+    fetch: options.fetch,
+    modelCatalog: options.modelCatalog,
+    backend: options.backend
+  }).pipe(Layer.provideMerge(executor))
+  return AgentsModule.layer.pipe(Layer.provideMerge(sessions))
 }
 
 /** Why a `DurableFx` closed: `close()` was called, or a storage error closed it. */
@@ -188,40 +188,12 @@ const runOn = <A, E>(fx: DurableFx, effect: Effect.Effect<A, E, Services>): Prom
   return runner ? runner.run(effect) : Promise.reject(notOpen())
 }
 
-export interface DocumentReadOptions {
-  /** Read the value as of this checkpoint sequence (rewindable documents): the latest one written before it. */
-  readonly checkpoint?: number
-}
+const read = <A>(fx: DurableFx, f: (storage: StorageReader) => A) => runOn(fx, Effect.flatMap(Database, (database) => database.read(f)))
 
-const readDocument = async <T extends JsonObject>(
-  fx: DurableFx,
-  document: DurableDocument<T>,
-  agentId: string | null,
-  options: DocumentReadOptions = {}
-): Promise<T> => {
-  const checkpoint = options.checkpoint
-  if (checkpoint !== undefined && (agentId === null || document.history !== "rewindable")) {
-    throw new TypeError(`document ${document.kind} keeps no history; it can only be read as of a checkpoint with history: "rewindable"`)
-  }
-  const record = await runOn(
-    fx,
-    Effect.flatMap(Database, (database) =>
-      database.read((storage) =>
-        checkpoint === undefined || agentId === null
-          ? storage.getDocument(agentId, document.kind)
-          : storage.documentAsOf(agentId, document.kind, checkpoint)
-      )
-    )
-  )
-  return documentValue(document, record)
-}
+const readDocument = async <T extends JsonObject>(fx: DurableFx, document: DurableDocument<T>, agentId: string | null): Promise<T> =>
+  documentValue(document, await read(fx, (storage) => storage.getDocument(agentId, document.kind)))
 
-const writeDocument = async <T extends JsonObject>(
-  fx: DurableFx,
-  document: DurableDocument<T>,
-  agentId: string | null,
-  update: DocumentUpdate<T>
-): Promise<T> => {
+const writeDocument = async <T extends JsonObject>(fx: DurableFx, document: DurableDocument<T>, agentId: string | null, update: DocumentUpdate<T>): Promise<T> => {
   const outcome = await runOn(
     fx,
     Effect.flatMap(Database, (database) =>
@@ -240,13 +212,10 @@ const writeDocument = async <T extends JsonObject>(
   return documentValue(document, outcome.record)
 }
 
-/** Open with Effect-native layer overrides (see `fx-durable/effect`). */
 /** A runtime's own tools and those of the extensions it lists. */
-const runtimeTools = (definition: RuntimeDefinition) => [
-  ...(definition.tools ?? []),
-  ...(definition.extensions ?? []).flatMap((extension) => extension.tools)
-]
+const runtimeTools = (definition: RuntimeDefinition) => [...(definition.tools ?? []), ...(definition.extensions ?? []).flatMap((extension) => extension.tools)]
 
+/** Open with Effect-native layer overrides (see `fx-durable/effect`). */
 export const openDurableFx = async (options: DurableFxOptions, layers: DurableFxLayers = {}): Promise<DurableFx> => {
   const runtime = ManagedRuntime.make(buildLayer(options, layers))
   const context = await runtime.context()
@@ -260,7 +229,6 @@ export const openDurableFx = async (options: DurableFxOptions, layers: DurableFx
   })
   const shutdown = (reason: CloseReason) => {
     closing ??= (async () => {
-      await runtime.runPromise(Effect.flatMap(AgentSupervisor, (s) => s.shutdown())).catch(() => undefined)
       await runtime.dispose().catch(() => undefined)
       settle(reason)
     })()
@@ -293,7 +261,7 @@ export const openDurableFx = async (options: DurableFxOptions, layers: DurableFx
     )
   )
 
-  // Before recovery: a recovered turn may call a subagent tool.
+  // Before recovery: a continued turn may call a subagent tool.
   for (const definition of Object.values(options.runtimes ?? {})) bindTools(fx, runtimeTools(definition))
   if ((options.recovery ?? "auto") === "auto") {
     try {
@@ -309,7 +277,7 @@ export const openDurableFx = async (options: DurableFxOptions, layers: DurableFx
 export class DurableFx {
   /** Use `DurableFx.open()`; an instance created directly is not open. */
 
-  /** Open the durable runtime. With `recovery: "auto"` (default), interrupted work resumes now. */
+  /** Open fx-durable. With `recovery: "auto"` (default), unfinished requests continue now. */
   static open(options: DurableFxOptions): Promise<DurableFx> {
     return openDurableFx(options)
   }
@@ -320,17 +288,17 @@ export class DurableFx {
 
   registerRuntime(id: string, definition: RuntimeDefinition): Promise<void> {
     bindTools(this, runtimeTools(definition))
-    return this.run(
-      Effect.gen(function* () {
-        const registry = yield* RuntimeRegistry
-        yield* registry.register(id, definition)
-      })
-    )
+    return this.run(Effect.flatMap(RuntimeRegistry, (registry) => registry.register(id, definition)))
   }
 
-  /** Recover interrupted turns whose executor is gone, then start workers for pending work. */
-  resume(): Promise<RecoveryReport> {
-    return this.run(Effect.flatMap(RecoveryManager, (recovery) => recovery.resume()))
+  /**
+   * Continue every unfinished request: each is prompted again under its
+   * `messageId`, and libfx continues its turn from its last step (or reports
+   * how it ended). Requests whose runtime is not registered wait for the next
+   * call. Resolves with the ids of the requests it continued.
+   */
+  resume(): Promise<ReadonlyArray<string>> {
+    return this.run(Effect.flatMap(Agents, (agents) => agents.resume()))
   }
 
   /**
@@ -338,67 +306,34 @@ export class DurableFx {
    * same durable agent across application restarts.
    */
   async agent(id: string, options: AgentOptions): Promise<DurableAgent> {
-    await this.run(
-      Effect.gen(function* () {
-        const database = yield* Database
-        const registry = yield* RuntimeRegistry
-        const supervisor = yield* AgentSupervisor
-        yield* registry.resolve(options.runtime)
-        yield* database.run((journal) => journal.upsertAgent(id, options))
-        yield* supervisor.ensureWorker(id)
-      })
-    )
+    await this.run(Effect.flatMap(Database, (database) => database.run((journal) => journal.upsertAgent(id, options))))
     return new DurableAgent(this, id)
   }
 
-  /** Attach to an existing agent without changing it. Clients attach; they do not own execution. */
+  /** Attach to an existing agent without changing it. */
   async attach(id: string): Promise<DurableAgent> {
-    await this.run(
-      Effect.gen(function* () {
-        const database = yield* Database
-        const agent = yield* database.read((storage) => storage.getAgent(id))
-        if (!agent) return yield* new NotFoundError({ entity: "agent", id })
-      })
-    )
+    const agent = await read(this, (storage) => storage.getAgent(id))
+    if (!agent) throw new NotFoundError({ entity: "agent", id })
     return new DurableAgent(this, id)
   }
 
-  /** Token and cost totals across every agent, from the journaled model requests. */
-  usage(options: UsageOptions = {}): Promise<UsageReport> {
-    return this.run(
-      Effect.gen(function* () {
-        const database = yield* Database
-        const log = yield* EventLog
-        const agents = yield* database.read((storage) => storage.listAgents())
-        const events: Array<DurableEvent> = []
-        for (const agent of agents) events.push(...(yield* log.history(agent.id)))
-        return usageOf(events, options.prices)
-      })
-    )
+  listAgents(): Promise<ReadonlyArray<DurableAgentRecord>> {
+    return read(this, (storage) => storage.listAgents())
   }
 
-  /**
-   * Running work across every agent as one graph: turns, model and tool
-   * calls, nested calls under their callers, and subagent turns under the
-   * tool calls that started them; plus queued requests. A snapshot of what is
-   * committed; re-read it on events to keep a view current.
-   */
-  taskGraph(): Promise<TaskGraph> {
-    return this.run(
-      Effect.flatMap(Database, (database) =>
-        database.read((storage) => {
-          const queued = storage
-            .listAgents()
-            .flatMap((agent) => storage.listSubmissions(agent.id, QUEUED_LIMIT).filter((s) => s.state === "queued").reverse())
-          return buildTaskGraph(storage.unfinishedTasks(), queued)
-        })
-      )
-    )
+  /** Token and cost totals across every agent, from its finished requests. */
+  async usage(options: UsageOptions = {}): Promise<UsageReport> {
+    return usageOf(await read(this, (storage) => storage.finishedSubmissions(null)), options.prices)
+  }
+
+  /** Running tool calls across agents, with what each runs for. */
+  async taskGraph(): Promise<TaskGraph> {
+    return read(this, (storage) => buildTaskGraph(storage.runningToolCalls(), storage.runningSubmissions()))
   }
 
   /**
    * Install an extension, replacing the installed one with the same name (a
-   * reload). Agents that select it get it from their next turn; a call
+   * reload). Agents that select it get it from their next request; a call
    * already running finishes with the code it started with.
    */
   installExtension(extension: Extension): Promise<void> {
@@ -425,11 +360,7 @@ export class DurableFx {
     return writeDocument(this, document, null, update)
   }
 
-  listAgents(): Promise<ReadonlyArray<DurableAgentRecord>> {
-    return this.run(Effect.flatMap(Database, (database) => database.read((storage) => storage.listAgents())))
-  }
-
-  /** Stop executing. In-flight turns are left interrupted and recover on the next open. */
+  /** Stop: wait for the turns this process runs, then close storage. Unfinished requests continue on the next open. */
   async close(): Promise<void> {
     await runners.get(this)?.close()
   }
@@ -451,113 +382,104 @@ export class DurableAgent {
     readonly id: string
   ) {}
 
-  /** Durably accept a request. The submission is committed before this resolves. */
-  submit(content: SubmissionContent, options: SubmitOptions = {}): Promise<Submission> {
-    return this.admit("input", content, options)
-  }
-
   /**
-   * Start a new context: from the next request on, the model no longer sees
-   * this conversation (it stays in the journal and in older checkpoints, so
-   * forks can still start from it). With `summary`, a handoff, the model sees
-   * that text in its instructions instead. Queued like a request: it runs
-   * after the work already queued, and its submission resolves once it has.
+   * Durably accept a request. It is recorded, then stored by libfx, before
+   * this resolves; it runs after the agent's earlier requests.
    */
-  reset(options: ResetOptions = {}): Promise<Submission> {
-    return this.admit("reset", options.summary ?? "", { requestId: options.requestId })
-  }
-
-  /**
-   * Replace the context with a summary the model writes of it: a reset whose
-   * handoff is a compaction. The summary is one model request, journaled and
-   * counted in `usage()` like any other; the submission's result is the
-   * summary. Queued like a request. Runtimes can also compact automatically
-   * (`RuntimeDefinition.compaction`).
-   */
-  compact(options: CompactOptions = {}): Promise<Submission> {
-    return this.admit("compaction", options.instructions ?? "", { requestId: options.requestId })
-  }
-
-  private async admit(kind: SubmissionKind, content: SubmissionContent, options: SubmitOptions): Promise<Submission> {
+  async submit(content: SubmissionContent, options: SubmitOptions = {}): Promise<Submission> {
     const agentId = this.id
-    const requestId = options.requestId ?? null
-    const reject = options.whenBusy === "reject"
     const { record, created } = await runOn(
       this.fx,
       Effect.gen(function* () {
-        const database = yield* Database
-        const supervisor = yield* AgentSupervisor
-        const crash = yield* CrashInjector
         const decoded = yield* decodeContent(content)
-        const admitted = yield* database.run((journal) =>
-          reject ? journal.submitIfIdle(agentId, requestId, decoded) : journal.submit(agentId, requestId, decoded, kind)
-        )
-        if (admitted === null) return yield* new AgentBusyError({ agentId, message: `agent ${agentId} is busy` })
-        const result = admitted
-        yield* crash.hit("submission.after-persist")
-        yield* supervisor.ensureWorker(agentId)
-        yield* supervisor.wake(agentId)
-        return result
+        return yield* Effect.flatMap(Agents, (agents) => agents.submit(agentId, decoded, options.requestId ?? null))
       })
     )
     return new Submission(this.fx, record.id, agentId, record.requestId, created)
   }
 
   /**
-   * Start a new agent from this one's conversation at a turn boundary: by
-   * default its latest checkpoint, or the one written when submission `after`
-   * completed, or checkpoint sequence `checkpoint`. The fork keeps the
-   * runtime, model and working directory unless overridden, then continues
-   * on its own; this agent is not touched. Rejects with `AgentExistsError` if
-   * `id` is taken.
+   * Add guidance to the running turn, like typing while a coding agent
+   * works. It reaches the model at its next request; with no turn running,
+   * it goes to the next one.
    */
-  async fork(id: string, options: ForkSpec = {}): Promise<DurableAgent> {
+  async steer(text: string): Promise<void> {
+    if (text.trim().length === 0) throw new TypeError("steering text cannot be empty")
+    const agentId = this.id
+    await runOn(this.fx, Effect.flatMap(Agents, (agents) => agents.steer(agentId, text)))
+  }
+
+  /** Cancel the turn running now. */
+  cancel(): Promise<void> {
+    const agentId = this.id
+    return runOn(this.fx, Effect.flatMap(Agents, (agents) => agents.cancel(agentId, null)))
+  }
+
+  /**
+   * The agent's current conversation as libfx stream lines: what it has
+   * produced from `after` on, then live events. Each line has a `cursor` to
+   * reconnect from.
+   */
+  events(options: EventsOptions = {}): AsyncIterable<FxStreamLine> {
+    const agentId = this.id
+    return runnerOf(this.fx).stream(Stream.unwrap(Effect.map(Agents, (agents) => agents.events(agentId, options.after ?? 0, options.follow ?? true))))
+  }
+
+  /**
+   * Start a new context: from the next request on, the model no longer sees
+   * this conversation (it stays in its old session). With `summary`, a
+   * handoff, the model sees that text in its instructions instead.
+   */
+  async reset(options: ResetOptions = {}): Promise<void> {
+    const agentId = this.id
+    await runOn(this.fx, Effect.flatMap(Database, (database) => database.run((journal) => journal.resetContext(agentId, options.summary ?? null))))
+  }
+
+  /**
+   * A new agent that continues from this one's conversation as it is now,
+   * with its runtime, model, and working directory unless overridden. Its
+   * documents start as their fork policies say. This agent is not touched.
+   * Rejects with `AgentExistsError` if `id` is taken.
+   */
+  async fork(id: string, options: ForkOptions = {}): Promise<DurableAgent> {
     const sourceId = this.id
     const created = await runOn(
       this.fx,
-      Effect.flatMap(Database, (database) => database.run((journal) => journal.forkAgent(sourceId, id, options)))
+      Effect.gen(function* () {
+        const checkpoint = yield* Effect.flatMap(Agents, (agents) => agents.checkpoint(sourceId))
+        const database = yield* Database
+        return yield* database.run((journal) => journal.forkAgent(sourceId, id, checkpoint.byteLength > 0 ? checkpoint : null, options))
+      })
     )
     if (!created) throw new AgentExistsError({ agentId: id, message: `agent ${id} already exists` })
     return new DurableAgent(this.fx, id)
   }
 
-  /**
-   * Add guidance to the turn that is running now, like typing while a coding
-   * agent works. It is journaled first and reaches the model at its next safe
-   * boundary; if the process dies, the recovered attempt receives it too.
-   * When no turn is running, or the turn finishes before the guidance reaches
-   * it, the text is submitted as a new request instead. Resolves with the
-   * submission that will act on it.
-   */
-  async steer(text: string): Promise<Submission> {
-    if (text.trim().length === 0) throw new TypeError("steering text cannot be empty")
-    if (Buffer.byteLength(text) > MAX_STEERING_BYTES) throw new RangeError(`steering text exceeds ${MAX_STEERING_BYTES} bytes`)
-    const agentId = this.id
-    const outcome = await runOn(this.fx, Effect.flatMap(AgentSupervisor, (supervisor) => supervisor.steer(agentId, text)))
-    if (outcome.kind === "idle" || outcome.kind === "missed") return this.submit(text)
-    return new Submission(this.fx, outcome.submissionId, agentId, null, false)
+  async info(): Promise<DurableAgentRecord> {
+    const agent = await read(this.fx, (storage) => storage.getAgent(this.id))
+    if (!agent) throw new NotFoundError({ entity: "agent", id: this.id })
+    return agent
   }
 
-  /** Persisted events after the cursor, then live events, without gaps. */
-  events(options: EventsOptions = {}): AsyncIterable<DurableEvent> {
-    const agentId = this.id
-    return runnerOf(this.fx).stream(
-      Stream.unwrap(
-        Effect.gen(function* () {
-          const log = yield* EventLog
-          if (options.follow === false) {
-            return Stream.fromIterable(yield* log.history(agentId, options.after ?? 0))
-          }
-          return log.subscribe(agentId, { after: options.after, pollInterval: options.pollInterval })
-        })
-      )
-    )
+  /** The agent's latest requests, newest first. */
+  submissions(limit = 20): Promise<ReadonlyArray<SubmissionRecord>> {
+    return read(this.fx, (storage) => storage.listSubmissions(this.id, limit))
+  }
+
+  /** This agent's token and cost totals, from its finished requests. */
+  async usage(options: UsageOptions = {}): Promise<UsageReport> {
+    return usageOf(await read(this.fx, (storage) => storage.finishedSubmissions(this.id)), options.prices)
+  }
+
+  /** The journaled tool calls under one model call: the call itself first, then its nested calls. */
+  toolCalls(sessionId: string, executionId: string): Promise<ReadonlyArray<ToolCallRecord>> {
+    return read(this.fx, (storage) => storage.toolCallsOf(sessionId, executionId).filter((call) => call.agentId === this.id))
   }
 
   /**
    * Choose this agent's extensions, in order (by object or name), or `null`
    * for its runtime's default. Stored with the agent, and copied to its
-   * forks; applies from its next turn. A selected extension that is not
+   * forks; applies from its next request. A selected extension that is not
    * installed is skipped until it is.
    */
   async setExtensions(extensions: ReadonlyArray<Extension | string> | null): Promise<void> {
@@ -565,7 +487,7 @@ export class DurableAgent {
     await this.updateDocument(ExtensionSelection, () => ({ names }))
   }
 
-  /** The extensions this agent's next turn runs with, in order. */
+  /** The extensions this agent's next request runs with, in order. */
   extensions(): Promise<ReadonlyArray<string>> {
     const agentId = this.id
     return runOn(
@@ -574,116 +496,55 @@ export class DurableAgent {
         const database = yield* Database
         const agent = yield* database.read((storage) => storage.getAgent(agentId))
         if (!agent) return yield* new NotFoundError({ entity: "agent", id: agentId })
-        const runtime = yield* Effect.flatMap(RuntimeRegistry, (registry) => registry.resolve(agent.runtimeId))
-        const configuration = yield* Effect.flatMap(ToolRegistry, (tools) => tools.configure(agent, runtime))
-        return configuration.extensions.map((extension) => extension.name)
+        const toolSet = yield* Effect.flatMap(ToolRegistry, (tools) => tools.toolSet(agent))
+        return toolSet.extensions.map((extension) => extension.name)
       })
     )
   }
 
   /** This agent's value of a document; its initial value if never written. */
-  document<T extends JsonObject>(document: AgentDocument<T>, options: DocumentReadOptions = {}): Promise<T> {
-    return readDocument(this.fx, document, this.id, options)
+  document<T extends JsonObject>(document: AgentDocument<T>): Promise<T> {
+    return readDocument(this.fx, document, this.id)
   }
 
   /**
    * Change this agent's document in one transaction: edit the draft, or
    * return a new value. Resolves with the stored value; rejects with the
-   * update's error, writing nothing. Recorded as `document.updated`.
+   * update's error, writing nothing.
    */
   updateDocument<T extends JsonObject>(document: AgentDocument<T>, update: DocumentUpdate<T>): Promise<T> {
     return writeDocument(this.fx, document, this.id, update)
   }
 
   /**
-   * The document's value now, then each new value as it is written (by this
-   * agent's tools, or `updateDocument`). Values written in quick succession
-   * may arrive as just the latest. Stop by breaking out of the loop.
+   * The document's value now, then each new value written in this process
+   * (by this agent's tools, or `updateDocument`). Values written in quick
+   * succession may arrive as just the latest. Stop by breaking out of the loop.
    */
   watchDocument<T extends JsonObject>(document: AgentDocument<T>): AsyncIterable<T> {
     const agentId = this.id
-    const current = Effect.flatMap(Database, (database) => database.read((storage) => storage.getDocument(agentId, document.kind)))
     return runnerOf(this.fx).stream(
       Stream.unwrap(
         Effect.gen(function* () {
           const database = yield* Database
-          const log = yield* EventLog
-          // The value and the event cursor in one read: later writes arrive as events after it.
-          const start = yield* database.read((storage) => ({
-            record: storage.getDocument(agentId, document.kind),
-            after: storage.lastEventSequence(agentId)
-          }))
-          const updates = log.subscribe(agentId, { after: start.after }).pipe(
-            Stream.filter((event) => event.type === "document.updated" && event.payload.kind === document.kind && event.payload.scope === "agent"),
-            Stream.mapEffect(() => current)
+          const current = database.read((storage) => storage.getDocument(agentId, document.kind))
+          const changes = Stream.callback<void>((queue) =>
+            Effect.acquireRelease(
+              Effect.sync(() =>
+                database.onCommitted((change) => {
+                  if (change.type === "document.updated" && change.agentId === agentId && change.kind === document.kind) Queue.offerUnsafe(queue, undefined)
+                })
+              ),
+              (unsubscribe) => Effect.sync(unsubscribe)
+            )
           )
-          return Stream.concat(Stream.make(start.record), updates).pipe(
+          return Stream.concat(Stream.make(undefined), changes).pipe(
+            Stream.mapEffect(() => current),
             Stream.changesWith((a, b) => (a?.revision ?? 0) === (b?.revision ?? 0)),
             Stream.map((record) => documentValue(document, record))
           )
         })
       )
-    )
-  }
-
-  /** This agent's token and cost totals, from its journaled model requests. A fork counts only its own. */
-  usage(options: UsageOptions = {}): Promise<UsageReport> {
-    const agentId = this.id
-    return runOn(this.fx, Effect.map(Effect.flatMap(EventLog, (log) => log.history(agentId)), (events) => usageOf(events, options.prices)))
-  }
-
-  info(): Promise<DurableAgentRecord> {
-    const id = this.id
-    return runOn(
-      this.fx,
-      Effect.gen(function* () {
-        const database = yield* Database
-        const agent = yield* database.read((storage) => storage.getAgent(id))
-        if (!agent) return yield* new NotFoundError({ entity: "agent", id })
-        return agent
-      })
-    )
-  }
-
-  submissions(limit = 20): Promise<ReadonlyArray<SubmissionRecord>> {
-    return runOn(this.fx, Effect.flatMap(Database, (database) => database.read((storage) => storage.listSubmissions(this.id, limit))))
-  }
-
-  /** The submission made with `requestId`, or null if there is none. */
-  async submission(requestId: string): Promise<Submission | null> {
-    const agentId = this.id
-    const record = await runOn(
-      this.fx,
-      Effect.flatMap(Database, (database) => database.read((storage) => storage.findSubmissionByRequest(agentId, requestId)))
-    )
-    return record ? new Submission(this.fx, record.id, agentId, record.requestId, false) : null
-  }
-
-  /** One journaled task (a tool or model call) of this agent, with its input and output. */
-  task(taskId: string): Promise<TaskRecord> {
-    const agentId = this.id
-    return runOn(
-      this.fx,
-      Effect.gen(function* () {
-        const database = yield* Database
-        const task = yield* database.read((storage) => storage.getTask(taskId))
-        if (!task || task.agentId !== agentId) return yield* new NotFoundError({ entity: "task", id: taskId })
-        return task
-      })
-    )
-  }
-
-  /** Current turn and its task journal, if any. */
-  currentTurn(): Promise<{ readonly turn: TurnRecord; readonly tasks: ReadonlyArray<TaskRecord> } | null> {
-    const id = this.id
-    return runOn(
-      this.fx,
-      Effect.gen(function* () {
-        const database = yield* Database
-        const turn = yield* database.read((storage) => storage.activeTurn(id))
-        if (!turn) return null
-        return { turn, tasks: yield* database.read((storage) => storage.tasksForTurn(turn.id)) }
-      })
     )
   }
 }
@@ -698,73 +559,33 @@ export class Submission {
     readonly created: boolean
   ) {}
 
-  status(): Promise<SubmissionRecord> {
-    const id = this.id
-    return runOn(
-      this.fx,
-      Effect.gen(function* () {
-        const database = yield* Database
-        const record = yield* database.read((storage) => storage.getSubmission(id))
-        if (!record) return yield* new NotFoundError({ entity: "submission", id })
-        return record
-      })
-    )
+  async status(): Promise<SubmissionRecord> {
+    const record = await read(this.fx, (storage) => storage.getSubmission(this.agentId, this.id))
+    if (!record) throw new NotFoundError({ entity: "submission", id: this.id })
+    return record
   }
 
-  /** This submission's durable events, ending once it reaches a terminal state. */
-  events(options: { readonly after?: number } = {}): AsyncIterable<DurableEvent> {
-    const id = this.id
-    const agentId = this.agentId
-    return runnerOf(this.fx).stream(
-      Stream.unwrap(
-        Effect.gen(function* () {
-          const log = yield* EventLog
-          return log.subscribe(agentId, { after: options.after }).pipe(
-            Stream.filter((event) => event.submissionId === id),
-            Stream.takeUntil((event) => TERMINAL_EVENTS.has(event.type))
-          )
-        })
-      )
-    )
+  /** The turn's events as this process follows it, from the start of the turn. Empty when another process runs it. */
+  events(): AsyncIterable<FxStreamLine> {
+    const { agentId, id } = this
+    return runnerOf(this.fx).stream(Stream.unwrap(Effect.map(Agents, (agents) => agents.turnEvents(agentId, id))))
   }
 
   /** Resolve with the result once completed; reject with `SubmissionError` if it failed or was cancelled. */
-  result(): Promise<SubmissionResult> {
-    const id = this.id
-    const agentId = this.agentId
-    return runOn(
-      this.fx,
-      Effect.gen(function* () {
-        const database = yield* Database
-        const log = yield* EventLog
-        const settled = (record: SubmissionRecord | null) =>
-          record !== null && (record.state === "completed" || record.state === "failed" || record.state === "cancelled")
-        let record = yield* database.read((storage) => storage.getSubmission(id))
-        if (!record) return yield* new NotFoundError({ entity: "submission", id })
-        if (!settled(record)) {
-          yield* log.subscribe(agentId).pipe(
-            Stream.filter((event) => event.submissionId === id && TERMINAL_EVENTS.has(event.type)),
-            Stream.runHead,
-            Effect.map(Option.getOrUndefined)
-          )
-          record = yield* database.read((storage) => storage.getSubmission(id))
-        }
-        if (record?.state === "completed" && record.result) return record.result
-        return yield* new SubmissionError({
-          submissionId: id,
-          state: record?.state ?? "unknown",
-          message: record?.error ?? `submission ${record?.state ?? "missing"}`
-        })
-      })
-    )
+  async result(): Promise<SubmissionResult> {
+    const { agentId, id } = this
+    const record = await runOn(this.fx, Effect.flatMap(Agents, (agents) => agents.settled(agentId, id)))
+    if (record.state === "completed" && record.result) return record.result
+    throw new SubmissionError({ submissionId: id, state: record.state, message: record.error ?? record.state })
   }
 
   /**
-   * Request cancellation. Local cancellation does not prove that an external
-   * unsafe effect was cancelled: such tasks are recorded as outcome_unknown.
+   * Cancel this request's turn. Local cancellation does not prove that an
+   * external unsafe effect was cancelled: such calls are recorded as
+   * outcome_unknown.
    */
   cancel(): Promise<void> {
-    const id = this.id
-    return runOn(this.fx, Effect.flatMap(AgentSupervisor, (s) => s.cancel(id)))
+    const { agentId, id } = this
+    return runOn(this.fx, Effect.flatMap(Agents, (agents) => agents.cancel(agentId, id)))
   }
 }

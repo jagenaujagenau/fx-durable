@@ -6,28 +6,17 @@ import { Context, Effect, Layer } from "effect"
  */
 export const CRASH_POINTS = [
   "submission.after-persist",
-  "turn.after-start",
-  "model.before-request",
-  "model.during-stream",
-  "model.after-response",
-  "tool.before-persist",
-  "tool.after-persist",
+  "submission.after-accept",
+  "tool.after-intent",
   "tool.during-execute",
   "tool.after-execute",
-  "tool.after-result-persist",
-  "checkpoint.before-write",
-  "checkpoint.during-write",
-  "checkpoint.after-write",
-  "recovery.started",
-  "recovery.after-classify",
-  "recovery.during-replay",
-  "recovery.before-continue"
+  "tool.after-result-persist"
 ] as const
 
 export type CrashPoint = (typeof CRASH_POINTS)[number]
 
 export interface CrashContext {
-  /** Tool name for tool points, model id for model points. */
+  /** Tool name for tool points. */
   readonly name?: string | undefined
 }
 

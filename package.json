@@ -1,7 +1,7 @@
 {
   "name": "fx-durable",
   "version": "0.2.0",
-  "description": "Durable execution for libfx. Agents should outlive their processes.",
+  "description": "Durable agents on libfx: tool calls with replay policies, documents, subagents, and extensions around libfx's durable sessions.",
   "keywords": [
     "libfx",
     "fx",
@@ -24,10 +24,6 @@
   "license": "MIT",
   "author": "Diego Peralta <hi@diegoperalta.com>",
   "type": "module",
-  "bin": {
-    "fxd": "dist/cli/main.js",
-    "fx-durable": "dist/cli/main.js"
-  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -60,18 +56,15 @@
     "node": ">=22.13"
   },
   "scripts": {
-    "build": "tsc -p . && node scripts/postbuild.mjs",
+    "build": "tsc -p .",
     "typecheck": "tsc --noEmit -p . && tsc -p tsconfig.check.json",
     "test": "vitest run",
-    "demo": "node dist/cli/main.js demo",
-    "fxd": "node dist/cli/main.js",
     "lint": "oxlint",
-    "test:live": "vitest run tests/live",
     "prepublishOnly": "pnpm typecheck && pnpm lint && pnpm build"
   },
   "dependencies": {
     "effect": "4.0.0",
-    "libfx": "0.0.12"
+    "libfx": "0.0.13-dev.1432.g1df91f0b4ebf"
   },
   "devDependencies": {
     "@oxlint/plugins": "1.86.0",

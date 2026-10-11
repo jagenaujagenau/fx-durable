@@ -10,8 +10,9 @@ const workspace = () => mkdtempSync(join(tmpdir(), "fxd-tools-"))
 
 const contextFor = (cwd: string | null, progress: Array<string> = []): DurableToolContext => ({
   agentId: "a",
-  turnId: "t",
-  taskId: "k",
+  sessionId: "s",
+  executionId: "e",
+  submissionId: null,
   cwd,
   idempotencyKey: null,
   signal: new AbortController().signal,
@@ -24,16 +25,16 @@ const contextFor = (cwd: string | null, progress: Array<string> = []): DurableTo
 describe("createCodingTools", () => {
   const tools = createCodingTools()
 
-  it("declares replay policies from what running twice would do", () => {
-    const policies = Object.fromEntries(tools.all.map((t) => [t.name, { replay: t.replay, reuse: t.reuse }]))
+  it("declares replay policies from what running twice would do, and which calls must not overlap", () => {
+    const policies = Object.fromEntries(tools.all.map((t) => [t.name, { replay: t.replay, writes: t.writes }]))
     expect(policies).toEqual({
-      read_file: { replay: "safe", reuse: false },
-      write_file: { replay: "safe", reuse: true },
-      edit_file: { replay: "safe", reuse: true },
-      list_files: { replay: "safe", reuse: false },
-      glob: { replay: "safe", reuse: false },
-      grep: { replay: "safe", reuse: false },
-      bash: { replay: "unsafe", reuse: true }
+      read_file: { replay: "safe", writes: false },
+      write_file: { replay: "safe", writes: true },
+      edit_file: { replay: "safe", writes: true },
+      list_files: { replay: "safe", writes: false },
+      glob: { replay: "safe", writes: false },
+      grep: { replay: "safe", writes: false },
+      bash: { replay: "unsafe", writes: true }
     })
     expect(tools.readOnly.map((t) => t.name)).toEqual(["read_file", "list_files", "glob", "grep"])
   })

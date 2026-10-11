@@ -2,86 +2,55 @@
 
 ## Unreleased
 
+fx-durable is rebuilt on libfx's durable sessions (the next libfx release; until it ships, fx-durable pins
+`libfx@0.0.13-dev.1432.g1df91f0b4ebf`). libfx now keeps each conversation itself: it stores every step of a turn,
+continues a turn a crash cut off, queues requests, and replays events. fx-durable drops its own versions of those and
+keeps what libfx does not do.
+
 ### Breaking
 
-- Custom `Storage` implementations must persist `TaskRecord.callerTaskId` and `callKey` (nested tool calls). SQLite
-  migrates itself (migration 3); the storage contract checks them.
-- `Storage` gains documents (`getDocument`, `putDocument`, `insertDocumentRevision`, `documentAsOf`,
-  `agentDocuments`) and `lastEventSequence`. SQLite adds the tables (migration 5); the storage contract checks them.
-- `ToolRegistry` (`fx-durable/effect`) needs `Database` and `RuntimeRegistry`, has `configure`, and its resolved
-  tools carry the composed `hooks`.
-- `DurableToolContext` has `documents`; code that builds a tool context by hand must provide it.
-- `Storage` gains `abandonedTasks()`: interrupted tool tasks of ended turns that no task retries. SQLite adds an
-  index for it (migration 4); the storage contract checks it.
-- `DurableTool` has an `abandon` field (null unless set), and `AgentSupervisor` (`fx-durable/effect`) an `abandon`
-  method.
-- `ToolCall` (hooks) has a `caller` field, and `ToolExecutor.execute`/`replay` (`fx-durable/effect`) take the
-  agent's tools.
-- Custom `Storage` implementations must persist two new fields: `SubmissionRecord.kind` (`"input"`, `"reset"` or
-  `"compaction"`) and `AgentCheckpoint.summary` (string or null). SQLite storage migrates itself (migration 2), and
-  the storage contract checks both.
-
-### Changed
-
-- An idempotent call cut off by `fx.close()` is now recorded as `interrupted`, as after a crash, so the recovered
-  turn retries it with the same key. It used to be recorded as `outcome_unknown`: a repeat call was refused once,
-  then ran with a new key, and for a subagent that started a second child.
-- A tool's abort signal carries a reason: `"cancelled"`, or `"executor_lost"` when the process is stopping.
-- **A storage error now closes fx-durable** instead of being logged and retried. The call that hit it rejects with
-  the `StorageError`; calls that were waiting or come later reject with the new `DurableFxFailedError`. Reopening
-  recovers from what was committed.
-- A duplicate `requestId` that loses a race to another process is resolved in the Journal, so it never surfaces as a
-  storage error.
-
-### Fixed
-
-- Registering a runtime again under the same id now reaches agents with a live session from their next turn. Before,
-  they kept the old tools and instructions until the process restarted.
-
-- `fx.close()` cancelled running subagents: the subagent tool cancelled its child whenever its signal aborted, and
-  stopping aborts in-flight calls. The child now keeps running, and the call resumes it after the restart.
+- **New storage.** fx-durable 0.2 databases are refused (their conversations lived in libfx checkpoints that libfx
+  sessions don't read); open a new one. `Storage` now holds agents, requests, a tool-call journal, and documents; the
+  storage contract checks it. libfx keeps conversations in session stores: by default a directory per tool set next
+  to the SQLite file. `DurableFx.open({ durability })` takes a libfx durability, or a function from a store's name to
+  one.
+- **Recovery is libfx's.** A crashed turn continues from its last step instead of being re-prompted with a summary.
+  Opening fx-durable prompts every unfinished request again under its `messageId`.
+- **Events are libfx's stream lines.** `agent.events({ after })` reads the agent's session from a `cursor`;
+  `submission.events()` gives the events of a turn this process follows. The fx-durable event log is gone.
+- **Removed:** the `fxd` CLI and demo; compaction (`agent.compact()`, `RuntimeDefinition.compaction`); the turn,
+  model-call, and checkpoint journal; `whenBusy: "reject"`; `agent.currentTurn()` and `agent.task()` (use
+  `agent.toolCalls()`); tool options `reuse`, `resumeOnCall`, and `abandon` (libfx runs interrupted calls again
+  itself); `RuntimeDefinition.createMcpClients`; rewindable documents and forking from an earlier request.
+- `DurableToolContext` has `sessionId`, `executionId`, and `submissionId` instead of `turnId` and `taskId`.
+  `ToolCall.caller` names the calling call's id. `ToolExecutionError` and `UnknownOutcomeError` carry `callId`.
+- `usage()` totals finished turns (`turns` instead of `requests` and `failedRequests`).
 
 ### Added
 
-- **Tools calling tools:** `context.executeTool(name, input, { key })`. A nested call is a durable task owned by its
-  caller, with hooks and its own replay policy; a caller that runs again after a crash gets its journaled nested
-  calls back by key. Calls left running when the caller returns are aborted. Two crash-matrix cases cover it.
-- **Documents:** `defineDocument({ kind, version, scope: "agent" | "global", initial, migrate?, history?, fork? })`
-  for typed JSON state. A tool's `documents.update()` commits in the same transaction as its result (none on failure,
-  once on replay); updates run again at commit so parallel calls compose. `agent.document()`,
-  `agent.updateDocument()`, `agent.watchDocument()`, `fx.document()`, `fx.updateDocument()`. Rewindable documents
-  read as of a checkpoint and fork as of it; versioned values migrate on read. Writes are `document.updated` events.
-- **Extensions:** `defineExtension({ name, tools, instructions, hooks })`. `RuntimeDefinition.extensions` sets the
-  default for a runtime's agents; `agent.setExtensions()` sets an agent's own choice, which is stored and copied to
-  forks. `fx.installExtension()` replaces an extension by name (a reload); `fx.uninstallExtension()` removes it.
-  Instructions can be rendered before each turn, from documents. Hooks compose in order. Changes apply from the next
-  turn.
-- **Abandoned calls:** when a turn ends without calling an interrupted call again, the tool's `abandon` hook runs
-  (at the next `resume()` if the process died first, retried until it succeeds) and the call is recorded as
-  cancelled (`tool.abandoned`). Subagents use it to cancel the child's request, so a recovered turn that moves on
-  leaves no orphaned subagent running.
-- `agent.submission(requestId)`: the submission made with that request id, or null.
-- `callers: "model" | "tools" | "both"` on tools; `"tools"` tools are not offered to the model.
-- `fx.taskGraph()`: running work across agents with owner links (nested calls, subagents), plus queued requests.
-- **Reset and handoff:** `agent.reset({ summary? })` starts a new context. With a summary, the model sees it in its
-  instructions until the next reset. Queued like a request; recorded as `context.reset`.
-- **Compaction:** `agent.compact({ instructions? })` asks the model for a summary and continues from it. It is a
-  journaled turn (crash-safe, counted in `usage()`), with the agent's tools visible but not runnable.
-  `RuntimeDefinition.compaction: { maxContextTokens, instructions? }` compacts automatically, before the next queued
-  request.
-- Steering sent during a reset or compaction is submitted as a new request instead of joining it.
+- **A tool-call journal keyed by libfx's `executionId`.** Every tool call is journaled before it runs and its result
+  after. When libfx runs a call again after a crash, a completed call answers from the journal, a safe or idempotent
+  one runs again (with the same idempotency key), and an unsafe one is recorded as `outcome_unknown`. Unsafe tools
+  are declared to libfx as not idempotent, so libfx never runs them twice.
+- **Tools calling tools** (`context.executeTool(name, input, { key })`), journaled under their caller and answered
+  from the journal when the caller runs again; `callers: "model" | "tools" | "both"`.
+- **Documents** (`defineDocument`): typed JSON per agent or global, written by tools in the same transaction as their
+  result, versioned with `migrate`, watched with `agent.watchDocument()`, and copied to forks by policy.
+- **Extensions** (`defineExtension`): tools, instructions (rendered before each request, e.g. from documents), and
+  hooks. Runtimes list defaults, agents choose their own, and `fx.installExtension()` reloads one by name. An agent
+  whose tools change continues its conversation in a new session.
+- `writes: true` on tools that must not run alongside others; the coding tools that write set it.
+- `fx-durable/tools`: `createCodingTools()` (`read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`,
+  `bash`).
+- `openMemoryStorage()`, `agent.usage()` / `fx.usage()` with prices, `fx.taskGraph()` (running requests and tool
+  calls with what each runs for), `agent.toolCalls(sessionId, executionId)`.
+- `scriptedModel` requests have `allToolResults`, for scripts that must survive libfx's resume messages.
+- `tests/libfx/`: the libfx behaviors fx-durable relies on, checked against libfx alone.
 
-- `fx.closed`: settles with `{ reason: "closed" }` after `close()`, or `{ reason: "failed", error }` after a storage
-  error. `DatabaseInterface.onFailure` (`fx-durable/effect`) reports the first storage error.
-- `agent.usage({ prices })` and `fx.usage({ prices })`: token and cost totals per model, folded from the event log.
-  `model.completed` events now also record `cacheReadTokens`, `cacheWriteTokens`, and `reasoningTokens`.
-- `fx-durable/tools`: `createCodingTools()` with `read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`,
-  and `bash`, with replay policies chosen per tool.
-- `DurableToolContext.cwd`: the agent's working directory.
-- `openMemoryStorage()`: in-memory `Storage` that passes the storage contract (except durability).
-- `ScriptedResponse.usage` in `fx-durable/testing`, to script token counts.
-- `tests/libfx/`: the libfx checkpoint behavior fx-durable relies on (restoring with other tools, instructions, or
-  model; the v1 checkpoint format), so a libfx upgrade that changes it fails the suite.
+### Fixed
+
+- A tool call whose input JSON has line breaks no longer crashes the process: fx-durable re-serializes it before
+  libfx's native backend sees it (vercel-labs/fx#1215).
 
 ## 0.2.0
 

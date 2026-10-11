@@ -1,531 +1,387 @@
-import { Cause, Context, Effect, Exit, Layer } from "effect"
+import { Context, Effect, Layer, Schema } from "effect"
+import type { FxHostTool, FxToolContext } from "libfx"
 import { CrashInjector } from "./crash.js"
-import { PROGRESS_MS } from "./model.js"
-import {
-  InterruptedError,
-  ToolBlockedError,
-  ToolExecutionError,
-  UnknownOutcomeError,
-  type NotFoundError,
-  type StorageError
-} from "../domain/errors.js"
-import { IdGenerator } from "./ids.js"
 import { Database } from "./database.js"
-import type { TaskRecord, UnknownOutcomeReason } from "../domain/schema.js"
-import { effectiveTask, unknownOutcomeNotice } from "../domain/tool-outcomes.js"
-import type { Json, JsonObject } from "../domain/json.js"
+import { ToolBlockedError, ToolExecutionError, UnknownOutcomeError } from "../domain/errors.js"
+import { canonicalJson, type Json, type JsonObject } from "../domain/json.js"
 import { applyUpdate, DocumentUpdateFailed, documentValue, ownValue, type DurableDocument } from "../domain/documents.js"
-import { hashInput, type TurnContext } from "./turn-context.js"
-import { OutcomeUnknown, type DocumentAccess, type DurableTool } from "../tools/define-tool.js"
+import type { StagedDocumentWrite } from "../durable/journal.js"
+import type { ToolCallKey } from "../durable/storage.js"
+import type { ToolCallRecord } from "../domain/schema.js"
+import { OutcomeUnknown, type DocumentAccess, type DurableTool, type NestedCallOptions } from "../tools/define-tool.js"
 import type { ToolCall, ToolHookContext, ToolHooks } from "../tools/hooks.js"
 import { idempotencyKeyFor, policyName } from "../tools/replay-policy.js"
+import { ToolRegistry } from "./tool-registry.js"
 
 /**
- * Write-ahead tool execution:
+ * Runs tool calls between libfx and the tools, with fx-durable's journal in
+ * the middle.
  *
- *   persist intent (running) → commit → execute effect → persist result → commit
+ * libfx records each step of a turn and, after a crash, continues the turn.
+ * A replay-safe or idempotent call that was cut off runs again under the same
+ * `executionId`; the journal (keyed by session, `executionId`, and nested
+ * key) decides what that rerun means:
  *
- * If the process dies between the external effect and the result commit,
- * recovery finds a running task and classifies it by its persisted policy.
+ *   - completed or failed before the crash → the recorded outcome, nothing runs;
+ *   - started but unfinished, replay-safe or idempotent → run again;
+ *   - started but unfinished, unsafe → outcome_unknown (a nested call, whose
+ *     caller runs again).
+ *
+ * An unsafe call the model made is never run again by libfx: the model is
+ * told it may have partly run, and when the turn ends the journal records
+ * its outcome as unknown.
+ *
+ * A fresh call runs `beforeTool`, records its intent, runs, then commits its
+ * result together with its document writes.
  */
 
-export type ToolCallError = ToolExecutionError | ToolBlockedError | UnknownOutcomeError | InterruptedError | StorageError | NotFoundError
-
-/** The agent's tools and hooks, which tools reach through `context.executeTool`. */
+/** The tools one agent can run, with its hooks. */
 export interface ToolSet {
   readonly byName: ReadonlyMap<string, DurableTool>
   readonly hooks: ToolHooks | undefined
 }
 
+/** What libfx passes as a turn's `context`: who the call is for. */
+export const CallContext = Schema.Struct({
+  agentId: Schema.String,
+  submissionId: Schema.NullOr(Schema.String),
+  cwd: Schema.NullOr(Schema.String)
+})
+export type CallContext = typeof CallContext.Type
+const decodeCallContext = Schema.decodeUnknownSync(CallContext)
+
 export interface ToolExecutorInterface {
-  /** Execute a model-requested tool call within a turn attempt. */
-  readonly execute: (ctx: TurnContext, tool: DurableTool, input: Json, tools: ToolSet) => Effect.Effect<Json, ToolCallError>
-  /** Recovery: replay an interrupted replay-safe/idempotent task as a child task. */
-  readonly replay: (task: TaskRecord, tool: DurableTool, tools: ToolSet, submissionId: string) => Effect.Effect<TaskRecord, StorageError | NotFoundError>
-}
-
-/** Where a call runs: its turn, and what nested calls can reach. */
-interface CallScope extends ToolSet {
-  readonly agentId: string
-  readonly submissionId: string
-  readonly turnId: string
-  readonly attempt: number
-  readonly interruptReason: () => UnknownOutcomeReason
-}
-
-/** A nested call's origin: the tool task that made it, and its key among that task's calls. */
-interface Caller {
-  readonly task: TaskRecord
-  readonly key: string
+  /**
+   * libfx descriptors for the tools a session store's agents are offered. A
+   * call runs the calling agent's own code and hooks for that tool, as its
+   * tool set is at the time of the call.
+   */
+  readonly hostTools: (offered: ReadonlyArray<DurableTool>) => ReadonlyArray<FxHostTool>
 }
 
 export class ToolExecutor extends Context.Service<ToolExecutor, ToolExecutorInterface>()("fx-durable/ToolExecutor") {}
 
-/** Tool progress keeps its last 64 KiB (as characters). */
 const MAX_PROGRESS_CHARS = 64 * 1024
+const PROGRESS_MS = 100
 
 const errorMessage = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause))
 
-export { effectiveTask, unknownOutcomeNotice }
+export const unknownOutcomeNotice = (tool: string, input: Json): string =>
+  [
+    `The previous \`${tool}\` operation was interrupted.`,
+    `Input: ${JSON.stringify(input)}`,
+    "It may or may not have completed successfully.",
+    "Do not repeat it blindly.",
+    "Inspect the current system state before deciding what to do."
+  ].join("\n")
+
+const callIdOf = (key: ToolCallKey) => (key.callKey ? `${key.sessionId}/${key.executionId}/${key.callKey}` : `${key.sessionId}/${key.executionId}`)
+
+/** Where a call runs: one model call (`executionId`) of one agent's session. */
+interface CallScope extends ToolSet {
+  readonly agentId: string
+  readonly sessionId: string
+  readonly executionId: string
+  readonly submissionId: string | null
+  readonly cwd: string | null
+}
+
+interface Caller {
+  readonly tool: string
+  readonly key: ToolCallKey
+}
 
 export const layer = Layer.effect(
   ToolExecutor,
   Effect.gen(function* () {
     const database = yield* Database
-    const ids = yield* IdGenerator
     const crash = yield* CrashInjector
+    const registry = yield* ToolRegistry
 
-    /** Run the tool body for a task that is already durably `running`. */
-    const runTask = (
-      task: TaskRecord,
-      tool: DurableTool,
-      input: Json,
-      scope: CallScope,
-      options: {
-        readonly replay: boolean
-        /** Replace a successful result before it is journaled (the `afterTool` hook). */
-        readonly afterTool?: (output: Json) => Promise<Json | undefined>
+    const read = <A>(f: Parameters<typeof database.read<A>>[0]) => Effect.runPromise(database.read(f))
+    const hit = (point: string, name: string) => Effect.runPromise(crash.hit(point, { name }))
+
+    const hookContext = (scope: CallScope, signal: AbortSignal): ToolHookContext => ({
+      agentId: scope.agentId,
+      sessionId: scope.sessionId,
+      executionId: scope.executionId,
+      submissionId: scope.submissionId,
+      signal
+    })
+
+    /** The outcome a call already has in the journal, if it settled. */
+    const settled = (record: ToolCallRecord): Json => {
+      const callId = callIdOf(record)
+      switch (record.state) {
+        case "completed":
+          return record.output
+        case "failed":
+          throw new ToolExecutionError({ callId, tool: record.name, message: record.error ?? "tool failed" })
+        case "outcome_unknown":
+          throw new UnknownOutcomeError({ callId, tool: record.name, message: unknownOutcomeNotice(record.name, record.input) })
+        case "running":
+          throw new Error("unreachable: a running call has not settled")
       }
-    ): Effect.Effect<Json, ToolExecutionError | UnknownOutcomeError | StorageError | NotFoundError> =>
-      Effect.gen(function* () {
-        const startedAt = new Date()
-        const controller = new AbortController()
-        const settled = { done: false }
+    }
 
-        // Nested calls: each runs as its own durable task, owned by this one.
-        // Calls still running when this one settles are aborted.
-        const nestedAbort = new AbortController()
-        const nestedRunning = new Set<Promise<Json>>()
-        let nestedOrdinal = 0
-        const executeTool = (name: string, nestedInput: Json, callOptions: { readonly key?: string } = {}): Promise<Json> => {
-          if (settled.done) return Promise.reject(new Error(`${tool.name} has returned; it can no longer call ${name}`))
-          const caller: Caller = { task, key: callOptions.key ?? String(nestedOrdinal++) }
-          const signal = AbortSignal.any([controller.signal, nestedAbort.signal])
-          const promise = Effect.runPromiseExit(callNested(caller, name, nestedInput, scope), { signal }).then((exit) => {
-            if (Exit.isSuccess(exit)) return exit.value
-            const failure = exit.cause.reasons.find((r) => r._tag === "Fail")
-            if (failure && failure._tag === "Fail") throw failure.error
-            if (Cause.hasInterruptsOnly(exit.cause)) throw new Error(`nested call ${name} was cancelled`)
-            throw Cause.squash(exit.cause)
-          })
-          nestedRunning.add(promise)
-          promise.finally(() => nestedRunning.delete(promise)).catch(() => undefined)
-          return promise
-        }
-        const settleNested = Effect.promise(() => {
-          nestedAbort.abort()
-          return Promise.allSettled(nestedRunning)
-        })
+    /** Calls running in this process, by `callIdOf` (a call from a dead process is not among them). */
+    const live = new Set<string>()
 
-        // Document writes, staged in call order and committed with the result.
-        type Step = (value: JsonObject) => JsonObject
-        const staged = new Map<string, { readonly document: DurableDocument<JsonObject>; readonly steps: Array<Step> }>()
-        const ownerOf = (document: DurableDocument<JsonObject>) => (document.scope === "agent" ? task.agentId : null)
-        const readDocument = async <T extends JsonObject>(document: DurableDocument<T>): Promise<T> => {
-          const record = await Effect.runPromise(database.read((storage) => storage.getDocument(ownerOf(document), document.kind)))
-          const steps = staged.get(`${document.scope}:${document.kind}`)?.steps ?? []
-          return ownValue(document, steps.reduce<JsonObject>((value, step) => step(value), documentValue(document, record)))
-        }
-        const documents: DocumentAccess = {
-          get: (document) => readDocument(document),
-          update: async (document, update) => {
-            if (settled.done) throw new Error(`${tool.name} has returned; it can no longer update ${document.kind}`)
-            // Fail here, in the tool, rather than at commit.
-            const value = applyUpdate(document, await readDocument(document), update)
-            const key = `${document.scope}:${document.kind}`
-            const entry = staged.get(key) ?? { document, steps: [] }
-            entry.steps.push((current) => applyUpdate(document, ownValue(document, current), update))
-            staged.set(key, entry)
-            return value
-          }
-        }
+    /**
+     * libfx (until a release that stores an idempotent call before running it)
+     * can lose a call a crash cut off right as it started: the continued turn
+     * asks the model again, which calls again under a new `executionId`. Such a
+     * call takes over the journal entry of the lost one, matched by request,
+     * tool, and input, so its nested calls and idempotency key carry over.
+     */
+    const lostCall = async (scope: CallScope, tool: DurableTool, input: Json): Promise<ToolCallRecord | undefined> => {
+      if (scope.submissionId === null) return undefined
+      const running = await read((storage) => storage.runningToolCalls())
+      return running.find(
+        (row) =>
+          row.callKey === "" &&
+          row.agentId === scope.agentId &&
+          row.sessionId === scope.sessionId &&
+          row.submissionId === scope.submissionId &&
+          row.executionId !== scope.executionId &&
+          row.name === tool.name &&
+          canonicalJson(row.input) === canonicalJson(input) &&
+          !live.has(callIdOf(row))
+      )
+    }
 
-        // Tool output reported while it runs, journaled at most every PROGRESS_MS.
-        let progress = ""
-        let pending: ReturnType<typeof setTimeout> | null = null
-        const flushProgress = () => {
-          pending = null
-          Effect.runFork(database.run((journal) => journal.recordProgress(task.id, progress)).pipe(Effect.ignore))
-        }
-        const reportProgress = (chunk: string) => {
-          if (settled.done || chunk.length === 0) return
-          progress = (progress + chunk).slice(-MAX_PROGRESS_CHARS)
-          pending ??= setTimeout(flushProgress, PROGRESS_MS)
-        }
-
-        const body = Effect.gen(function* () {
-          const agent = yield* database.read((storage) => storage.getAgent(task.agentId))
-          // Start the external effect, then hit the "during" crash point while it is in flight.
-          const promise = yield* Effect.sync(() =>
-            tool.run(input, {
-              agentId: task.agentId,
-              turnId: task.turnId,
-              taskId: task.id,
-              cwd: agent?.cwd ?? null,
-              idempotencyKey: task.idempotencyKey,
-              signal: controller.signal,
-              replay: options.replay,
-              progress: reportProgress,
-              executeTool,
-              documents
-            })
-          )
-          promise.catch(() => undefined)
-          yield* crash.hit("tool.during-execute", { name: tool.name })
-          return yield* Effect.tryPromise({ try: () => promise, catch: (cause) => cause }).pipe(Effect.exit)
-        })
-
-        const exit = yield* body.pipe(
-          Effect.onInterrupt(() =>
-            Effect.gen(function* () {
-              if (settled.done) return
-              controller.abort(scope.interruptReason())
-              yield* settleNested
-              const current = yield* database.read((storage) => storage.getTask(task.id))
-              if (!current || current.state !== "running") return
-              // Local cancellation does not prove an external unsafe effect was cancelled.
-              if (task.replayPolicy === "safe") {
-                yield* database.run((journal) => journal.transitionTask(task.id, "cancelled", { error: "cancelled" }, { type: "tool.cancelled", payload: { tool: tool.name } }))
-              } else if (task.replayPolicy === "idempotent") {
-                // As after a crash: a retry with the same key resumes the work (or the call is abandoned).
-                const reason = scope.interruptReason()
-                yield* database.run((journal) => journal.transitionTask(task.id, "interrupted", { error: reason }, {
-                  type: "tool.interrupted",
-                  payload: { tool: tool.name, input, replay: task.replayPolicy, action: "retry_with_same_key", reason }
-                }))
-              } else {
-                const reason = scope.interruptReason()
-                yield* database.run((journal) => journal.transitionTask(
-                  task.id,
-                  "outcome_unknown",
-                  { error: `interrupted: ${reason}` },
-                  {
-                    type: "tool.outcome_unknown",
-                    payload: { tool: tool.name, input, startedAt: startedAt.toISOString(), reason }
-                  }
-                ))
-              }
-            }).pipe(Effect.orDie)
-          )
-        )
-        settled.done = true
-        if (pending) clearTimeout(pending)
-        yield* settleNested
-
-        if (Exit.isSuccess(exit)) {
-          yield* crash.hit("tool.after-execute", { name: tool.name })
-          const afterTool = options.afterTool
-          // A failing afterTool keeps the original result: the effect already happened.
-          const replaced = afterTool
-            ? yield* Effect.promise(() => afterTool(exit.value).catch(() => undefined))
-            : undefined
-          const output = replaced ?? exit.value
-          const durationMs = Date.now() - startedAt.getTime()
-          // The result and the call's document writes commit together. Updates run again here, on the current values.
-          const rejected = yield* database.run((journal) => {
-            try {
-              journal.transaction(() => {
-                const origin = { agentId: task.agentId, turnId: task.turnId, taskId: task.id }
-                for (const { document, steps } of staged.values()) {
-                  journal.updateDocument(document, ownerOf(document), [(draft) => steps.reduce<JsonObject>((value, step) => step(value), draft)], origin)
-                }
-                journal.transitionTask(
-                  task.id,
-                  "completed",
-                  { output, metadata: { durationMs, replay: options.replay } },
-                  { type: "tool.completed", payload: { tool: tool.name, input, durationMs, replay: options.replay } }
-                )
-              })
-              return null
-            } catch (cause: unknown) {
-              if (cause instanceof DocumentUpdateFailed) return cause.message
-              throw cause
-            }
-          })
-          if (rejected !== null) return yield* failTask(task, tool, rejected)
-          yield* crash.hit("tool.after-result-persist", { name: tool.name })
-          return output
-        }
-
-        const cause = exit.cause
-        const failure = cause.reasons.find((r) => r._tag === "Fail")
-        const error = failure && failure._tag === "Fail" ? failure.error : cause
-        if (error instanceof OutcomeUnknown) {
-          yield* database.run((journal) => journal.transitionTask(
-            task.id,
-            "outcome_unknown",
-            { error: error.message },
-            {
-              type: "tool.outcome_unknown",
-              payload: { tool: tool.name, input, startedAt: startedAt.toISOString(), reason: error.reason }
-            }
-          ))
-          return yield* new UnknownOutcomeError({
-            taskId: task.id,
+    /** Run one call: the model's (`callKey` ""), or a nested one. */
+    const call = async (scope: CallScope, tool: DurableTool, requested: Json, callKey: string, caller: Caller | null, signal: AbortSignal): Promise<Json> => {
+      if (callKey === "") {
+        const lost = await lostCall(scope, tool, requested)
+        if (lost) return call({ ...scope, executionId: lost.executionId }, tool, requested, "", caller, signal)
+      }
+      const key: ToolCallKey = { sessionId: scope.sessionId, executionId: scope.executionId, callKey }
+      const existing = await read((storage) => storage.getToolCall(key))
+      if (existing) {
+        if (existing.name !== tool.name || (caller && canonicalJson(existing.input) !== canonicalJson(requested))) {
+          throw new ToolExecutionError({
+            callId: callIdOf(key),
             tool: tool.name,
-            message: unknownOutcomeNotice(tool.name, input)
+            message: `nested call key ${callKey} was used by another call (${existing.name}); give each call its own key`
           })
         }
-        return yield* failTask(task, tool, errorMessage(error))
-      })
-
-    const failTask = (task: TaskRecord, tool: DurableTool, message: string) =>
-      Effect.gen(function* () {
-        yield* database.run((journal) => journal.transitionTask(
-          task.id,
-          "failed",
-          { error: message },
-          { type: "tool.failed", payload: { tool: tool.name, error: message } }
-        ))
-        return yield* new ToolExecutionError({ taskId: task.id, tool: tool.name, message })
-      })
-
-    /** Journal the intent of a new call (after `beforeTool` allows it), then run it. */
-    const runFresh = (
-      scope: CallScope,
-      tool: DurableTool,
-      requested: Json,
-      inputHash: string,
-      parentTaskId: string | null,
-      caller: Caller | null,
-      /** Retrying an interrupted idempotent call: keep its idempotency key. */
-      retryKey: string | null = null
-    ) =>
-      Effect.gen(function* () {
-        const submission = yield* database.read((storage) => storage.getSubmission(scope.submissionId))
-        if (submission?.cancelRequested) {
-          return yield* new InterruptedError({ message: "submission cancellation requested" })
+        if (existing.state !== "running") return settled(existing)
+        // It started before a crash.
+        if (policyName(tool.replay) === "unsafe") {
+          database.runSync((journal) => journal.markToolCallUnknown(key, "process_terminated"))
+          return settled({ ...existing, state: "outcome_unknown" })
         }
-        const hookContext = (signal: AbortSignal): ToolHookContext => ({
+        const restarted = database.runSync((journal) => journal.restartToolCall(key))
+        return run(scope, tool, restarted.input, restarted, caller, signal)
+      }
+
+      const request: ToolCall = { name: tool.name, input: requested, caller: caller ? { tool: caller.tool, callId: callIdOf(caller.key) } : null }
+      const decision = scope.hooks?.beforeTool ? await scope.hooks.beforeTool(request, hookContext(scope, signal)) : undefined
+      if (decision && "block" in decision) throw new ToolBlockedError({ tool: tool.name, message: decision.block })
+      const input = decision ? decision.input : requested
+      const record = database.runSync((journal) =>
+        journal.startToolCall({
+          ...key,
           agentId: scope.agentId,
           submissionId: scope.submissionId,
-          turnId: scope.turnId,
-          signal
-        })
-        const call = (input: Json): ToolCall => ({
           name: tool.name,
           input,
-          caller: caller ? { taskId: caller.task.id, tool: caller.task.name ?? "" } : null
+          replayPolicy: policyName(tool.replay),
+          idempotencyKey: idempotencyKeyFor(tool.replay, callIdOf(key), input)
         })
-        // beforeTool runs before the intent is journaled: until it allows the
-        // call, nothing has started, and a crash here leaves nothing to recover.
-        let input = requested
-        const beforeTool = scope.hooks?.beforeTool
-        if (beforeTool) {
-          const decision = yield* Effect.tryPromise({
-            try: async (signal) => beforeTool(call(requested), hookContext(signal)),
-            catch: (cause) => new ToolBlockedError({ tool: tool.name, message: `beforeTool failed: ${errorMessage(cause)}` })
-          })
-          if (decision && "block" in decision) {
-            yield* database.run((journal) => journal.appendEvent({
-              agentId: scope.agentId,
-              submissionId: scope.submissionId,
-              turnId: scope.turnId,
-              type: "tool.blocked",
-              payload: { tool: tool.name, input: requested, reason: decision.block, callerTaskId: caller?.task.id ?? null }
-            }))
-            return yield* new ToolBlockedError({ tool: tool.name, message: decision.block })
-          }
-          if (decision) input = decision.input
-        }
-        yield* crash.hit("tool.before-persist", { name: tool.name })
-        const id = ids.next("task")
-        const policy = policyName(tool.replay)
-        const task = yield* database.run((journal) => journal.startTask({
-          id,
-          turnId: scope.turnId,
-          agentId: scope.agentId,
-          type: "tool",
-          name: tool.name,
-          input,
-          inputHash,
-          parentTaskId,
-          callerTaskId: caller?.task.id ?? null,
-          callKey: caller?.key ?? null,
-          replayPolicy: policy,
-          idempotencyKey: retryKey ?? idempotencyKeyFor(tool.replay, id, input),
-          attempt: scope.attempt,
-          event: { type: "tool.started", payload: { tool: tool.name, input, replay: policy, callerTaskId: caller?.task.id ?? null } }
-        }))
-        yield* crash.hit("tool.after-persist", { name: tool.name })
-        const afterTool = scope.hooks?.afterTool
-        return yield* runTask(task, tool, input, scope, {
-          replay: false,
-          afterTool: afterTool
-            ? async (output) => afterTool(call(input), output, hookContext(new AbortController().signal))
-            : undefined
-        })
-      })
-
-    /**
-     * Continue a call journaled by an earlier attempt (`slot`), or run it fresh:
-     * completed work is answered from the journal, an unknown outcome is refused
-     * once, and interrupted or cancelled calls run again.
-     */
-    const resumeOrRun = (scope: CallScope, tool: DurableTool, input: Json, inputHash: string, slot: TaskRecord | undefined, tasks: ReadonlyArray<TaskRecord>, caller: Caller | null) =>
-      Effect.gen(function* () {
-        if (!slot) return yield* runFresh(scope, tool, input, inputHash, null, caller)
-        const effective = effectiveTask(slot, tasks)
-        // Observation tools re-read current state rather than return what they saw before the crash.
-        if (!tool.reuse && (effective.state === "completed" || effective.state === "failed")) {
-          return yield* runFresh(scope, tool, input, inputHash, caller ? effective.id : null, caller)
-        }
-        switch (effective.state) {
-          case "completed": {
-            yield* database.run((journal) => journal.appendEvent({
-              agentId: scope.agentId,
-              submissionId: scope.submissionId,
-              turnId: scope.turnId,
-              taskId: effective.id,
-              type: "tool.reused",
-              payload: { tool: tool.name, input, state: "completed" }
-            }))
-            return effective.output
-          }
-          case "failed": {
-            yield* database.run((journal) => journal.appendEvent({
-              agentId: scope.agentId,
-              submissionId: scope.submissionId,
-              turnId: scope.turnId,
-              taskId: effective.id,
-              type: "tool.reused",
-              payload: { tool: tool.name, input, state: "failed" }
-            }))
-            return yield* new ToolExecutionError({
-              taskId: effective.id,
-              tool: tool.name,
-              message: effective.error ?? "tool failed"
-            })
-          }
-          case "outcome_unknown": {
-            if (!effective.acknowledged) {
-              // Unsafe effects are never blindly replayed. Refuse once, explicitly;
-              // a deliberate second call after inspection executes normally.
-              yield* database.run((journal) => journal.refuseUnknownOutcomeRepeat(effective, scope.submissionId, input))
-              return yield* new UnknownOutcomeError({
-                taskId: effective.id,
-                tool: tool.name,
-                message: `${unknownOutcomeNotice(tool.name, input)}\nThis call was NOT executed. If, after inspecting state, you still need it, call the tool again.`
-              })
-            }
-            return yield* runFresh(scope, tool, input, inputHash, effective.id, caller)
-          }
-          case "cancelled":
-            return yield* runFresh(scope, tool, input, inputHash, effective.id, caller)
-          case "interrupted":
-            // Not replayed during recovery (resumeOnCall, a missing tool, or a nested call):
-            // an idempotent call retries with its original key, so it resumes the same work.
-            return yield* runFresh(scope, tool, input, inputHash, effective.id, caller, effective.idempotencyKey)
-          case "pending":
-          case "running":
-            // Recovery classifies every unfinished task before a new attempt starts.
-            return yield* new UnknownOutcomeError({
-              taskId: effective.id,
-              tool: tool.name,
-              message: unknownOutcomeNotice(tool.name, input)
-            })
-        }
-      })
-
-    /**
-     * A tool calling another tool. The nested call is a task of its own, owned
-     * by the caller: hooks, replay policy, and journaling apply as to the
-     * model's calls. A caller that runs again (a replay after a crash) gets the
-     * nested calls it already made back, matched by key, tool, and input.
-     */
-    const callNested = (caller: Caller, name: string, input: Json, scope: CallScope): Effect.Effect<Json, ToolCallError> =>
-      Effect.gen(function* () {
-        const tool = scope.byName.get(name)
-        if (!tool || tool.callers === "model") {
-          return yield* new ToolExecutionError({ taskId: caller.task.id, tool: name, message: `no tool named ${name} can be called from a tool` })
-        }
-        const inputHash = hashInput(tool.name, input)
-        const tasks = yield* database.read((storage) => storage.tasksForTurn(caller.task.turnId))
-        // The caller and the calls it replays or retries.
-        const incarnations = new Set<string>()
-        for (let at: TaskRecord | undefined = caller.task; at; at = tasks.find((t) => t.id === at?.parentTaskId)) incarnations.add(at.id)
-        const slot = tasks
-          .filter(
-            (t) =>
-              t.type === "tool" &&
-              t.parentTaskId === null &&
-              t.callerTaskId !== null &&
-              incarnations.has(t.callerTaskId) &&
-              t.id !== caller.task.id &&
-              t.callKey === caller.key &&
-              t.name === tool.name &&
-              t.inputHash === inputHash
-          )
-          .at(-1)
-        return yield* resumeOrRun(scope, tool, input, inputHash, slot, tasks, caller)
-      })
-
-    const scopeOf = (ctx: TurnContext, tools: ToolSet): CallScope => ({
-      ...tools,
-      agentId: ctx.agentId,
-      submissionId: ctx.submissionId,
-      turnId: ctx.turnId,
-      attempt: ctx.attempt,
-      interruptReason: () => ctx.interruptReason ?? "executor_lost"
-    })
-
-    const execute = Effect.fn("ToolExecutor.execute")(function* (ctx: TurnContext, tool: DurableTool, input: Json, tools: ToolSet) {
-      const inputHash = hashInput(tool.name, input)
-      const key = `${tool.name}:${inputHash}`
-      const ordinal = ctx.ordinals.get(key) ?? 0
-      ctx.ordinals.set(key, ordinal + 1)
-
-      // Map this call onto work journaled by earlier attempts of the same turn.
-      const tasks = yield* database.read((storage) => storage.tasksForTurn(ctx.turnId))
-      const slots = tasks.filter(
-        (t) =>
-          t.type === "tool" &&
-          t.parentTaskId === null &&
-          t.callerTaskId === null &&
-          t.name === tool.name &&
-          t.inputHash === inputHash &&
-          t.attempt < ctx.attempt
       )
-      return yield* resumeOrRun(scopeOf(ctx, tools), tool, input, inputHash, slots[ordinal], tasks, null)
-    })
+      await hit("tool.after-intent", tool.name)
+      return run(scope, tool, input, record, caller, signal)
+    }
 
-    const replay = Effect.fn("ToolExecutor.replay")(function* (original: TaskRecord, tool: DurableTool, tools: ToolSet, submissionId: string) {
-      const task = yield* database.run((journal) => journal.startTask({
-        turnId: original.turnId,
-        agentId: original.agentId,
-        type: "tool",
-        name: original.name,
-        input: original.input,
-        inputHash: original.inputHash,
-        parentTaskId: original.id,
-        callerTaskId: original.callerTaskId,
-        callKey: original.callKey,
-        replayPolicy: original.replayPolicy,
-        // Idempotent tools retry with the SAME key.
-        idempotencyKey: original.idempotencyKey,
-        attempt: original.attempt,
-        event: {
-          type: "tool.replayed",
-          payload: { tool: original.name, input: original.input, replayOf: original.id, replay: original.replayPolicy }
-        }
-      }))
-      yield* crash.hit("recovery.during-replay", { name: tool.name })
-      const input = original.input
-      const scope: CallScope = {
-        ...tools,
-        agentId: original.agentId,
-        submissionId,
-        turnId: original.turnId,
-        attempt: original.attempt,
-        interruptReason: () => "executor_lost"
+    /** Execute a journaled call and record how it ended. */
+    const run = async (scope: CallScope, tool: DurableTool, input: Json, record: ToolCallRecord, caller: Caller | null, signal: AbortSignal): Promise<Json> => {
+      const key: ToolCallKey = record
+      const callId = callIdOf(key)
+      live.add(callId)
+      try {
+        return await execute(scope, tool, input, record, caller, signal, key, callId)
+      } finally {
+        live.delete(callId)
       }
-      yield* runTask(task, tool, input, scope, { replay: true }).pipe(
-        Effect.catchTags({ ToolExecutionError: () => Effect.void, UnknownOutcomeError: () => Effect.void })
-      )
-      const updated = yield* database.read((storage) => storage.getTask(task.id))
-      return updated ?? task
-    })
+    }
 
-    return ToolExecutor.of({ execute, replay })
+    const execute = async (
+      scope: CallScope,
+      tool: DurableTool,
+      input: Json,
+      record: ToolCallRecord,
+      caller: Caller | null,
+      signal: AbortSignal,
+      key: ToolCallKey,
+      callId: string
+    ): Promise<Json> => {
+      let finished = false
+
+      // Nested calls: each a journaled call of its own, under this one's key.
+      const nestedAbort = new AbortController()
+      const nested = new Set<Promise<Json>>()
+      let ordinal = 0
+      const executeTool = (name: string, nestedInput: Json, options: NestedCallOptions = {}): Promise<Json> => {
+        if (finished) return Promise.reject(new Error(`${tool.name} has returned; it can no longer call ${name}`))
+        const target = scope.byName.get(name)
+        const nestedKey = `${key.callKey ? `${key.callKey}/` : ""}${options.key ?? String(ordinal++)}`
+        if (!target || target.callers === "model") {
+          return Promise.reject(new ToolExecutionError({ callId, tool: name, message: `no tool named ${name} can be called from a tool` }))
+        }
+        const promise = call(scope, target, nestedInput, nestedKey, { tool: tool.name, key }, AbortSignal.any([signal, nestedAbort.signal]))
+        nested.add(promise)
+        promise.finally(() => nested.delete(promise)).catch(() => undefined)
+        return promise
+      }
+
+      // Document writes, staged in call order and committed with the result.
+      type Step = (value: JsonObject) => JsonObject
+      const staged = new Map<string, { readonly document: DurableDocument<JsonObject>; readonly steps: Array<Step> }>()
+      const ownerOf = (document: DurableDocument<JsonObject>) => (document.scope === "agent" ? scope.agentId : null)
+      const readDocument = async <T extends JsonObject>(document: DurableDocument<T>): Promise<T> => {
+        const stored = await read((storage) => storage.getDocument(ownerOf(document), document.kind))
+        const steps = staged.get(`${document.scope}:${document.kind}`)?.steps ?? []
+        return ownValue(document, steps.reduce<JsonObject>((value, step) => step(value), documentValue(document, stored)))
+      }
+      const documents: DocumentAccess = {
+        get: (document) => readDocument(document),
+        update: async (document, update) => {
+          if (finished) throw new Error(`${tool.name} has returned; it can no longer update ${document.kind}`)
+          // Fail here, in the tool, rather than at commit.
+          const value = applyUpdate(document, await readDocument(document), update)
+          const stageKey = `${document.scope}:${document.kind}`
+          const entry = staged.get(stageKey) ?? { document, steps: [] }
+          entry.steps.push((current) => applyUpdate(document, ownValue(document, current), update))
+          staged.set(stageKey, entry)
+          return value
+        }
+      }
+
+      // Output reported while it runs, journaled at most every PROGRESS_MS.
+      let progress = ""
+      let pending: ReturnType<typeof setTimeout> | null = null
+      const flush = () => {
+        pending = null
+        try {
+          database.runSync((journal) => journal.recordProgress(key, progress))
+        } catch {
+          // Progress is best-effort; a storage failure is reported by the next durable write.
+        }
+      }
+      const reportProgress = (chunk: string) => {
+        if (finished || chunk.length === 0) return
+        progress = (progress + chunk).slice(-MAX_PROGRESS_CHARS)
+        pending ??= setTimeout(flush, PROGRESS_MS)
+      }
+
+      const settle = async () => {
+        finished = true
+        if (pending) clearTimeout(pending)
+        nestedAbort.abort()
+        await Promise.allSettled(nested)
+      }
+
+      let output: Json
+      try {
+        const running = Promise.resolve().then(() =>
+          tool.run(input, {
+            agentId: scope.agentId,
+            sessionId: scope.sessionId,
+            executionId: scope.executionId,
+            submissionId: scope.submissionId,
+            cwd: scope.cwd,
+            idempotencyKey: record.idempotencyKey,
+            signal,
+            replay: record.attempts > 1,
+            progress: reportProgress,
+            executeTool,
+            documents
+          })
+        )
+        running.catch(() => undefined)
+        await hit("tool.during-execute", tool.name)
+        output = await running
+      } catch (cause) {
+        await settle()
+        if (cause instanceof OutcomeUnknown || (signal.aborted && policyName(tool.replay) === "unsafe")) {
+          const reason = cause instanceof OutcomeUnknown ? cause.reason : "cancelled"
+          database.runSync((journal) => journal.markToolCallUnknown(key, reason))
+          throw new UnknownOutcomeError({ callId, tool: tool.name, message: unknownOutcomeNotice(tool.name, input) })
+        }
+        if (cause instanceof ToolExecutionError || cause instanceof UnknownOutcomeError || cause instanceof ToolBlockedError) {
+          // A nested call's failure the tool let through: this call failed too, with that message.
+          database.runSync((journal) => journal.failToolCall(key, cause.message))
+          throw cause
+        }
+        const message = errorMessage(cause)
+        database.runSync((journal) => journal.failToolCall(key, message))
+        throw new ToolExecutionError({ callId, tool: tool.name, message, cause })
+      }
+      await settle()
+      await hit("tool.after-execute", tool.name)
+
+      // A failing afterTool keeps the original result: the effect already happened.
+      const afterTool = scope.hooks?.afterTool
+      if (afterTool) {
+        const request: ToolCall = { name: tool.name, input, caller: caller ? { tool: caller.tool, callId: callIdOf(caller.key) } : null }
+        const replaced = await Promise.resolve()
+          .then(() => afterTool(request, output, hookContext(scope, signal)))
+          .catch(() => undefined)
+        if (replaced !== undefined) output = replaced
+      }
+
+      const writes: ReadonlyArray<StagedDocumentWrite> = [...staged.values()].map(({ document, steps }) => ({
+        document,
+        agentId: ownerOf(document),
+        updates: [(draft: JsonObject) => steps.reduce<JsonObject>((value, step) => step(value), draft)]
+      }))
+      try {
+        database.runSync((journal) => journal.completeToolCall(key, output, writes))
+      } catch (cause) {
+        if (!(cause instanceof DocumentUpdateFailed)) throw cause
+        database.runSync((journal) => journal.failToolCall(key, cause.message))
+        throw new ToolExecutionError({ callId, tool: tool.name, message: cause.message, cause })
+      }
+      await hit("tool.after-result-persist", tool.name)
+      return output
+    }
+
+    /** The calling agent's tool set now, and its version of `tool`. */
+    const resolve = async (agentId: string, tool: DurableTool) => {
+      const agent = await read((storage) => storage.getAgent(agentId))
+      if (!agent) throw new Error(`agent ${agentId} does not exist`)
+      const current = await Effect.runPromise(registry.toolSet(agent))
+      // A tool the agent no longer has finishes with the definition its turn started with.
+      return { tools: current, tool: current.byName.get(tool.name) ?? tool }
+    }
+
+    const hostTools = (offered: ReadonlyArray<DurableTool>): ReadonlyArray<FxHostTool> =>
+      offered.map(
+        (descriptor): FxHostTool => ({
+          name: descriptor.name,
+          description: descriptor.description,
+          inputSchema: descriptor.jsonSchema,
+          // libfx starts an idempotent call before storing it, so after a crash it may ask the model
+          // again instead of rerunning the call: fine for a call that may run twice. An unsafe call
+          // is stored before it starts, and libfx never reruns it.
+          idempotent: policyName(descriptor.replay) !== "unsafe",
+          writes: descriptor.writes,
+          execute: async (input: Json, context: FxToolContext) => {
+            try {
+              const who = decodeCallContext(context.context)
+              const { tools, tool } = await resolve(who.agentId, descriptor)
+              const scope: CallScope = { byName: tools.byName, hooks: tools.hooks, ...who, sessionId: context.sessionId, executionId: context.executionId }
+              return await call(scope, tool, input, "", null, context.signal)
+            } catch (cause) {
+              // libfx hands the model the message of what the tool throws.
+              throw new Error(errorMessage(cause))
+            }
+          }
+        })
+      )
+
+    return ToolExecutor.of({ hostTools })
   })
 )

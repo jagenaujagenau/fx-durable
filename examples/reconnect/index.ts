@@ -1,7 +1,7 @@
 /**
  * Clients attach to agents; they do not own them. This client remembers the
- * last event sequence it saw and resumes from there: persisted events first,
- * then live, with no gap in between. Ctrl-C it and run it again.
+ * cursor of the last event it saw and resumes from there: stored events
+ * first, then live, with no gap in between. Ctrl-C it and run it again.
  *
  *   npx tsx examples/reconnect/index.ts
  */
@@ -18,15 +18,18 @@ const fx = await DurableFx.open({
 const agent = await fx.agent("echo", { runtime: "chat", model: MODEL })
 
 const after = existsSync(CURSOR) ? Number(readFileSync(CURSOR, "utf8")) : 0
-console.log(`resuming after event #${after}`)
+console.log(`resuming after cursor ${after}`)
 
 // Some other client keeps submitting work...
 const timer = setInterval(() => void agent.submit(`ping ${new Date().toISOString()}`), 1500)
 
+// The first request opens the agent's session, which events() reads.
+await (await agent.submit("hello")).result()
 for await (const event of agent.events({ after })) {
-  console.log(`#${event.sequence} ${event.type}`)
-  writeFileSync(CURSOR, String(event.sequence))
-  if (event.sequence >= after + 30) break
+  const cursor = event.cursor ?? after
+  console.log(`#${cursor} ${event.type}`)
+  writeFileSync(CURSOR, String(cursor))
+  if (cursor >= after + 30) break
 }
 clearInterval(timer)
 await fx.close()

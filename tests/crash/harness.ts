@@ -36,49 +36,35 @@ export interface RunResult {
 export interface Sandbox {
   readonly dir: string
   readonly db: string
-  readonly ledger: string
-  run(options?: {
-    crash?: CrashPlan
-    scenario?: string
-    requestId?: string
-    env?: Record<string, string>
-    timeoutMs?: number
-  }): RunResult
+  run(options?: { crash?: CrashPlan; env?: Record<string, string>; timeoutMs?: number }): RunResult
   ledgerEntries(): Array<LedgerEntry>
   count(effect: string): number
   query(sql: string, ...params: Array<string | number>): Array<Row>
 }
 
-/** `crashAt("tool.after-execute")` — a crash plan for the next process run. */
+/** `crashAt("tool.after-execute", "deploy")`: a crash plan for the next process run. */
 export const crashAt = (point: string, name?: string, occurrence?: number): CrashPlan => ({ point, name, occurrence })
 
-export const sandbox = (scenario = "deploy"): Sandbox => {
+export const sandbox = (scenario: string): Sandbox => {
   const dir = mkdtempSync(join(tmpdir(), "fxd-crash-"))
   const db = join(dir, "fx.db")
   const ledger = join(dir, "ledger.jsonl")
   const self: Sandbox = {
     dir,
     db,
-    ledger,
     run(options = {}) {
-      const env = {
+      const env: NodeJS.ProcessEnv = {
         ...process.env,
         FXD_TEST_DB: db,
         FXD_TEST_LEDGER: ledger,
-        FXD_TEST_SCENARIO: options.scenario ?? scenario,
-        FXD_TEST_REQUEST_ID: options.requestId ?? "req-1",
+        FXD_TEST_SCENARIO: scenario,
         FXD_CRASH_QUIET: "1"
       }
       if (options.crash) Object.assign(env, crashEnv(options.crash))
       Object.assign(env, options.env)
-      const child = spawnSync(process.execPath, ["--import", "tsx", FIXTURE], {
-        env,
-        encoding: "utf8",
-        timeout: options.timeoutMs ?? 60_000
-      })
+      const child = spawnSync(process.execPath, ["--import", "tsx", FIXTURE], { env, encoding: "utf8", timeout: options.timeoutMs ?? 60_000 })
       const line = child.stdout.trim().split("\n").filter(Boolean).pop() ?? ""
-      const output = Option.getOrNull(decodeOutput(line))
-      return { status: child.status, signal: child.signal, stdout: child.stdout, stderr: child.stderr, output }
+      return { status: child.status, signal: child.signal, stdout: child.stdout, stderr: child.stderr, output: Option.getOrNull(decodeOutput(line)) }
     },
     ledgerEntries() {
       if (!existsSync(ledger)) return []
@@ -90,7 +76,7 @@ export const sandbox = (scenario = "deploy"): Sandbox => {
     count(effect) {
       return self.ledgerEntries().filter((e) => e.effect === effect).length
     },
-    query(sql: string, ...params: Array<string | number>) {
+    query(sql, ...params) {
       const handle = new DatabaseSync(db, { readOnly: true })
       try {
         return handle.prepare(sql).all(...params)
@@ -102,36 +88,21 @@ export const sandbox = (scenario = "deploy"): Sandbox => {
   return self
 }
 
-/** Invariants that must hold after any crash + successful recovery. */
+/** Invariants that must hold after any crash and successful recovery. */
 export const assertInvariants = (box: Sandbox, expect: typeof import("vitest").expect) => {
-  // submission requestId never creates duplicate logical work
-  const subs = box.query("SELECT COUNT(*) AS n FROM submissions WHERE request_id = 'req-1'")
-  expect(subs[0]!.n).toBe(1)
-  // unsafe effect occurs <= 1 time automatically
+  // A requestId never creates duplicate logical work.
+  expect(box.query("SELECT COUNT(*) AS n FROM submissions WHERE request_id = 'req-1'")[0]!.n).toBe(1)
+  // An unsafe effect occurs at most once automatically.
   expect(box.count("deploy")).toBeLessThanOrEqual(1)
-  // nothing left running
-  const open = box.query("SELECT id, type, state FROM tasks WHERE state IN ('running', 'pending')")
-  expect(open).toEqual([])
-  const activeTurns = box.query("SELECT id FROM turns WHERE state IN ('running', 'interrupted')")
-  expect(activeTurns).toEqual([])
-  // unknown external state is represented as unknown — in task state AND event history
-  const unknown = box.query("SELECT id FROM tasks WHERE state = 'outcome_unknown'")
-  for (const task of unknown) {
-    const events = box.query("SELECT id FROM events WHERE type = 'tool.outcome_unknown' AND task_id = ?", String(task.id))
-    expect(events.length).toBe(1)
-  }
-  // checkpoints are contiguous per agent and one per completed turn
-  for (const agent of box.query("SELECT id FROM agents")) {
-    const id = String(agent.id)
-    const seqs = box.query("SELECT sequence FROM checkpoints WHERE agent_id = ? ORDER BY sequence", id).map((r) => Number(r.sequence))
-    expect(seqs).toEqual(seqs.map((_, i) => i + 1))
-    const completedTurns = box.query("SELECT COUNT(*) AS n FROM turns WHERE agent_id = ? AND state = 'completed'", id)
-    expect(seqs.length).toBe(completedTurns[0]!.n)
-  }
-  // event sequences are gap-free per agent
-  const events = box.query("SELECT sequence FROM events WHERE agent_id = 'engineer' ORDER BY sequence")
-  expect(events.map((e) => Number(e.sequence))).toEqual(events.map((_, i) => i + 1))
+  // Nothing is left running.
+  expect(box.query("SELECT id FROM submissions WHERE state = 'running'")).toEqual([])
+  expect(box.query("SELECT name, call_key FROM tool_calls WHERE state = 'running'")).toEqual([])
 }
 
-export const eventTypes = (box: Sandbox): Array<string> =>
-  box.query("SELECT type FROM events ORDER BY sequence").map((e) => String(e.type))
+export const toolCalls = (box: Sandbox) =>
+  box.query("SELECT name, call_key, state, attempts FROM tool_calls ORDER BY rowid").map((r) => ({
+    name: String(r.name),
+    key: String(r.call_key),
+    state: String(r.state),
+    attempts: Number(r.attempts)
+  }))

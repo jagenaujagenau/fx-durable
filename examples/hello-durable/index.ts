@@ -1,7 +1,7 @@
 /**
  * The smallest durable agent. Run it twice: the second run remembers the
- * first conversation (restored from the SQLite checkpoint), and re-running
- * with the same requestId attaches to the existing submission.
+ * first conversation (libfx keeps it in its session), and re-running with
+ * the same requestId attaches to the existing request.
  *
  *   pnpm build && npx tsx examples/hello-durable/index.ts "My name is Ada"
  *   npx tsx examples/hello-durable/index.ts "What is my name?"
@@ -32,7 +32,7 @@ const prompt = process.argv[2] ?? "Hello!"
 const submission = await agent.submit(prompt, { requestId: `hello:${prompt}` })
 
 for await (const event of submission.events()) {
-  console.log(`#${event.sequence} ${event.type}`)
+  if (event.type !== "text_delta") console.log(`  ${event.type}`)
 }
 console.log((await submission.result()).text)
 await fx.close()
