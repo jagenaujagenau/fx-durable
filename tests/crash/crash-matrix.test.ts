@@ -91,6 +91,25 @@ describe("crash matrix: subagents", () => {
   })
 })
 
+describe("crash matrix: nested tool calls", () => {
+  it("a safe caller replayed after a crash gets its committed nested call back instead of running it again", () => {
+    const box = sandbox()
+    const recovered = crashThenRecover(box, crashAt("test.in-release", "release"), "nested")
+    expect(recovered.output?.result?.text).toContain("Release: done")
+    expect(box.count("release")).toBe(2)
+    expect(box.count("deploy")).toBe(1)
+    expect(box.query("SELECT id FROM events WHERE type = 'tool.reused' AND payload LIKE '%deploy%'")).toHaveLength(1)
+  })
+
+  it("an unsafe nested call cut off by a crash is outcome_unknown, and the replayed caller is refused it", () => {
+    const box = sandbox()
+    crashThenRecover(box, crashAt("test.during-unsafe-tool", "deploy"), "nested")
+    expect(box.count("deploy")).toBe(1)
+    expect(unknownTasks(box, "deploy")).toHaveLength(1)
+    expect(eventTypes(box)).toContain("tool.outcome_unknown_refused")
+  })
+})
+
 describe("crash matrix: hooks", () => {
   it("a crash while beforeTool decides leaves nothing unknown: the call never started", () => {
     const box = sandbox()

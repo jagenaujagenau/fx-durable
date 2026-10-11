@@ -83,6 +83,44 @@ export const storageContract: ReadonlyArray<StorageContractCase> = [
     }
   },
   {
+    name: "tasks round-trip, with their replay and caller links",
+    run: (storage) => {
+      storage.insertAgent(agent())
+      storage.insertSubmission(submission("s1"))
+      storage.insertTurn(turn("t1", "running"))
+      const task = (id: string, links: { parentTaskId: string | null; callerTaskId: string | null; callKey: string | null }) => ({
+        id,
+        turnId: "t1",
+        agentId: "a",
+        ...links,
+        type: "tool" as const,
+        state: "running" as const,
+        name: "tool",
+        input: { x: 1 },
+        inputHash: "h",
+        replayPolicy: "safe" as const,
+        idempotencyKey: null,
+        attempt: 1,
+        metadata: null,
+        startedAt: at
+      })
+      storage.insertTask(task("k1", { parentTaskId: null, callerTaskId: null, callKey: null }))
+      storage.insertTask(task("k2", { parentTaskId: null, callerTaskId: "k1", callKey: "0" }))
+      storage.insertTask(task("k3", { parentTaskId: "k2", callerTaskId: "k1", callKey: "0" }))
+      assert.deepEqual(
+        storage.tasksForTurn("t1").map((t) => [t.id, t.parentTaskId, t.callerTaskId, t.callKey]),
+        [
+          ["k1", null, null, null],
+          ["k2", null, "k1", "0"],
+          ["k3", "k2", "k1", "0"]
+        ]
+      )
+      storage.updateTask("k2", { state: "completed", output: 3, completedAt: at })
+      assert.equal(storage.getTask("k2")?.output, 3)
+      assert.deepEqual(storage.unfinishedTasks().map((t) => t.id), ["k1", "k3"])
+    }
+  },
+  {
     name: "1. a committed transaction applies all of its writes",
     run: (storage) => {
       storage.transaction(() => {

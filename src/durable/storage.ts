@@ -59,6 +59,8 @@ export interface NewTask {
   readonly turnId: string
   readonly agentId: string
   readonly parentTaskId: string | null
+  readonly callerTaskId: string | null
+  readonly callKey: string | null
   readonly type: TaskType
   readonly state: TaskState
   readonly name: string | null

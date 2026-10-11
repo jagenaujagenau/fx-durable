@@ -56,7 +56,8 @@ export const buildRecoveryPrompt = (
     for (const text of steering) lines.push(`- ${text}`)
     lines.push("")
   }
-  const originals = tasks.filter((t) => t.type === "tool" && t.parentTaskId === null)
+  // Nested calls are part of their caller's work, not calls the model made.
+  const originals = tasks.filter((t) => t.type === "tool" && t.parentTaskId === null && t.callerTaskId === null)
   const unknown: Array<string> = []
   if (originals.length > 0) {
     lines.push("Tool calls already journaled for this turn:")

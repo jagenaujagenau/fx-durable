@@ -145,7 +145,12 @@ export const TaskRecord = Schema.Struct({
   id: Schema.String,
   turnId: Schema.String,
   agentId: Schema.String,
+  /** The task this one replays or retries. */
   parentTaskId: Schema.NullOr(Schema.String),
+  /** For a nested call: the tool task that made it (`context.executeTool`). */
+  callerTaskId: Schema.NullOr(Schema.String),
+  /** For a nested call: its key among the caller's calls. */
+  callKey: Schema.NullOr(Schema.String),
   type: TaskType,
   state: TaskState,
   name: Schema.NullOr(Schema.String),

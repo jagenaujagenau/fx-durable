@@ -92,6 +92,8 @@ const taskFromRow = (r: Row): TaskRecord =>
     turnId: r.turn_id,
     agentId: r.agent_id,
     parentTaskId: str(r.parent_task_id),
+    callerTaskId: str(r.caller_task_id),
+    callKey: str(r.call_key),
     type: r.type,
     state: r.state,
     name: str(r.name),
@@ -366,12 +368,14 @@ export const openSqliteStorage = (options: SqliteOptions): Storage => {
     insertTask: (t) =>
       op("insertTask", () => {
         stmt(
-          "INSERT INTO tasks (id, turn_id, agent_id, parent_task_id, type, state, name, input, input_hash, replay_policy, idempotency_key, attempt, metadata, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO tasks (id, turn_id, agent_id, parent_task_id, caller_task_id, call_key, type, state, name, input, input_hash, replay_policy, idempotency_key, attempt, metadata, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ).run(
           t.id,
           t.turnId,
           t.agentId,
           t.parentTaskId,
+          t.callerTaskId,
+          t.callKey,
           t.type,
           t.state,
           t.name,

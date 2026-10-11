@@ -105,6 +105,20 @@ const work = defineDurableTool({
 })
 const delegate = defineSubagent({ name: "delegate", description: "Delegate work to a subagent", runtime: "worker" })
 
+// A tool that deploys through a nested call, then announces the release.
+const release = defineDurableTool({
+  name: "release",
+  description: "Deploy a version and announce it",
+  replay: "safe",
+  inputSchema: Schema.Struct({ version: Schema.String }),
+  execute: async ({ version }, ctx) => {
+    record("release", { version })
+    const deployed = await ctx.executeTool("deploy", { version })
+    crashPoint("test.in-release", "release")
+    return { deployed, announced: true }
+  }
+})
+
 const isRecovery = (text: string) => text.includes("[fx-durable recovery]")
 
 const scripts = new Map<string, Script>(Object.entries({
@@ -132,6 +146,12 @@ const scripts = new Map<string, Script>(Object.entries({
     return { text: "Charged." }
   },
   chat: (req) => ({ text: `You said: ${req.userText.slice(0, 40)}` }),
+  // release (safe) deploys through a nested call.
+  nested: (req) => {
+    const released = req.toolResults.find((r) => r.toolName === "release")
+    if (!released) return { toolCalls: [{ name: "release", input: { version: "abc123" } }] }
+    return { text: `Release: ${released.isError ? "failed" : "done"}: ${released.output.slice(0, 200)}` }
+  },
   // The parent delegates; the child (offered `work`) does it.
   subagent: (req) => {
     if (req.tools.includes("work")) {
@@ -150,7 +170,7 @@ const main = async () => {
     storage: sqlite(DB),
     runtimes: {
       coding: {
-        tools: [readFile, runTests, deploy, checkDeploy, charge, delegate],
+        tools: [readFile, runTests, deploy, checkDeploy, charge, delegate, release],
         instructions: INSTRUCTIONS,
         hooks: HOOKS
           ? {

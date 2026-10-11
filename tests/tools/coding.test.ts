@@ -16,7 +16,8 @@ const contextFor = (cwd: string | null, progress: Array<string> = []): DurableTo
   idempotencyKey: null,
   signal: new AbortController().signal,
   replay: false,
-  progress: (chunk) => progress.push(chunk)
+  progress: (chunk) => progress.push(chunk),
+  executeTool: () => Promise.reject(new Error("no nested calls"))
 })
 
 describe("createCodingTools", () => {

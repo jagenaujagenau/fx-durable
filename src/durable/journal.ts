@@ -58,6 +58,8 @@ export interface StartTask {
   readonly input?: Json
   readonly inputHash?: string | null
   readonly parentTaskId?: string | null
+  readonly callerTaskId?: string | null
+  readonly callKey?: string | null
   readonly replayPolicy?: ReplayPolicyName | null
   readonly idempotencyKey?: string | null
   readonly attempt?: number
@@ -227,6 +229,8 @@ export class Journal {
       turnId: task.turnId,
       agentId: task.agentId,
       parentTaskId: task.parentTaskId ?? null,
+      callerTaskId: task.callerTaskId ?? null,
+      callKey: task.callKey ?? null,
       type: task.type,
       state: "running" as const,
       name: task.name ?? null,
@@ -394,6 +398,8 @@ export class Journal {
         turnId: turn.id,
         agentId: turn.agentId,
         parentTaskId: null,
+        callerTaskId: null,
+        callKey: null,
         type: "turn",
         state: "running",
         name: null,

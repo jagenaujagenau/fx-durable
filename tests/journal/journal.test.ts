@@ -80,6 +80,8 @@ describe("state transitions: every (from, to) pair", () => {
           turnId: turn.id,
           agentId: "a",
           parentTaskId: null,
+          callerTaskId: null,
+          callKey: null,
           type: "tool" satisfies TaskType,
           state: from,
           name: "tool",

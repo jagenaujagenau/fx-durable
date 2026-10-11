@@ -1,9 +1,11 @@
 import type { Json } from "../domain/json.js"
 
-/** A tool call as the model made it. */
+/** A tool call, as the model or another tool made it. */
 export interface ToolCall {
   readonly name: string
   readonly input: Json
+  /** For a nested call (`context.executeTool`), the tool task that made it; null for the model's calls. */
+  readonly caller: { readonly taskId: string; readonly tool: string } | null
 }
 
 export interface ToolHookContext {

@@ -22,7 +22,30 @@ export interface DurableToolContext {
    * mid-call can see it. It is not the result: return that as usual.
    */
   readonly progress: (chunk: string) => void
+  /**
+   * Call another of the agent's tools, as code-mode scripts and MCP bridges
+   * do. The nested call is a durable task of its own, owned by this one: it
+   * is validated, runs the runtime's hooks (which see `call.caller`), and
+   * keeps its own replay policy. It resolves with the tool's result and
+   * rejects as a model call would fail (`ToolExecutionError`,
+   * `UnknownOutcomeError`, `ToolBlockedError`).
+   *
+   * Each nested call has a key: its position among this call's nested calls,
+   * unless you pass one. When this tool runs again after a crash (it is
+   * replay-safe, or the recovered turn retries it), calls with the same key,
+   * tool, and input get their journaled outcome back instead of running
+   * again. Nested calls still running when this tool returns are aborted.
+   */
+  readonly executeTool: (name: string, input: Json, options?: NestedCallOptions) => Promise<Json>
 }
+
+export interface NestedCallOptions {
+  /** Identifies the call among this tool's nested calls, across reruns. Default: its position. */
+  readonly key?: string
+}
+
+/** Who may call a tool: the model, other tools (`context.executeTool`), or both. */
+export type ToolCallers = "model" | "tools" | "both"
 
 /**
  * Tool results are persisted in the task journal, so they must be JSON.
@@ -51,6 +74,11 @@ interface ToolBase {
    * block recovery. Only allowed with the idempotent replay policy.
    */
   readonly resumeOnCall?: boolean
+  /**
+   * Who may call this tool (default `"both"`). `"tools"` keeps it out of the
+   * model's tool list, for tools that only scripts and other tools use.
+   */
+  readonly callers?: ToolCallers
 }
 
 /** A tool whose input is decoded and validated with an Effect Schema. */
@@ -85,6 +113,7 @@ export interface DurableTool {
   readonly reuse: boolean
   /** Interrupted calls are retried when the turn calls them again, not replayed during recovery. */
   readonly resumeOnCall: boolean
+  readonly callers: ToolCallers
   readonly jsonSchema: JsonObject
   /** Validate the input and execute. Rejects on invalid input or tool failure. */
   readonly run: (input: Json, context: DurableToolContext) => Promise<Json>
@@ -157,7 +186,8 @@ export function defineDurableTool(definition: AnyDefinition): DurableTool {
     description: definition.description ?? definition.name,
     replay: definition.replay,
     reuse,
-    resumeOnCall
+    resumeOnCall,
+    callers: definition.callers ?? "both"
   }
   if (isSchemaDefinition(definition)) {
     const decode = Schema.decodeUnknownSync(definition.inputSchema)

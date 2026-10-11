@@ -15,6 +15,7 @@ export type {
   UsageOptions
 } from "./runtime/durable-fx.js"
 export type { CompactionOptions } from "./domain/context.js"
+export type { QueuedWork, TaskGraph, TaskGraphNode } from "./domain/task-graph.js"
 export { usageOf } from "./domain/usage.js"
 export type { ModelPrice, ModelPrices, UsageReport, UsageTotals } from "./domain/usage.js"
 export { defineDurableTool, OutcomeUnknown } from "./tools/define-tool.js"
@@ -23,6 +24,8 @@ export type { SubagentDefinition } from "./tools/subagent.js"
 export type {
   DurableTool,
   DurableToolContext,
+  NestedCallOptions,
+  ToolCallers,
   JsonToolDefinition,
   SchemaToolDefinition,
   StandardToolDefinition,

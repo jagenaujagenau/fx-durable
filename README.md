@@ -230,6 +230,43 @@ This uses a tool option you can use too: `resumeOnCall: true` (idempotent tools 
 during recovery, which would block it while it waits on other durable work. When the recovered turn calls it again,
 it is retried with its original idempotency key.
 
+### Tools calling tools
+
+```ts
+const release = defineDurableTool({
+  name: "release",
+  replay: "safe",
+  inputSchema: Schema.Struct({ version: Schema.String }),
+  execute: async ({ version }, { executeTool }) => {
+    const deployed = await executeTool("deploy", { version }) // its own durable task
+    await executeTool("announce", { text: `${version} is live` })
+    return deployed
+  }
+})
+const deploy = defineDurableTool({ name: "deploy", replay: "unsafe", callers: "tools", /* … */ })
+```
+
+`context.executeTool(name, input, { key })` is for code-mode scripts, MCP bridges, and tools built from other tools.
+A nested call is a task of its own, owned by its caller: it runs the runtime's hooks (`call.caller` tells them who
+called), keeps its own replay policy, and is journaled like the model's calls (`TaskRecord.callerTaskId`). It
+resolves with the tool's result, or rejects with `ToolExecutionError`, `UnknownOutcomeError`, or `ToolBlockedError`.
+
+Each nested call has a key: its position among the caller's nested calls, unless you pass one. When the caller runs
+again after a crash (a replay-safe caller is replayed; a recovered turn may call it again), a nested call with the
+same key, tool, and input gets its journaled outcome back: a finished `deploy` is not repeated, and an interrupted
+unsafe one is refused once as `outcome_unknown`. Nested calls are never replayed on their own. Calls still running
+when the caller returns are aborted.
+
+`callers` says who may call a tool: `"model"`, `"tools"`, or `"both"` (the default). A `"tools"` tool is left out of
+the model's tool list.
+
+### Task graph
+
+`fx.taskGraph()` returns the running work of every agent as one graph: turns, model and tool calls, nested calls
+under their callers, and a subagent's turn under the tool call that started it. Each node has an `owner`, and owners
+come before what they own. `queued` lists the requests waiting for their agent. It is a snapshot of what is
+committed; re-read it on events to keep a task panel current.
+
 ### Forks
 
 ```ts
@@ -547,6 +584,7 @@ fx-durable/
 │   ├── idempotency/
 │   ├── journal/             # exhaustive synchronous tests of durable state
 │   ├── libfx/               # what fx-durable assumes about libfx checkpoints
+│   ├── nested/              # tools calling tools, task graph
 │   ├── live/                # crash scenarios against the real AI Gateway (opt-in)
 │   ├── reconnect/
 │   ├── recovery/

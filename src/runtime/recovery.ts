@@ -66,7 +66,8 @@ export const layer = (options: RecoveryOptions = {}) =>
       /** Interrupted replayable tool calls with no settled replay yet. */
       const pendingReplays = (tasks: ReadonlyArray<TaskRecord>) =>
         tasks
-          .filter((t) => t.type === "tool" && t.parentTaskId === null)
+          // Nested calls run again only if their caller does (and calls them again).
+          .filter((t) => t.type === "tool" && t.parentTaskId === null && t.callerTaskId === null)
           .map((t) => effectiveTask(t, tasks))
           .filter((t) => t.state === "interrupted" && (t.replayPolicy === "safe" || t.replayPolicy === "idempotent"))
 
@@ -108,7 +109,7 @@ export const layer = (options: RecoveryOptions = {}) =>
                   if (!tool) continue // tool removed from runtime: the model sees it as interrupted
                   // Waits on other durable work: retried when the recovered turn calls it, not here.
                   if (tool.resumeOnCall) continue
-                  const result = yield* executor.replay(task, tool)
+                  const result = yield* executor.replay(task, tool, { byName: resolved.byName, hooks: runtime.hooks }, turn.submissionId)
                   replayed.push(result.id)
                 }
               })

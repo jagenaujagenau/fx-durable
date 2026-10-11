@@ -1,6 +1,7 @@
 import { hostname } from "node:os"
 import { Cause, Context, Effect, Exit, Fiber, FiberMap, Layer, Option, Queue, Schedule, Scope } from "effect"
-import { ToolExecutor } from "./tool-executor.js"
+import { ToolExecutor, type ToolSet } from "./tool-executor.js"
+import type { DurableTool } from "../tools/define-tool.js"
 import { ToolRegistry } from "./tool-registry.js"
 import { CrashInjector } from "./crash.js"
 import { ModelError, NotFoundError, type StorageError } from "../domain/errors.js"
@@ -67,6 +68,9 @@ interface AgentSession {
   readonly model: string
   checkpointSeq: number | null
 }
+
+/** Tools whose `callers` include the model; the rest only other tools can call. */
+const offeredToModel = (tool: DurableTool) => tool.callers !== "tools"
 
 const errorMessage = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause))
 
@@ -136,14 +140,15 @@ export const layer = (options: SupervisorOptions = {}) =>
             const checkpoint = yield* database.read((storage) => storage.latestCheckpoint(agent.id))
             const holder: ModelTransportHolder = { current: null }
             const fetch = makeDurableFetch(holder, libfx.transport, database.models, crash)
-            const tools: Array<LibfxTool> = resolved.tools.map((tool) => ({
+            const toolSet: ToolSet = { byName: resolved.byName, hooks: runtime.hooks }
+            const tools: Array<LibfxTool> = resolved.tools.filter(offeredToModel).map((tool) => ({
               name: tool.name,
               description: tool.description,
               inputSchema: tool.jsonSchema,
               execute: (input, { signal }) => {
                 const ctx = holder.current
                 if (!ctx) return Promise.reject(new Error(`tool ${tool.name} called outside of a turn`))
-                const promise = Effect.runPromiseExit(executor.execute(ctx, tool, input, runtime.hooks), { signal }).then(
+                const promise = Effect.runPromiseExit(executor.execute(ctx, tool, input, toolSet), { signal }).then(
                   (exit) => {
                     if (Exit.isSuccess(exit)) return exit.value
                     const failure = exit.cause.reasons.find((r) => r._tag === "Fail")
@@ -203,7 +208,7 @@ export const layer = (options: SupervisorOptions = {}) =>
             const resolved = yield* toolRegistry.resolve(agent, runtime)
             const holder: ModelTransportHolder = { current: ctx }
             // The same tool definitions (providers reject tool calls in history without them), none of them callable.
-            const tools: Array<LibfxTool> = resolved.tools.map((tool) => ({
+            const tools: Array<LibfxTool> = resolved.tools.filter(offeredToModel).map((tool) => ({
               name: tool.name,
               description: tool.description,
               inputSchema: tool.jsonSchema,

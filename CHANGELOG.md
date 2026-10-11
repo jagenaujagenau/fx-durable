@@ -4,6 +4,10 @@
 
 ### Breaking
 
+- Custom `Storage` implementations must persist `TaskRecord.callerTaskId` and `callKey` (nested tool calls). SQLite
+  migrates itself (migration 3); the storage contract checks them.
+- `ToolCall` (hooks) has a `caller` field, and `ToolExecutor.execute`/`replay` (`fx-durable/effect`) take the
+  agent's tools.
 - Custom `Storage` implementations must persist two new fields: `SubmissionRecord.kind` (`"input"`, `"reset"` or
   `"compaction"`) and `AgentCheckpoint.summary` (string or null). SQLite storage migrates itself (migration 2), and
   the storage contract checks both.
@@ -18,6 +22,11 @@
 
 ### Added
 
+- **Tools calling tools:** `context.executeTool(name, input, { key })`. A nested call is a durable task owned by its
+  caller, with hooks and its own replay policy; a caller that runs again after a crash gets its journaled nested
+  calls back by key. Calls left running when the caller returns are aborted. Two crash-matrix cases cover it.
+- `callers: "model" | "tools" | "both"` on tools; `"tools"` tools are not offered to the model.
+- `fx.taskGraph()`: running work across agents with owner links (nested calls, subagents), plus queued requests.
 - **Reset and handoff:** `agent.reset({ summary? })` starts a new context. With a summary, the model sees it in its
   instructions until the next reset. Queued like a request; recorded as `context.reset`.
 - **Compaction:** `agent.compact({ instructions? })` asks the model for a summary and continues from it. It is a

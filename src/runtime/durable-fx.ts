@@ -28,6 +28,7 @@ import {
 import type { Storage } from "../durable/storage.js"
 import type { Transport } from "../domain/transport.js"
 import { usageOf, type ModelPrices, type UsageReport } from "../domain/usage.js"
+import { buildTaskGraph, type TaskGraph } from "../domain/task-graph.js"
 
 /**
  * Promise/AsyncIterable façade over the Effect-native runtime, so adopting
@@ -95,6 +96,9 @@ export interface UsageOptions {
   /** USD per million tokens by model id. Without a model's price, its `costUsd` (and the total's) is `null`. */
   readonly prices?: ModelPrices
 }
+
+/** How many of an agent's latest submissions `taskGraph()` looks through for queued ones. */
+const QUEUED_LIMIT = 500
 
 /** libfx's limit for one steering message. */
 const MAX_STEERING_BYTES = 64 * 1024
@@ -302,6 +306,25 @@ export class DurableFx {
         for (const agent of agents) events.push(...(yield* log.history(agent.id)))
         return usageOf(events, options.prices)
       })
+    )
+  }
+
+  /**
+   * Running work across every agent as one graph: turns, model and tool
+   * calls, nested calls under their callers, and subagent turns under the
+   * tool calls that started them; plus queued requests. A snapshot of what is
+   * committed; re-read it on events to keep a view current.
+   */
+  taskGraph(): Promise<TaskGraph> {
+    return this.run(
+      Effect.flatMap(Database, (database) =>
+        database.read((storage) => {
+          const queued = storage
+            .listAgents()
+            .flatMap((agent) => storage.listSubmissions(agent.id, QUEUED_LIMIT).filter((s) => s.state === "queued").reverse())
+          return buildTaskGraph(storage.unfinishedTasks(), queued)
+        })
+      )
     )
   }
 
