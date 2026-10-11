@@ -13,7 +13,7 @@ import {
 import type { JSONSchema7, LanguageModelV4FinishReason, LanguageModelV4Usage } from "@ai-sdk/provider"
 import { jsonSchema, tool } from "@ai-sdk/provider-utils"
 import { Schema } from "effect"
-import { Submission, type DurableFx, type DurableTool, type FxStreamLine, type Json } from "fx-durable"
+import { Submission, type DurableAgent, type DurableFx, type DurableTool, type FxStreamLine, type Json } from "fx-durable"
 
 /**
  * A HarnessV1 adapter backed by fx-durable.
@@ -60,11 +60,21 @@ const promptText = (prompt: HarnessV1Prompt): string => {
   return prompt.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n")
 }
 
-/** A tool's result as the model got it: JSON text when the tool returned JSON. */
-const outputOf = (content: string | undefined): Json => {
+/** A tool's result from a stream line's `content`, which libfx cuts to a short preview. */
+const previewOf = (content: string | undefined): Json => {
   if (content === undefined) return null
   const parsed = decodeJson(content)
   return parsed._tag === "Some" ? parsed.value : content
+}
+
+/**
+ * A tool call's full result: from fx-durable's journal of the agent's tool
+ * calls (keyed by the session and the call's id), or the line's preview.
+ */
+const resultOf = async (agent: DurableAgent, line: { readonly id: string; readonly content?: string | undefined }): Promise<Json> => {
+  const { sessionId } = await agent.info()
+  const [call] = sessionId ? await agent.toolCalls(sessionId, line.id) : []
+  return call?.state === "completed" ? call.output : previewOf(line.content)
 }
 
 interface TurnUsage {
@@ -119,7 +129,7 @@ const builtinToolsOf = (tools: ReadonlyArray<DurableTool>): Record<string, Harne
  * are executed by fx-durable, so they are `providerExecuted`. A model step
  * ends when its tool results are in and the model speaks or calls again.
  */
-const createTranslator = (emit: (part: HarnessV1StreamPart) => void) => {
+const createTranslator = (agent: DurableAgent, emit: (part: HarnessV1StreamPart) => void) => {
   let textId: string | null = null
   let texts = 0
   let stepHasTools = false
@@ -136,7 +146,7 @@ const createTranslator = (emit: (part: HarnessV1StreamPart) => void) => {
   }
 
   /** Returns true when the turn ended. */
-  const onLine = (line: FxStreamLine): boolean => {
+  const onLine = async (line: FxStreamLine): Promise<boolean> => {
     switch (line.type) {
       case "text_delta":
         nextStep()
@@ -153,7 +163,7 @@ const createTranslator = (emit: (part: HarnessV1StreamPart) => void) => {
         return false
       case "tool_end":
         // A tool that returned nothing has a null result; the stream part needs a value.
-        emit({ type: "tool-result", toolCallId: line.id, toolName: line.name, result: outputOf(line.content) ?? "", isError: line.isError })
+        emit({ type: "tool-result", toolCallId: line.id, toolName: line.name, result: line.isError ? (line.content ?? "") : ((await resultOf(agent, line)) ?? ""), isError: line.isError })
         return false
       case "turn_end": {
         closeText()
@@ -174,10 +184,13 @@ const createTranslator = (emit: (part: HarnessV1StreamPart) => void) => {
 // History: the conversation, read back from the agent's session
 // ---------------------------------------------------------------------------
 
-const historyFromLines = (lines: ReadonlyArray<FxStreamLine>): Array<HarnessV1Message> => {
+const historyFromLines = async (agent: DurableAgent, lines: ReadonlyArray<FxStreamLine>): Promise<Array<HarnessV1Message>> => {
   const messages: Array<HarnessV1Message> = []
   let assistant: Array<HarnessV1AssistantMessage["content"][number]> = []
   let text = ""
+  // Tool calls without a result yet, and guidance that arrived while they ran.
+  const running = new Set<string>()
+  const steering: Array<string> = []
   const flushText = () => {
     if (text.length > 0) assistant.push({ type: "text", text })
     text = ""
@@ -195,24 +208,33 @@ const historyFromLines = (lines: ReadonlyArray<FxStreamLine>): Array<HarnessV1Me
         if (line.input) messages.push({ role: "user", content: [{ type: "text", text: line.input }] })
         break
       case "user_message":
-        // Guidance typed while the turn ran: a user message in the middle of the turn.
-        flush()
-        messages.push({ role: "user", content: [{ type: "text", text: line.text }] })
+        // Guidance typed while the turn ran: a user message in the middle of the turn, once
+        // the tool calls running when it arrived have their results (they share a message).
+        if (running.size === 0) {
+          flush()
+          messages.push({ role: "user", content: [{ type: "text", text: line.text }] })
+        } else steering.push(line.text)
         break
       case "text_delta":
         text += line.delta
         break
       case "tool_start":
         flushText()
+        running.add(line.id)
         assistant.push({ type: "tool-call", toolCallId: line.id, toolName: line.name, input: line.input ?? {}, providerExecuted: true })
         break
       case "tool_end":
+        running.delete(line.id)
         assistant.push({
           type: "tool-result",
           toolCallId: line.id,
           toolName: line.name,
-          output: line.isError ? { type: "error-text", value: line.content ?? "failed" } : { type: "json", value: outputOf(line.content) }
+          output: line.isError ? { type: "error-text", value: line.content ?? "failed" } : { type: "json", value: await resultOf(agent, line) }
         })
+        if (running.size === 0 && steering.length > 0) {
+          flush()
+          for (const text of steering.splice(0)) messages.push({ role: "user", content: [{ type: "text", text }] })
+        }
         break
       case "turn_end":
         flush()
@@ -242,7 +264,7 @@ export const createFxDurableHarness = (settings: FxDurableHarnessSettings): Harn
     }
     const origin = after === 0 && depth < 10 ? (settings.forkOf?.(agentId) ?? null) : null
     const prefix = origin ? ((await conversationOf(origin.from, 0, origin.cursor, depth + 1).catch(() => null))?.messages ?? []) : []
-    return { messages: [...prefix, ...historyFromLines(lines)], cursor: lines.at(-1)?.cursor ?? null }
+    return { messages: [...prefix, ...(await historyFromLines(agent, lines))], cursor: lines.at(-1)?.cursor ?? null }
   }
 
   const doStart: HarnessV1["doStart"] = async (options) => {
@@ -270,7 +292,7 @@ export const createFxDurableHarness = (settings: FxDurableHarnessSettings): Harn
         void new Submission(fx, cursor.submissionId, agentId, null, false).cancel()
         turn.abort.abort()
       })
-      const translator = createTranslator(emit)
+      const translator = createTranslator(agent, emit)
       const stopped = new Promise<IteratorReturnResult<undefined>>((resolve) =>
         turn.abort.signal.addEventListener("abort", () => resolve({ done: true, value: undefined }))
       )
@@ -285,7 +307,7 @@ export const createFxDurableHarness = (settings: FxDurableHarnessSettings): Harn
             const line = next.value
             if (!("messageId" in line) || line.messageId !== cursor.submissionId) continue
             turn.cursor = { ...turn.cursor, after: line.cursor ?? turn.cursor.after }
-            if (translator.onLine(line)) break
+            if (await translator.onLine(line)) break
           }
         } finally {
           void lines.return?.()
