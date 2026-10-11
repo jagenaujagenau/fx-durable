@@ -147,7 +147,8 @@ describe("subagents", () => {
     expect(answer).toContain("worker did: count the files")
     const children = (await fx.listAgents()).filter((a) => a.id !== "boss")
     expect(children).toHaveLength(1)
-    expect(children[0]?.id).toMatch(/^boss\/delegate\//)
+    // Named after the model's call, as the tool card knows it.
+    expect(children[0]?.id).toMatch(/^boss\/delegate\/call_[a-z0-9]+$/)
     await fx.close()
   })
 })

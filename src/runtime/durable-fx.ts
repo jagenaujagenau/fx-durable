@@ -84,7 +84,10 @@ export interface ForkOptions {
 export interface EventsOptions {
   /** Deliver events after this cursor (each line's `cursor`). Default 0: everything. */
   readonly after?: number
-  /** Stop at the end of the agent's latest request instead of following live. Default true. */
+  /**
+   * Stop at the end of the agent's latest finished request instead of
+   * following live (a turn still running is left out). Default true.
+   */
   readonly follow?: boolean
 }
 

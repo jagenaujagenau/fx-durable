@@ -352,11 +352,12 @@ export const layer = Layer.effect(
           if (!session) return Stream.empty
           const all = lines(session.stream(after))
           if (follow) return all
-          // Without following, stop at the end of the latest request in this session (a session
-          // that is already idle writes no line saying so).
+          // Without following, stop at the end of the latest finished request in this session (a
+          // session that is already idle writes no line saying so; a running turn would block).
           const agent = yield* requireAgent(agentId)
-          const [latest] = yield* database.read((storage) => storage.listSubmissions(agentId, 1))
-          if (!latest || latest.sessionId !== agent.sessionId) return Stream.empty
+          const recent = yield* database.read((storage) => storage.listSubmissions(agentId, 100))
+          const latest = recent.find((record) => record.state !== "running" && record.sessionId === agent.sessionId)
+          if (!latest) return Stream.empty
           return all.pipe(Stream.takeUntil((line) => line.type === "turn_end" && line.messageId === latest.id))
         })
       )

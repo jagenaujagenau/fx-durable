@@ -1,5 +1,5 @@
 import type { SubmissionRecord, ToolCallRecord } from "./schema.js"
-import { subagentId } from "../tools/subagent.js"
+import { callPath, subagentId } from "../tools/subagent.js"
 
 /**
  * Running work across agents as one graph, for task panels and debugging.
@@ -37,7 +37,7 @@ export const buildTaskGraph = (calls: ReadonlyArray<ToolCallRecord>, requests: R
   // A subagent's request runs for the call that started it (its agent id comes from the call's execution id).
   const subagentCall = new Map<string, string>()
   for (const call of calls) {
-    if (call.callKey === "") subagentCall.set(subagentId(call.agentId, call.name, call.idempotencyKey ?? callId(call)), callId(call))
+    subagentCall.set(subagentId(call.agentId, call.name, callPath(call.sessionId, call.idempotencyKey ?? callId(call))), callId(call))
   }
 
   const nodes: Array<TaskGraphNode> = [

@@ -35,8 +35,11 @@ export const bindTools = (fx: DurableFx, tools: ReadonlyArray<DurableTool>): voi
   for (const tool of tools) binders.get(tool)?.(fx)
 }
 
-/** The child agent id for one subagent call. */
-export const subagentId = (parentAgentId: string, name: string, key: string) => `${parentAgentId}/${name}/${key}`
+/** The child agent id for one subagent call: `call` is the model's call id (and nested key, if any). */
+export const subagentId = (parentAgentId: string, name: string, call: string) => `${parentAgentId}/${name}/${call}`
+
+/** A call's id without its session: the model's call id, then its nested key. */
+export const callPath = (sessionId: string, callId: string) => (callId.startsWith(`${sessionId}/`) ? callId.slice(sessionId.length + 1) : callId)
 
 /** Declare a subagent tool. Add it to a runtime's `tools` like any other. */
 export const defineSubagent = (definition: SubagentDefinition): DurableTool => {
@@ -57,7 +60,7 @@ export const defineSubagent = (definition: SubagentDefinition): DurableTool => {
       const { task } = decodeInput(input)
       const key = context.idempotencyKey ?? `${context.sessionId}/${context.executionId}`
       const parent = await (await fx.attach(context.agentId)).info()
-      const childId = subagentId(context.agentId, definition.name, key)
+      const childId = subagentId(context.agentId, definition.name, callPath(context.sessionId, key))
       const child = await fx.agent(childId, { runtime: definition.runtime, model: definition.model ?? parent.model, cwd: parent.cwd })
       const submission = await child.submit(task, { requestId: key })
 
