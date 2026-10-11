@@ -101,7 +101,7 @@ export const useSessionStream = (id: string | null, onSettled: () => void) => {
   const [events, setEvents] = useState<Array<JournalEvent>>([])
   const [approvals, setApprovals] = useState<Array<PendingApproval>>([])
   const [mode, setMode] = useState<PermissionMode | null>(null)
-  // Live output of running tools (bash), by task id = tool call id.
+  // Live output of running tools (bash), by tool call id.
   const [progress, setProgress] = useState<ReadonlyMap<string, string>>(new Map())
   const [connected, setConnected] = useState(false)
   const settled = useRef(onSettled)
@@ -146,7 +146,8 @@ export const useSessionStream = (id: string | null, onSettled: () => void) => {
   for (const event of events) {
     if (event.type === "submission.started") running = true
     if (TERMINAL.has(event.type)) running = false
-    if (event.type === "model.completed") contextTokens = (event.payload.usage?.inputTokens ?? 0) + (event.payload.usage?.outputTokens ?? 0)
+    // libfx reports usage per turn: its input and output tokens stand in for the context size.
+    if (TERMINAL.has(event.type) && event.payload.usage) contextTokens = (event.payload.usage.inputTokens ?? 0) + (event.payload.usage.outputTokens ?? 0)
   }
 
   return { events, approvals, mode, running, contextTokens, connected, progress }

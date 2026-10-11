@@ -53,11 +53,11 @@ export const JournalEvent = z.object({
   payload: z.object({
     tool: z.string().optional(),
     replay: z.union([z.string(), z.boolean()]).optional(),
-    text: z.string().optional(),
+    text: z.string().nullish(),
     attempt: z.number().optional(),
     reason: z.string().optional(),
     error: z.string().optional(),
-    usage: z.object({ inputTokens: z.number().nullable(), outputTokens: z.number().nullable() }).optional()
+    usage: z.object({ inputTokens: z.number().nullish(), outputTokens: z.number().nullish() }).optional()
   })
 })
 export type JournalEvent = z.infer<typeof JournalEvent>

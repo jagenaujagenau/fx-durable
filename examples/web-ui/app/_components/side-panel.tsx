@@ -95,7 +95,7 @@ const tone = (type: string) => {
 
 const detail = ({ type, payload }: JournalEvent) => {
   if (payload.tool !== undefined) return `${payload.tool}${payload.replay !== undefined ? ` · replay ${String(payload.replay)}` : ""}`
-  if (type === "model.completed" && payload.text !== undefined) return payload.text.slice(0, 80)
+  if (type === "model.completed" && payload.text) return payload.text.slice(0, 80)
   if (payload.attempt !== undefined && (type === "turn.started" || type === "turn.recovered")) return `attempt ${payload.attempt}`
   return payload.reason ?? payload.error ?? ""
 }

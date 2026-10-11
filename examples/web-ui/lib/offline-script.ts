@@ -1,4 +1,33 @@
-import type { Script, ScriptedResponse } from "fx-durable/testing"
+import { Schema } from "effect"
+import type { Script, ScriptedRequest, ScriptedResponse, ScriptedToolResult } from "fx-durable/testing"
+
+/** libfx's own user messages when it continues a turn after a crash: not a new request. */
+const RESUME = /^(Resuming from unexpected session interruption|Continue from the confirmed tool result)/
+
+const isText = Schema.is(Schema.String)
+
+const textOf = (content: ScriptedRequest["messages"][number]["content"]) =>
+  isText(content) ? content : content.map((part) => part.text ?? "").join("")
+
+/** The tool results since the user's last request, through any crash and resume. */
+const resultsOfRequest = (req: ScriptedRequest): ReadonlyArray<ScriptedToolResult> => {
+  let start = 0
+  req.messages.forEach((message, index) => {
+    if (message.role === "user" && !RESUME.test(textOf(message.content))) start = index
+  })
+  // allToolResults lists the conversation's results in order: skip those before the request.
+  const skip = req.messages
+    .slice(0, start)
+    .filter((m) => m.role === "tool")
+    .reduce((sum, m) => sum + (isText(m.content) ? 0 : m.content.filter((p) => p.type === "tool-result").length), 0)
+  return req.allToolResults.slice(skip)
+}
+
+/** The request's text: the last user message that is not libfx's resume note. */
+const requestText = (req: ScriptedRequest): string => {
+  const request = [...req.messages].reverse().find((m) => m.role === "user" && !RESUME.test(textOf(m.content)))
+  return request ? textOf(request.content) : req.userText
+}
 
 /**
  * The model used when AI_GATEWAY_API_KEY is not set. It speaks the AI Gateway
@@ -6,10 +35,11 @@ import type { Script, ScriptedResponse } from "fx-durable/testing"
  * only the decisions are scripted. It knows the sample workspace.
  */
 export const offlineScript: Script = (req): ScriptedResponse => {
-  const text = req.userText.toLowerCase()
-  const results = req.toolResults.map((r) => r.toolName)
+  const text = requestText(req).toLowerCase()
+  const toolResults = resultsOfRequest(req)
+  const results = toolResults.map((r) => r.toolName)
   const count = (name: string) => results.filter((n) => n === name).length
-  const last = req.toolResults.at(-1)
+  const last = toolResults.at(-1)
 
   // The explore subagent: its requests offer read-only tools, no bash.
   if (!req.tools.includes("bash")) {
@@ -21,7 +51,7 @@ export const offlineScript: Script = (req): ScriptedResponse => {
   }
 
   if (text.includes("explain") || text.includes("explore")) {
-    const explored = req.toolResults.find((r) => r.toolName === "explore")
+    const explored = toolResults.find((r) => r.toolName === "explore")
     if (!explored) {
       return {
         text: "I'll send a subagent to look around, so this conversation stays focused.",

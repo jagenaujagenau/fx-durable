@@ -1,9 +1,8 @@
 import { randomUUID } from "node:crypto"
-import { cp, mkdir, stat, writeFile } from "node:fs/promises"
+import { cp, mkdir, stat } from "node:fs/promises"
 import { join } from "node:path"
 import { HarnessAgent, type HarnessAgentSession } from "@ai-sdk/harness/agent"
-import { Schema } from "effect"
-import { DurableFx, sqlite, type DurableFxOptions, type Transport, type TransportContext } from "fx-durable"
+import { DurableFx, sqlite, type DurableFxOptions } from "fx-durable"
 import { scriptedModel } from "fx-durable/testing"
 import { createFxDurableHarness } from "./fx-durable-harness"
 import { live } from "./live"
@@ -25,57 +24,6 @@ export const MODELS = [
   { id: "openai/gpt-5", name: "GPT-5", provider: "openai" },
   { id: "google/gemini-2.5-pro", name: "Gemini 2.5 Pro", provider: "google" }
 ] as const
-
-// ---------------------------------------------------------------------------
-// Token streaming: tee each model response and publish its text deltas
-// ---------------------------------------------------------------------------
-
-const TextDelta = Schema.Struct({ type: Schema.Literal("text-delta"), delta: Schema.String })
-const decodeTextDelta = Schema.decodeUnknownOption(Schema.fromJsonString(TextDelta))
-
-const publishDeltas = async (body: ReadableStream<Uint8Array>, context: TransportContext) => {
-  const decoder = new TextDecoder()
-  let buffer = ""
-  const line = (raw: string) => {
-    if (!raw.startsWith("data:")) return
-    const part = decodeTextDelta(raw.slice(5).trim())
-    if (part._tag === "Some") live.publish(context.agentId, { type: "text-delta", taskId: context.taskId, delta: part.value.delta })
-  }
-  const reader = body.getReader()
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      let index: number
-      while ((index = buffer.indexOf("\n")) >= 0) {
-        line(buffer.slice(0, index).replace(/\r$/, ""))
-        buffer = buffer.slice(index + 1)
-      }
-    }
-  } catch {
-    // The model stream failed; fx-durable journals that on its own branch.
-  }
-}
-
-const streamingTransport =
-  (base: Transport): Transport =>
-  async (input, init, context) => {
-    const response = await base(input, init)
-    if (!context || !response.ok || !response.body) return response
-    const [forLibfx, forViewers] = response.body.tee()
-    void publishDeltas(forViewers, context)
-    if (process.env.FXD_DEBUG_STREAMS) {
-      // Debugging aid: keep each raw model response next to the journal.
-      const [forLibfxNext, forDisk] = forLibfx.tee()
-      void (async () => {
-        await mkdir(join(DATA_DIR, "streams"), { recursive: true })
-        await writeFile(join(DATA_DIR, "streams", `${context.taskId}.sse`), await new Response(forDisk).text())
-      })()
-      return new Response(forLibfxNext, { status: response.status, statusText: response.statusText, headers: response.headers })
-    }
-    return new Response(forLibfx, { status: response.status, statusText: response.statusText, headers: response.headers })
-  }
 
 // ---------------------------------------------------------------------------
 // One DurableFx + HarnessAgent per process
@@ -105,21 +53,20 @@ const open = async (): Promise<Runtime> => {
   }
   const tools = createCodingTools(workspaceOf)
 
-  const base: Transport = OFFLINE ? scriptedModel(offlineScript, { latencyMs: 500, chunkDelayMs: 12 }) : (input, init) => fetch(input, init)
   const options: DurableFxOptions = {
     storage: sqlite(join(DATA_DIR, "fx.db")),
     runtimes: {
       [CODING_RUNTIME]: { tools: tools.coding, instructions: SYSTEM_PROMPT, hooks: permissionHooks },
       [EXPLORER_RUNTIME]: { tools: tools.explorer, instructions: EXPLORER_PROMPT }
     },
-    fetch: streamingTransport(base),
-    idlePollMillis: 100,
-    // Recover after `opened` is set: recovered tool calls look up their workspace through it.
+    // libfx streams the model's tokens itself; offline, a scripted model stands in.
+    fetch: OFFLINE ? scriptedModel(offlineScript, { latencyMs: 500, chunkDelayMs: 12 }) : undefined,
+    // Continue after `opened` is set: continued tool calls look up their workspace through it.
     recovery: "manual"
   }
   const fx = await DurableFx.open(options)
   opened = fx
-  // Recover any turn that was running when the previous process died.
+  // Continue every request that was running when the previous process died.
   await fx.resume()
 
   const harness = createFxDurableHarness({
@@ -127,10 +74,7 @@ const open = async (): Promise<Runtime> => {
     runtime: CODING_RUNTIME,
     tools: tools.coding,
     defaultModel: DEFAULT_MODEL,
-    textDeltas: (agentId, onDelta) =>
-      live.subscribe(agentId, (event) => {
-        if (event.type === "text-delta") onDelta(event.taskId, event.delta)
-      })
+    forkOf: (agentId) => live.forkOf(agentId)
   })
   // No `model` here: each durable agent keeps its own (switchable) model.
   const agent = new HarnessAgent({ harness, permissionMode: "allow-all" })
@@ -149,7 +93,7 @@ export const runtime = (): Promise<Runtime> => (globalThis.fxDurableRuntime ??= 
 // ---------------------------------------------------------------------------
 
 /**
- * Fork a session from its latest checkpoint. A sample-project workspace is
+ * Fork a session from its conversation as it is now. A sample-project workspace is
  * copied, so the two sessions don't edit the same files; a directory you
  * chose is shared (it's yours).
  */
@@ -163,7 +107,11 @@ export const forkChatSession = async (sourceId: string) => {
     cwd = join(WORKSPACES_DIR, id)
     await cp(sourceCwd, cwd, { recursive: true })
   }
+  // The fork's own session starts from the source's conversation; its history view shows the source's up to here.
+  let cursor = 0
+  for await (const line of source.events({ follow: false })) cursor = line.cursor ?? cursor
   await source.fork(id, { cwd })
+  live.recordFork(id, { from: sourceId, cursor })
   live.setMode(id, live.modeOf(sourceId))
   if (cwd) workspaces.set(id, cwd)
   return { id, cwd: cwd ?? "" }

@@ -11,7 +11,8 @@ import { live, type ToolCategory } from "./live"
  * Replay policy is chosen per tool from what happens if it runs twice:
  * reads are safe; writes are idempotent (same content, or an edit that is
  * already applied); shell commands are unsafe, so an interrupted command is
- * reported as outcome unknown instead of being run again.
+ * reported as outcome unknown instead of being run again (libfx tells the model
+ * it may have partly run).
  */
 
 export type WorkspaceResolver = (agentId: string) => Promise<string>
@@ -84,8 +85,6 @@ export const createCodingTools = (workspaceOf: WorkspaceResolver): CodingToolset
     description:
       "Read a text file from the workspace. Returns numbered lines (like `cat -n`). Use offset/limit for large files.",
     replay: "safe",
-    // Observes the workspace: after a crash, read it again rather than reuse a stale answer.
-    reuse: false,
     inputSchema: z.object({
       path: z.string().describe("File path, relative to the workspace root"),
       offset: z.number().int().min(1).optional().describe("1-based line to start from"),
@@ -105,6 +104,8 @@ export const createCodingTools = (workspaceOf: WorkspaceResolver): CodingToolset
     name: "write_file",
     description: "Create or overwrite a file in the workspace with the given content. Prefer edit_file for changes to existing files.",
     replay: "safe",
+    // libfx never runs it alongside the other calls of a model response.
+    writes: true,
     inputSchema: z.object({
       path: z.string().describe("File path, relative to the workspace root"),
       content: z.string().describe("The complete new file content")
@@ -124,6 +125,8 @@ export const createCodingTools = (workspaceOf: WorkspaceResolver): CodingToolset
     description:
       "Replace an exact string in a file. old_string must match the file exactly (including whitespace) and be unique unless replace_all is true. Read the file first.",
     replay: "safe",
+    // libfx never runs it alongside the other calls of a model response.
+    writes: true,
     inputSchema: z.object({
       path: z.string().describe("File path, relative to the workspace root"),
       old_string: z.string().describe("Exact text to replace"),
@@ -153,8 +156,6 @@ export const createCodingTools = (workspaceOf: WorkspaceResolver): CodingToolset
     name: "list_files",
     description: "List the entries of a directory in the workspace (directories end with /).",
     replay: "safe",
-    // Observes the workspace: after a crash, read it again rather than reuse a stale answer.
-    reuse: false,
     inputSchema: z.object({ path: z.string().optional().describe("Directory, relative to the workspace root (default: root)") }),
     execute: async (input, context) => {
       const root = await prepare("list_files", "read", input, context)
@@ -173,8 +174,6 @@ export const createCodingTools = (workspaceOf: WorkspaceResolver): CodingToolset
     name: "glob",
     description: 'Find files by glob pattern, e.g. "**/*.ts" or "src/**/*.test.js". Ignores .git and node_modules.',
     replay: "safe",
-    // Observes the workspace: after a crash, read it again rather than reuse a stale answer.
-    reuse: false,
     inputSchema: z.object({
       pattern: z.string().describe("Glob pattern"),
       path: z.string().optional().describe("Directory to search from (default: root)")
@@ -195,8 +194,6 @@ export const createCodingTools = (workspaceOf: WorkspaceResolver): CodingToolset
     name: "grep",
     description: "Search file contents with a regular expression (ripgrep syntax). Returns matching lines as path:line:text.",
     replay: "safe",
-    // Observes the workspace: after a crash, read it again rather than reuse a stale answer.
-    reuse: false,
     inputSchema: z.object({
       pattern: z.string().describe("Regular expression"),
       path: z.string().optional().describe("File or directory to search (default: root)"),
@@ -219,6 +216,8 @@ export const createCodingTools = (workspaceOf: WorkspaceResolver): CodingToolset
     description:
       "Run a shell command in the workspace root (bash -c). Use for tests, builds, git, and package managers. Not for reading or editing files: use the file tools.",
     replay: "unsafe",
+    // libfx never runs it alongside the other calls of a model response.
+    writes: true,
     inputSchema: z.object({
       command: z.string().describe("The command to run"),
       description: z.string().optional().describe("What the command does, in 5-10 words"),
@@ -229,7 +228,7 @@ export const createCodingTools = (workspaceOf: WorkspaceResolver): CodingToolset
       // Stream output: durably (for viewers that reconnect) and live (for the open page).
       return run(input.command, root, context.signal, input.timeout_ms ?? 120_000, (chunk) => {
         context.progress(chunk)
-        live.publish(context.agentId, { type: "tool-progress", taskId: context.taskId, chunk })
+        live.publish(context.agentId, { type: "tool-progress", taskId: context.executionId, chunk })
       })
     }
   })
@@ -278,7 +277,7 @@ const CATEGORIES = new Map<string, ToolCategory>([
 /**
  * Permission prompts as a beforeTool hook. It runs before fx-durable journals
  * the call, so a crash while a prompt is open leaves nothing half-started:
- * the recovered turn simply asks again.
+ * when libfx continues the turn, the call asks again.
  */
 export const permissionHooks: ToolHooks = {
   beforeTool: async (call, context) => {
@@ -301,7 +300,7 @@ export const SYSTEM_PROMPT = `You are a coding agent working in a local project 
 - Verify changes: run the tests or the relevant command with bash.
 - If a tool call is denied, do not retry it; ask the user.
 - Be concise. Use GitHub-flavored Markdown. Reference code as path:line.
-- If a turn was interrupted and recovered, read the recovery notes carefully: never repeat an operation whose outcome is unknown without checking first.`
+- If a tool reports that it may have partly run, check the workspace before repeating it.`
 
 export const EXPLORER_PROMPT = `You are a read-only investigator working for a coding agent, in a local project workspace.
 

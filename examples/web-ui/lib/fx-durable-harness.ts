@@ -13,20 +13,27 @@ import {
 import type { JSONSchema7, LanguageModelV4FinishReason, LanguageModelV4Usage } from "@ai-sdk/provider"
 import { jsonSchema, tool } from "@ai-sdk/provider-utils"
 import { Schema } from "effect"
-import { Submission, type DurableAgent, type DurableEvent, type DurableFx, type DurableTool, type Json } from "fx-durable"
+import { Submission, type DurableFx, type DurableTool, type FxStreamLine, type Json } from "fx-durable"
 
 /**
  * A HarnessV1 adapter backed by fx-durable.
  *
  * `@ai-sdk/harness-fx` runs the fx CLI inside a sandbox over ACP. This adapter
  * runs the same agent kernel (libfx) in the host process instead, with
- * fx-durable's journal underneath. A harness session is a durable agent: the
- * session id is the agent id, and every prompt turn is a durable submission.
- * If the process dies mid-turn, fx-durable recovers the turn when it opens
- * again, and `doReadHistory` / `doContinueTurn` read the result from the journal.
+ * fx-durable around it. A harness session is a durable agent: the session id
+ * is the agent id, and every prompt turn is a durable request. libfx keeps the
+ * conversation as a durable session, so if the process dies mid-turn the turn
+ * continues when fx-durable opens again, and `doReadHistory` /
+ * `doContinueTurn` read it back from the session's stream.
  */
 
 const HARNESS_ID = "fx-durable"
+
+/** Where a fork came from: its source agent, and the source's last stream cursor at the fork. */
+export interface ForkOrigin {
+  readonly from: string
+  readonly cursor: number
+}
 
 export interface FxDurableHarnessSettings {
   /** An open fx-durable runtime. The harness never closes it. */
@@ -37,55 +44,15 @@ export interface FxDurableHarnessSettings {
   readonly tools: ReadonlyArray<DurableTool>
   /** Model used when a turn does not name one. */
   readonly defaultModel: string
-  /**
-   * Optional live token stream: `subscribe(agentId, onDelta)` returns an
-   * unsubscribe function. Without it, text arrives one model step at a time.
-   */
-  readonly textDeltas?: (agentId: string, onDelta: (taskId: string, delta: string) => void) => () => void
+  /** A fork's session starts empty; its history begins with its source's, up to the fork. */
+  readonly forkOf?: (agentId: string) => ForkOrigin | null
 }
 
-// ---------------------------------------------------------------------------
-// Journal payloads, parsed at the boundary
-// ---------------------------------------------------------------------------
-
-const TextBlock = Schema.Struct({ type: Schema.Literal("text"), text: Schema.String })
-const SubmissionCreated = Schema.Struct({ content: Schema.Union([Schema.String, Schema.Array(TextBlock)]) })
-const ModelCompleted = Schema.Struct({
-  text: Schema.String,
-  finishReason: Schema.NullOr(Schema.String),
-  usage: Schema.Struct({ inputTokens: Schema.NullOr(Schema.Number), outputTokens: Schema.NullOr(Schema.Number) })
-})
-const ToolEvent = Schema.Struct({
-  tool: Schema.String,
-  input: Schema.optional(Schema.Json),
-  error: Schema.optional(Schema.String),
-  durationMs: Schema.optional(Schema.Number)
-})
-const SubmissionCompleted = Schema.Struct({
-  text: Schema.String,
-  stopReason: Schema.String,
-  usage: Schema.NullOr(Schema.Struct({ inputTokens: Schema.Number, outputTokens: Schema.Number }))
-})
-const SubmissionFailed = Schema.Struct({ error: Schema.optional(Schema.String) })
-const TurnSteered = Schema.Struct({ text: Schema.String })
 const TurnCursor = Schema.Struct({ agentId: Schema.String, submissionId: Schema.String, after: Schema.Number })
 type TurnCursor = typeof TurnCursor.Type
-
-const decodeSubmissionCreated = Schema.decodeUnknownSync(SubmissionCreated)
-const decodeModelCompleted = Schema.decodeUnknownSync(ModelCompleted)
-const decodeToolEvent = Schema.decodeUnknownSync(ToolEvent)
-const decodeSubmissionCompleted = Schema.decodeUnknownSync(SubmissionCompleted)
-const decodeSubmissionFailed = Schema.decodeUnknownSync(SubmissionFailed)
-const decodeTurnSteered = Schema.decodeUnknownSync(TurnSteered)
 const decodeTurnCursor = Schema.decodeUnknownSync(TurnCursor)
 const isString = Schema.is(Schema.String)
-
-interface TokenCounts {
-  readonly inputTokens: number | null
-  readonly outputTokens: number | null
-}
-
-const NO_TOKENS: TokenCounts = { inputTokens: null, outputTokens: null }
+const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Json))
 
 const promptText = (prompt: HarnessV1Prompt): string => {
   if (isString(prompt)) return prompt
@@ -93,25 +60,40 @@ const promptText = (prompt: HarnessV1Prompt): string => {
   return prompt.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n")
 }
 
-const contentText = (content: typeof SubmissionCreated.Type.content): string =>
-  isString(content) ? content : content.map((block) => block.text).join("\n")
-
-const usageOf = ({ inputTokens, outputTokens }: TokenCounts): LanguageModelV4Usage => ({
-  inputTokens: { total: inputTokens ?? undefined, noCache: undefined, cacheRead: undefined, cacheWrite: undefined },
-  outputTokens: { total: outputTokens ?? undefined, text: undefined, reasoning: undefined }
-})
-
-const isUnifiedFinishReason = Schema.is(Schema.Literals(["stop", "length", "content-filter", "tool-calls", "error", "other"]))
-
-const finishReasonOf = (raw: string | null): LanguageModelV4FinishReason => {
-  const text = raw ?? "stop"
-  if (isUnifiedFinishReason(text)) return { unified: text, raw: text }
-  if (text === "refused") return { unified: "content-filter", raw: text }
-  if (text === "max_tokens") return { unified: "length", raw: text }
-  return { unified: "stop", raw: text }
+/** A tool's result as the model got it: JSON text when the tool returned JSON. */
+const outputOf = (content: string | undefined): Json => {
+  if (content === undefined) return null
+  const parsed = decodeJson(content)
+  return parsed._tag === "Some" ? parsed.value : content
 }
 
-const TERMINAL = new Set(["submission.completed", "submission.failed", "submission.cancelled"])
+interface TurnUsage {
+  readonly inputTokens?: number
+  readonly outputTokens?: number
+  readonly cacheReadTokens?: number
+  readonly reasoningTokens?: number
+}
+
+const usageOf = (usage: TurnUsage | undefined): LanguageModelV4Usage => ({
+  inputTokens: { total: usage?.inputTokens, noCache: undefined, cacheRead: usage?.cacheReadTokens, cacheWrite: undefined },
+  outputTokens: { total: usage?.outputTokens, text: undefined, reasoning: usage?.reasoningTokens }
+})
+
+const finishReasonOf = (stopReason: string): LanguageModelV4FinishReason => {
+  switch (stopReason) {
+    case "end_turn":
+      return { unified: "stop", raw: stopReason }
+    case "max_output_tokens":
+    case "max_model_turns":
+      return { unified: "length", raw: stopReason }
+    case "refused":
+      return { unified: "content-filter", raw: stopReason }
+    case "error":
+      return { unified: "error", raw: stopReason }
+    default:
+      return { unified: "other", raw: stopReason }
+  }
+}
 
 /** The durable tools, as the `ToolSet` HarnessAgent validates built-in tool calls against. */
 const builtinToolsOf = (tools: ReadonlyArray<DurableTool>): Record<string, HarnessV1BuiltinTool> =>
@@ -129,234 +111,110 @@ const builtinToolsOf = (tools: ReadonlyArray<DurableTool>): Record<string, Harne
   )
 
 // ---------------------------------------------------------------------------
-// Live translation: durable events → harness stream parts
+// Live translation: libfx stream lines → harness stream parts
 // ---------------------------------------------------------------------------
 
 /**
- * Translates one submission's durable events into harness stream parts.
- * Tool calls are executed by fx-durable, so they are `providerExecuted`.
+ * Translates one turn's stream lines into harness stream parts. Tool calls
+ * are executed by fx-durable, so they are `providerExecuted`. A model step
+ * ends when its tool results are in and the model speaks or calls again.
  */
-const createTranslator = (agent: DurableAgent, emit: (part: HarnessV1StreamPart) => void) => {
-  const calls = new Set<string>()
-  // Model tasks whose step has begun (from a live delta or `model.started`), and
-  // those whose text was streamed live, so `model.completed` only closes it.
-  const begun = new Set<string>()
-  const streamed = new Set<string>()
-  // A step ends when the next model call starts (or the turn ends), so the
-  // tool calls a model step requested land inside that step.
-  let openStep: HarnessV1StreamPart | null = null
-  let lastText = ""
-  // libfx starts a tool before the model step that requested it is journaled.
-  // Hold those calls until the step's text is out, so text comes first.
-  let modelRunning = false
-  let deferred: Array<() => void> = []
+const createTranslator = (emit: (part: HarnessV1StreamPart) => void) => {
+  let textId: string | null = null
+  let texts = 0
+  let stepHasTools = false
 
-  const emitText = (id: string, text: string) => {
-    lastText = text
-    emit({ type: "text-start", id })
-    emit({ type: "text-delta", id, delta: text })
-    emit({ type: "text-end", id })
+  const closeText = () => {
+    if (textId) emit({ type: "text-end", id: textId })
+    textId = null
   }
-  const closeStep = () => {
-    if (openStep) emit(openStep)
-    openStep = null
-  }
-  const releaseDeferred = () => {
-    for (const release of deferred) release()
-    deferred = []
-  }
-  const beginStep = (taskId: string) => {
-    if (begun.has(taskId)) return
-    begun.add(taskId)
-    releaseDeferred()
-    closeStep()
-    modelRunning = true
+  /** The model speaks or calls again after its tools ran: the previous step is over. */
+  const nextStep = () => {
+    if (!stepHasTools) return
+    stepHasTools = false
+    emit({ type: "finish-step", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage: usageOf(undefined) })
   }
 
-  /** A live token delta for a model task of this agent. */
-  const onDelta = (taskId: string, delta: string) => {
-    beginStep(taskId)
-    if (!streamed.has(taskId)) {
-      streamed.add(taskId)
-      emit({ type: "text-start", id: taskId })
-    }
-    lastText += delta
-    emit({ type: "text-delta", id: taskId, delta })
-  }
-
-  const emitCall = (toolCallId: string, toolName: string, input: Json) => {
-    if (calls.has(toolCallId)) return
-    calls.add(toolCallId)
-    emit({ type: "tool-call", toolCallId, toolName, input: JSON.stringify(input), providerExecuted: true })
-  }
-
-  /** The tool's journaled output, read from the active turn's task records. */
-  const outputOf = async (taskId: string): Promise<Json | null> => {
-    const turn = await agent.currentTurn()
-    return turn?.tasks.find((task) => task.id === taskId)?.output ?? null
-  }
-
-  const onEvent = async (event: DurableEvent): Promise<boolean> => {
-    const taskId = event.taskId ?? event.id
-    emit({ type: "raw", rawValue: { durableEvent: { sequence: event.sequence, type: event.type, payload: event.payload } } })
-
-    switch (event.type) {
-      case "model.started":
-        beginStep(taskId)
-        return false
-      case "model.completed": {
-        const model = decodeModelCompleted(event.payload)
-        if (streamed.has(taskId)) {
-          emit({ type: "text-end", id: taskId })
-          lastText = model.text
-        } else if (model.text.length > 0) {
-          emitText(taskId, model.text)
+  /** Returns true when the turn ended. */
+  const onLine = (line: FxStreamLine): boolean => {
+    switch (line.type) {
+      case "text_delta":
+        nextStep()
+        if (!textId) {
+          textId = `text-${++texts}`
+          emit({ type: "text-start", id: textId })
         }
-        modelRunning = false
-        releaseDeferred()
-        openStep = { type: "finish-step", finishReason: finishReasonOf(model.finishReason), usage: usageOf(model.usage) }
+        emit({ type: "text-delta", id: textId, delta: line.delta })
         return false
-      }
-      case "tool.started": {
-        const call = decodeToolEvent(event.payload)
-        const start = () => emitCall(taskId, call.tool, call.input ?? {})
-        if (modelRunning) deferred.push(start)
-        else start()
+      case "tool_start":
+        closeText()
+        emit({ type: "tool-call", toolCallId: line.id, toolName: line.name, input: JSON.stringify(line.input ?? {}), providerExecuted: true })
+        stepHasTools = true
         return false
-      }
-      case "tool.completed":
-      case "tool.reused":
-      case "tool.replayed": {
-        releaseDeferred()
-        const call = decodeToolEvent(event.payload)
-        emitCall(taskId, call.tool, call.input ?? {})
-        const output = (await outputOf(taskId)) ?? { replayed: event.type !== "tool.completed" }
-        emit({ type: "tool-result", toolCallId: taskId, toolName: call.tool, result: output })
+      case "tool_end":
+        // A tool that returned nothing has a null result; the stream part needs a value.
+        emit({ type: "tool-result", toolCallId: line.id, toolName: line.name, result: outputOf(line.content) ?? "", isError: line.isError })
         return false
-      }
-      case "tool.failed":
-      case "tool.cancelled":
-      case "tool.outcome_unknown": {
-        releaseDeferred()
-        const call = decodeToolEvent(event.payload)
-        emitCall(taskId, call.tool, call.input ?? {})
-        const result = event.type === "tool.outcome_unknown" ? "outcome unknown · not replayed" : (call.error ?? event.type)
-        emit({ type: "tool-result", toolCallId: taskId, toolName: call.tool, result, isError: true })
-        return false
-      }
-      case "submission.completed": {
-        const submission = decodeSubmissionCompleted(event.payload)
-        releaseDeferred()
-        // The final model step can settle after the turn commits, in which
-        // case its text is only on the submission result.
-        if (submission.text.length > 0 && submission.text !== lastText) {
-          emitText(event.id, submission.text)
-          openStep ??= { type: "finish-step", finishReason: finishReasonOf(submission.stopReason), usage: usageOf(NO_TOKENS) }
-        }
-        closeStep()
-        emit({ type: "finish", finishReason: finishReasonOf(submission.stopReason), totalUsage: usageOf(submission.usage ?? NO_TOKENS) })
+      case "turn_end": {
+        closeText()
+        emit({ type: "finish-step", finishReason: finishReasonOf(line.stopReason), usage: usageOf(line.usage) })
+        if (line.stopReason === "error") emit({ type: "error", error: new Error(line.error?.message ?? "the turn failed") })
+        emit({ type: "finish", finishReason: finishReasonOf(line.stopReason), totalUsage: usageOf(line.usage) })
         return true
       }
-      case "submission.failed": {
-        const failure = decodeSubmissionFailed(event.payload)
-        closeStep()
-        emit({ type: "error", error: new Error(failure.error ?? "submission failed") })
-        emit({ type: "finish", finishReason: { unified: "error", raw: "failed" }, totalUsage: usageOf(NO_TOKENS) })
-        return true
-      }
-      case "submission.cancelled":
-        closeStep()
-        emit({ type: "finish", finishReason: { unified: "other", raw: "cancelled" }, totalUsage: usageOf(NO_TOKENS) })
-        return true
       default:
-        return TERMINAL.has(event.type)
+        return false
     }
   }
 
-  return { onEvent, onDelta }
+  return { onLine }
 }
 
 // ---------------------------------------------------------------------------
-// History: the conversation, rebuilt from the agent's event log
+// History: the conversation, read back from the agent's session
 // ---------------------------------------------------------------------------
 
-const historyFromEvents = (events: ReadonlyArray<DurableEvent>, outputs: ReadonlyMap<string, Json>): Array<HarnessV1Message> => {
+const historyFromLines = (lines: ReadonlyArray<FxStreamLine>): Array<HarnessV1Message> => {
   const messages: Array<HarnessV1Message> = []
   let assistant: Array<HarnessV1AssistantMessage["content"][number]> = []
-  let lastText = ""
-  let stepStart = 0
-  // The final model step can be journaled after its submission completed;
-  // its text was already taken from the submission result.
-  const settled = new Set<string>()
+  let text = ""
+  const flushText = () => {
+    if (text.length > 0) assistant.push({ type: "text", text })
+    text = ""
+  }
   const flush = () => {
+    flushText()
     if (assistant.length > 0) messages.push({ role: "assistant", content: assistant })
     assistant = []
   }
 
-  for (const event of events) {
-    const toolCallId = event.taskId ?? event.id
-    if (event.submissionId !== null && settled.has(event.submissionId)) continue
-    if (event.submissionId !== null && TERMINAL.has(event.type)) settled.add(event.submissionId)
-
-    switch (event.type) {
-      case "submission.created":
+  for (const line of lines) {
+    switch (line.type) {
+      case "turn_start":
         flush()
-        messages.push({
-          role: "user",
-          content: [{ type: "text", text: contentText(decodeSubmissionCreated(event.payload).content) }],
-          at: event.createdAt.toISOString()
-        })
+        if (line.input) messages.push({ role: "user", content: [{ type: "text", text: line.input }] })
         break
-      case "turn.steered":
+      case "user_message":
         // Guidance typed while the turn ran: a user message in the middle of the turn.
         flush()
-        messages.push({
-          role: "user",
-          content: [{ type: "text", text: decodeTurnSteered(event.payload).text }],
-          at: event.createdAt.toISOString()
-        })
-        stepStart = 0
+        messages.push({ role: "user", content: [{ type: "text", text: line.text }] })
         break
-      case "model.started":
-        stepStart = assistant.length
+      case "text_delta":
+        text += line.delta
         break
-      case "model.completed": {
-        const { text } = decodeModelCompleted(event.payload)
-        if (text.length > 0) {
-          // Tools of this step may already be listed; the text precedes them.
-          assistant.splice(stepStart, 0, { type: "text", text })
-          lastText = text
-        }
+      case "tool_start":
+        flushText()
+        assistant.push({ type: "tool-call", toolCallId: line.id, toolName: line.name, input: line.input ?? {}, providerExecuted: true })
         break
-      }
-      case "tool.started": {
-        const call = decodeToolEvent(event.payload)
-        assistant.push({ type: "tool-call", toolCallId, toolName: call.tool, input: call.input ?? {}, providerExecuted: true })
-        break
-      }
-      case "tool.completed":
-      case "tool.failed":
-      case "tool.outcome_unknown": {
-        const call = decodeToolEvent(event.payload)
+      case "tool_end":
         assistant.push({
           type: "tool-result",
-          toolCallId,
-          toolName: call.tool,
-          output:
-            event.type === "tool.completed"
-              ? { type: "json", value: outputs.get(toolCallId) ?? { status: "completed", durationMs: call.durationMs ?? null } }
-              : { type: "error-text", value: event.type === "tool.failed" ? (call.error ?? "failed") : "outcome unknown · not replayed" }
+          toolCallId: line.id,
+          toolName: line.name,
+          output: line.isError ? { type: "error-text", value: line.content ?? "failed" } : { type: "json", value: outputOf(line.content) }
         })
         break
-      }
-      case "submission.completed": {
-        const { text } = decodeSubmissionCompleted(event.payload)
-        if (text.length > 0 && text !== lastText) assistant.push({ type: "text", text })
-        flush()
-        break
-      }
-      case "submission.failed":
-      case "submission.cancelled":
+      case "turn_end":
         flush()
         break
     }
@@ -365,116 +223,72 @@ const historyFromEvents = (events: ReadonlyArray<DurableEvent>, outputs: Readonl
   return messages
 }
 
-const AgentForked = Schema.Struct({ from: Schema.String, checkpoint: Schema.NullOr(Schema.Number) })
-const CheckpointCreated = Schema.Struct({ sequence: Schema.Number })
-const isAgentForked = Schema.is(AgentForked)
-const isCheckpointCreated = Schema.is(CheckpointCreated)
-
 interface Conversation {
   readonly messages: Array<HarnessV1Message>
-  /** The last event sequence read. */
+  /** The last cursor read. */
   readonly cursor: number | null
-}
-
-/**
- * An agent's conversation from its journal. A fork's journal starts empty, so
- * its history begins with its source's, up to the checkpoint it was forked
- * from (recursively, for forks of forks). `until` cuts a source there.
- */
-const conversationOf = async (fx: DurableFx, agentId: string, after: number, until: number | null, depth: number): Promise<Conversation> => {
-  const agent = await fx.attach(agentId)
-  const events: Array<DurableEvent> = []
-  for await (const event of agent.events({ after, follow: false })) {
-    events.push(event)
-    if (until !== null && event.type === "checkpoint.created" && isCheckpointCreated(event.payload) && event.payload.sequence === until) break
-  }
-
-  const forked = after === 0 ? events.find((event) => event.type === "agent.forked") : undefined
-  const prefix =
-    forked && isAgentForked(forked.payload) && forked.payload.checkpoint !== null && depth < 10
-      ? (await conversationOf(fx, forked.payload.from, 0, forked.payload.checkpoint, depth + 1).catch(() => null))?.messages ?? []
-      : []
-
-  // Tool results live in the task journal, not in the events.
-  const outputs = new Map<string, Json>()
-  await Promise.all(
-    events
-      .filter((event) => event.type === "tool.completed" && event.taskId !== null)
-      .map(async (event) => {
-        const task = await agent.task(event.taskId ?? "").catch(() => null)
-        if (task?.output !== null && task?.output !== undefined) outputs.set(task.id, task.output)
-      })
-  )
-  return { messages: [...prefix, ...historyFromEvents(events, outputs)], cursor: events.at(-1)?.sequence ?? null }
-}
-
-// ---------------------------------------------------------------------------
-// The adapter
-// ---------------------------------------------------------------------------
-
-interface ActiveTurn {
-  readonly abort: AbortController
-  cursor: TurnCursor
 }
 
 export const createFxDurableHarness = (settings: FxDurableHarnessSettings): HarnessV1 => {
   const { fx, runtime, defaultModel } = settings
 
+  /** An agent's conversation; a fork's begins with its source's (recursively), up to the fork. */
+  const conversationOf = async (agentId: string, after: number, until: number | null, depth: number): Promise<Conversation> => {
+    const agent = await fx.attach(agentId)
+    const lines: Array<FxStreamLine> = []
+    for await (const line of agent.events({ after, follow: false })) {
+      if (until !== null && (line.cursor ?? 0) > until) break
+      lines.push(line)
+    }
+    const origin = after === 0 && depth < 10 ? (settings.forkOf?.(agentId) ?? null) : null
+    const prefix = origin ? ((await conversationOf(origin.from, 0, origin.cursor, depth + 1).catch(() => null))?.messages ?? []) : []
+    return { messages: [...prefix, ...historyFromLines(lines)], cursor: lines.at(-1)?.cursor ?? null }
+  }
+
   const doStart: HarnessV1["doStart"] = async (options) => {
     // The session id is the durable agent id, so a new process attaches to the
-    // same journal simply by reusing the session id.
+    // same agent simply by reusing the session id.
     const agentId = options.sessionId
     // An agent the host already created keeps its model and workspace;
     // otherwise create one working in the session's directory.
     const existing = (await fx.listAgents()).find((record) => record.id === agentId)
     const cwd = existing?.cwd ?? options.sessionWorkDir
     let agent = existing ? await fx.attach(agentId) : await fx.agent(agentId, { runtime, model: defaultModel, cwd })
-    let active: ActiveTurn | null = null
+    let active: { readonly abort: AbortController; cursor: TurnCursor } | null = null
 
     const withModel = async (model: string | undefined) => {
       if (model && model !== (await agent.info()).model) agent = await fx.agent(agentId, { runtime, model, cwd })
       return agent
     }
 
-    /** Pump a submission's events into `emit` until it reaches a terminal state. */
+    /** Pump a request's stream lines into `emit` until its turn ends. */
     const drive = (cursor: TurnCursor, emit: (part: HarnessV1StreamPart) => void, abortSignal?: AbortSignal): HarnessV1PromptControl => {
-      const turn: ActiveTurn = { abort: new AbortController(), cursor }
+      const turn = { abort: new AbortController(), cursor }
       active = turn
-      // A user abort cancels the durable submission; a suspend or detach only stops listening.
+      // A user abort cancels the durable request; a suspend or detach only stops listening.
       abortSignal?.addEventListener("abort", () => {
         void new Submission(fx, cursor.submissionId, agentId, null, false).cancel()
         turn.abort.abort()
       })
-      const translator = createTranslator(agent, emit)
-      // Journal events and live deltas go through one queue, in arrival order.
-      let queue: Promise<unknown> = Promise.resolve()
-      const serially = <A>(task: () => A | Promise<A>): Promise<A> => {
-        const next = queue.then(task)
-        queue = next.catch(() => undefined)
-        return next
-      }
-      const unsubscribe = settings.textDeltas?.(agentId, (taskId, delta) => {
-        if (!turn.abort.signal.aborted) void serially(() => translator.onDelta(taskId, delta))
-      })
+      const translator = createTranslator(emit)
       const stopped = new Promise<IteratorReturnResult<undefined>>((resolve) =>
         turn.abort.signal.addEventListener("abort", () => resolve({ done: true, value: undefined }))
       )
 
       const done = (async () => {
         emit({ type: "stream-start", modelId: (await agent.info()).model })
-        const events = agent.events({ after: cursor.after })[Symbol.asyncIterator]()
+        const lines = agent.events({ after: cursor.after })[Symbol.asyncIterator]()
         try {
           while (!turn.abort.signal.aborted) {
-            const next = await Promise.race([events.next(), stopped])
+            const next = await Promise.race([lines.next(), stopped])
             if (next.done) break
-            if (next.value.submissionId !== cursor.submissionId) continue
-            turn.cursor = { ...turn.cursor, after: next.value.sequence }
-            const event = next.value
-            if (await serially(() => translator.onEvent(event))) break
+            const line = next.value
+            if (!("messageId" in line) || line.messageId !== cursor.submissionId) continue
+            turn.cursor = { ...turn.cursor, after: line.cursor ?? turn.cursor.after }
+            if (translator.onLine(line)) break
           }
         } finally {
-          unsubscribe?.()
-          void events.return?.()
+          void lines.return?.()
           if (active === turn) active = null
         }
       })()
@@ -514,8 +328,8 @@ export const createFxDurableHarness = (settings: FxDurableHarnessSettings): Harn
       },
 
       async doContinueTurn(turn) {
-        // The turn kept running (or was recovered) inside fx-durable; re-attach
-        // to its event log from the saved cursor. Nothing is recomputed.
+        // The turn kept running (or continued after a crash) inside libfx;
+        // re-attach to its session stream from the saved cursor.
         const cursor = active?.cursor ?? suspended
         if (!cursor) throw new Error("fx-durable: no suspended turn to continue")
         return drive(cursor, turn.emit, turn.abortSignal)
@@ -530,16 +344,16 @@ export const createFxDurableHarness = (settings: FxDurableHarnessSettings): Harn
 
       async doReadHistory({ since } = {}) {
         const after = since ? Number(since) : 0
-        const { messages, cursor } = await conversationOf(fx, agentId, after, null, 0)
+        const { messages, cursor } = await conversationOf(agentId, after, null, 0)
         return { messages, cursor: String(cursor ?? after) }
       },
 
       doCompact: async () => {
-        throw new HarnessCapabilityUnsupportedError({ harnessId: HARNESS_ID, message: "fx-durable does not expose manual compaction." })
+        throw new HarnessCapabilityUnsupportedError({ harnessId: HARNESS_ID, message: "libfx manages the context; there is no manual compaction." })
       },
 
-      // The journal is the session: detaching, stopping, and destroying all
-      // leave it in SQLite so the agent can be attached again later.
+      // The session is durable: detaching, stopping, and destroying all leave
+      // it in libfx's store so the agent can be attached again later.
       doDetach: async () => {
         active?.abort.abort()
         return resumeState()

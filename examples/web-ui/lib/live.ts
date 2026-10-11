@@ -3,11 +3,13 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname } from "node:path"
 import { z } from "zod"
 import type { Json } from "fx-durable"
+import type { ForkOrigin } from "./fx-durable-harness"
 
 /**
  * In-process, non-durable state that viewers see live: token deltas,
- * permission prompts, and each session's permission mode. The durable record
- * of what happened is fx-durable's journal; this is only what is happening now.
+ * permission prompts, and each session's permission mode (and where forks came
+ * from). The durable record of what happened is the agent's libfx session; this
+ * is only what is happening now.
  */
 
 export type PermissionMode = "default" | "acceptEdits" | "plan" | "bypassPermissions"
@@ -40,13 +42,17 @@ interface Waiting {
   readonly settle: (decision: ApprovalDecision, reason?: string) => void
 }
 
-const Settings = z.object({ modes: z.record(z.string(), z.enum(["default", "acceptEdits", "plan", "bypassPermissions"])) })
+const Settings = z.object({
+  modes: z.record(z.string(), z.enum(["default", "acceptEdits", "plan", "bypassPermissions"])),
+  forks: z.record(z.string(), z.object({ from: z.string(), cursor: z.number() })).default({})
+})
 
 class Live {
   #settingsFile: string | null = null
   readonly #listeners = new Map<string, Set<Listener>>()
   readonly #approvals = new Map<string, Waiting>()
   readonly #modes = new Map<string, PermissionMode>()
+  readonly #forks = new Map<string, ForkOrigin>()
   readonly #allowed = new Map<string, Set<string>>()
 
   subscribe(agentId: string, listener: Listener): () => void {
@@ -69,6 +75,7 @@ class Live {
     try {
       const saved = Settings.parse(JSON.parse(readFileSync(file, "utf8")))
       for (const [agentId, mode] of Object.entries(saved.modes)) this.#modes.set(agentId, mode)
+      for (const [agentId, origin] of Object.entries(saved.forks)) this.#forks.set(agentId, origin)
     } catch {
       // first run, or an unreadable file: start from defaults
     }
@@ -80,11 +87,24 @@ class Live {
 
   setMode(agentId: string, mode: PermissionMode): void {
     this.#modes.set(agentId, mode)
-    if (this.#settingsFile) {
-      mkdirSync(dirname(this.#settingsFile), { recursive: true })
-      writeFileSync(this.#settingsFile, JSON.stringify({ modes: Object.fromEntries(this.#modes) }, null, 2))
-    }
+    this.#save()
     this.publish(agentId, { type: "mode-changed", mode })
+  }
+
+  /** A fork's history starts with its source's, up to where it was forked. */
+  forkOf(agentId: string): ForkOrigin | null {
+    return this.#forks.get(agentId) ?? null
+  }
+
+  recordFork(agentId: string, origin: ForkOrigin): void {
+    this.#forks.set(agentId, origin)
+    this.#save()
+  }
+
+  #save(): void {
+    if (!this.#settingsFile) return
+    mkdirSync(dirname(this.#settingsFile), { recursive: true })
+    writeFileSync(this.#settingsFile, JSON.stringify({ modes: Object.fromEntries(this.#modes), forks: Object.fromEntries(this.#forks) }, null, 2))
   }
 
   pending(agentId: string): Array<PendingApproval> {

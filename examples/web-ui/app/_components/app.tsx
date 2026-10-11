@@ -118,7 +118,7 @@ export function App() {
   const { sessions, refresh: refreshSessions } = useSessions()
   const [restarts, setRestarts] = useState(0)
   const { config, online } = useServer((pid) => {
-    setBanner(`The server restarted (pid ${pid}). fx-durable recovered every interrupted turn from the journal.`)
+    setBanner(`The server restarted (pid ${pid}). Every interrupted turn continues from its last step.`)
     setRestarts((n) => n + 1)
     void refreshSessions()
   })
@@ -518,7 +518,7 @@ function ChatView({
         )
         return
       case "/compact":
-        notice("Compaction is not available: libfx manages the context itself, and fx-durable checkpoints it after every turn.")
+        notice("Compaction is not available: libfx manages the context itself.")
         return
       default:
         notice(

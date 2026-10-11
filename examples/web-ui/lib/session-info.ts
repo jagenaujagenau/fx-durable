@@ -1,5 +1,5 @@
 import { Schema } from "effect"
-import type { DurableAgent, DurableAgentRecord, SubmissionRecord } from "fx-durable"
+import type { DurableAgentRecord, SubmissionRecord } from "fx-durable"
 import { live } from "./live"
 import { runtime } from "./runtime"
 
@@ -21,20 +21,13 @@ const titleOf = (submissions: ReadonlyArray<SubmissionRecord>) => {
   return text.length > 60 ? `${text.slice(0, 60)}…` : text
 }
 
-const ForkedFrom = Schema.Struct({ from: Schema.String })
-const isForkedFrom = Schema.is(ForkedFrom)
-
 /** "Fork of …" for a fork that has no requests of its own yet. */
-const forkTitle = async (agent: DurableAgent): Promise<string | null> => {
-  for await (const event of agent.events({ follow: false })) {
-    if (event.type === "agent.forked" && isForkedFrom(event.payload)) {
-      const { fx } = await runtime()
-      const source = await fx.attach(event.payload.from)
-      return `Fork of ${titleOf(await source.submissions(200))}`
-    }
-    if (event.sequence > 5) break
-  }
-  return null
+const forkTitle = async (id: string): Promise<string | null> => {
+  const origin = live.forkOf(id)
+  if (!origin) return null
+  const { fx } = await runtime()
+  const source = await fx.attach(origin.from).catch(() => null)
+  return source ? `Fork of ${titleOf(await source.submissions(200))}` : null
 }
 
 const summarize = async (record: DurableAgentRecord): Promise<SessionSummary> => {
@@ -43,10 +36,10 @@ const summarize = async (record: DurableAgentRecord): Promise<SessionSummary> =>
   const submissions = await agent.submissions(200)
   return {
     id: record.id,
-    title: submissions.length === 0 ? ((await forkTitle(agent)) ?? titleOf(submissions)) : titleOf(submissions),
+    title: submissions.length === 0 ? ((await forkTitle(record.id)) ?? titleOf(submissions)) : titleOf(submissions),
     cwd: record.cwd,
     model: record.model,
-    state: record.state,
+    state: submissions.some((s) => s.state === "running") ? "running" : "idle",
     updatedAt: record.updatedAt.toISOString()
   }
 }
@@ -70,7 +63,7 @@ export const sessionDetails = async (id: string) => {
     inputTokens += submission.result?.usage?.inputTokens ?? 0
     outputTokens += submission.result?.usage?.outputTokens ?? 0
   }
-  const running = submissions.find((s) => s.state === "queued" || s.state === "running")
+  const running = submissions.find((s) => s.state === "running")
   return {
     ...(await summarize(record)),
     mode: live.modeOf(id),
