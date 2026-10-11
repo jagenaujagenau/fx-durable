@@ -1,4 +1,6 @@
 import { bindTools } from "../tools/subagent.js"
+import { ExtensionSelection, type Extension } from "../tools/extension.js"
+import { ToolRegistry } from "./tool-registry.js"
 import type { ForkSpec } from "../durable/journal.js"
 import { Cause, Effect, Exit, Layer, ManagedRuntime, Option, Stream } from "effect"
 import type * as Sqlite from "../durable/sqlite/storage.js"
@@ -29,6 +31,15 @@ import type { Storage } from "../durable/storage.js"
 import type { Transport } from "../domain/transport.js"
 import { usageOf, type ModelPrices, type UsageReport } from "../domain/usage.js"
 import { buildTaskGraph, type TaskGraph } from "../domain/task-graph.js"
+import {
+  DocumentUpdateFailed,
+  documentValue,
+  type AgentDocument,
+  type DocumentUpdate,
+  type DurableDocument,
+  type GlobalDocument
+} from "../domain/documents.js"
+import { isJsonString, type JsonObject } from "../domain/json.js"
 
 /**
  * Promise/AsyncIterable façade over the Effect-native runtime, so adopting
@@ -105,7 +116,7 @@ const MAX_STEERING_BYTES = 64 * 1024
 
 const TERMINAL_EVENTS = new Set(["submission.completed", "submission.failed", "submission.cancelled"])
 
-type Services = Database | EventLog | IdGenerator | RuntimeRegistry | AgentSupervisor | RecoveryManager | CrashInjector
+type Services = Database | EventLog | IdGenerator | RuntimeRegistry | ToolRegistry | AgentSupervisor | RecoveryManager | CrashInjector
 
 const decodeContent = decodeWith(SubmissionContent, "submission content")
 
@@ -134,10 +145,9 @@ export const buildLayer = (options: DurableFxOptions, layers: DurableFxLayers = 
     databaseLayer(options.storage, layers.clock).pipe(Layer.provideMerge(ids)),
     crash,
     RuntimeRegistry.layer(options.runtimes ?? {}),
-    Registry.layer,
     LibFxModule.layer({ apiKey: options.apiKey, fetch: options.fetch, backend: options.backend })
   )
-  const events = eventLogLayer.pipe(Layer.provideMerge(base))
+  const events = eventLogLayer.pipe(Layer.provideMerge(Registry.layer.pipe(Layer.provideMerge(base))))
   const journal = Executor.layer.pipe(Layer.provideMerge(events))
   const supervisor = supervisorLayer({
     heartbeatMillis: options.heartbeatMillis,
@@ -178,7 +188,65 @@ const runOn = <A, E>(fx: DurableFx, effect: Effect.Effect<A, E, Services>): Prom
   return runner ? runner.run(effect) : Promise.reject(notOpen())
 }
 
+export interface DocumentReadOptions {
+  /** Read the value as of this checkpoint sequence (rewindable documents): the latest one written before it. */
+  readonly checkpoint?: number
+}
+
+const readDocument = async <T extends JsonObject>(
+  fx: DurableFx,
+  document: DurableDocument<T>,
+  agentId: string | null,
+  options: DocumentReadOptions = {}
+): Promise<T> => {
+  const checkpoint = options.checkpoint
+  if (checkpoint !== undefined && (agentId === null || document.history !== "rewindable")) {
+    throw new TypeError(`document ${document.kind} keeps no history; it can only be read as of a checkpoint with history: "rewindable"`)
+  }
+  const record = await runOn(
+    fx,
+    Effect.flatMap(Database, (database) =>
+      database.read((storage) =>
+        checkpoint === undefined || agentId === null
+          ? storage.getDocument(agentId, document.kind)
+          : storage.documentAsOf(agentId, document.kind, checkpoint)
+      )
+    )
+  )
+  return documentValue(document, record)
+}
+
+const writeDocument = async <T extends JsonObject>(
+  fx: DurableFx,
+  document: DurableDocument<T>,
+  agentId: string | null,
+  update: DocumentUpdate<T>
+): Promise<T> => {
+  const outcome = await runOn(
+    fx,
+    Effect.flatMap(Database, (database) =>
+      database.run((journal) => {
+        try {
+          return { _tag: "written" as const, record: journal.updateDocument(document, agentId, [update]) }
+        } catch (cause: unknown) {
+          if (cause instanceof DocumentUpdateFailed) return { _tag: "failed" as const, cause: cause.cause }
+          throw cause
+        }
+      })
+    )
+  )
+  // The update's own error, as if it had been called directly.
+  if (outcome._tag === "failed") throw outcome.cause
+  return documentValue(document, outcome.record)
+}
+
 /** Open with Effect-native layer overrides (see `fx-durable/effect`). */
+/** A runtime's own tools and those of the extensions it lists. */
+const runtimeTools = (definition: RuntimeDefinition) => [
+  ...(definition.tools ?? []),
+  ...(definition.extensions ?? []).flatMap((extension) => extension.tools)
+]
+
 export const openDurableFx = async (options: DurableFxOptions, layers: DurableFxLayers = {}): Promise<DurableFx> => {
   const runtime = ManagedRuntime.make(buildLayer(options, layers))
   const context = await runtime.context()
@@ -226,7 +294,7 @@ export const openDurableFx = async (options: DurableFxOptions, layers: DurableFx
   )
 
   // Before recovery: a recovered turn may call a subagent tool.
-  for (const definition of Object.values(options.runtimes ?? {})) bindTools(fx, definition.tools ?? [])
+  for (const definition of Object.values(options.runtimes ?? {})) bindTools(fx, runtimeTools(definition))
   if ((options.recovery ?? "auto") === "auto") {
     try {
       await fx.resume()
@@ -251,7 +319,7 @@ export class DurableFx {
   }
 
   registerRuntime(id: string, definition: RuntimeDefinition): Promise<void> {
-    bindTools(this, definition.tools ?? [])
+    bindTools(this, runtimeTools(definition))
     return this.run(
       Effect.gen(function* () {
         const registry = yield* RuntimeRegistry
@@ -326,6 +394,35 @@ export class DurableFx {
         })
       )
     )
+  }
+
+  /**
+   * Install an extension, replacing the installed one with the same name (a
+   * reload). Agents that select it get it from their next turn; a call
+   * already running finishes with the code it started with.
+   */
+  installExtension(extension: Extension): Promise<void> {
+    bindTools(this, extension.tools)
+    return this.run(Effect.flatMap(RuntimeRegistry, (registry) => registry.install(extension)))
+  }
+
+  /** Remove the installed extension with this name. Runtimes that list an extension by that name fall back to theirs. */
+  uninstallExtension(name: string): Promise<void> {
+    return this.run(Effect.flatMap(RuntimeRegistry, (registry) => registry.uninstall(name)))
+  }
+
+  /** A global document's value (`defineDocument({ scope: "global" })`); its initial value if never written. */
+  document<T extends JsonObject>(document: GlobalDocument<T>): Promise<T> {
+    return readDocument(this, document, null)
+  }
+
+  /**
+   * Change a global document in one transaction: edit the draft, or return a
+   * new value. Resolves with the stored value; rejects with the update's
+   * error, writing nothing.
+   */
+  updateDocument<T extends JsonObject>(document: GlobalDocument<T>, update: DocumentUpdate<T>): Promise<T> {
+    return writeDocument(this, document, null, update)
   }
 
   listAgents(): Promise<ReadonlyArray<DurableAgentRecord>> {
@@ -452,6 +549,78 @@ export class DurableAgent {
             return Stream.fromIterable(yield* log.history(agentId, options.after ?? 0))
           }
           return log.subscribe(agentId, { after: options.after, pollInterval: options.pollInterval })
+        })
+      )
+    )
+  }
+
+  /**
+   * Choose this agent's extensions, in order (by object or name), or `null`
+   * for its runtime's default. Stored with the agent, and copied to its
+   * forks; applies from its next turn. A selected extension that is not
+   * installed is skipped until it is.
+   */
+  async setExtensions(extensions: ReadonlyArray<Extension | string> | null): Promise<void> {
+    const names = extensions === null ? null : extensions.map((extension) => (isJsonString(extension) ? extension : extension.name))
+    await this.updateDocument(ExtensionSelection, () => ({ names }))
+  }
+
+  /** The extensions this agent's next turn runs with, in order. */
+  extensions(): Promise<ReadonlyArray<string>> {
+    const agentId = this.id
+    return runOn(
+      this.fx,
+      Effect.gen(function* () {
+        const database = yield* Database
+        const agent = yield* database.read((storage) => storage.getAgent(agentId))
+        if (!agent) return yield* new NotFoundError({ entity: "agent", id: agentId })
+        const runtime = yield* Effect.flatMap(RuntimeRegistry, (registry) => registry.resolve(agent.runtimeId))
+        const configuration = yield* Effect.flatMap(ToolRegistry, (tools) => tools.configure(agent, runtime))
+        return configuration.extensions.map((extension) => extension.name)
+      })
+    )
+  }
+
+  /** This agent's value of a document; its initial value if never written. */
+  document<T extends JsonObject>(document: AgentDocument<T>, options: DocumentReadOptions = {}): Promise<T> {
+    return readDocument(this.fx, document, this.id, options)
+  }
+
+  /**
+   * Change this agent's document in one transaction: edit the draft, or
+   * return a new value. Resolves with the stored value; rejects with the
+   * update's error, writing nothing. Recorded as `document.updated`.
+   */
+  updateDocument<T extends JsonObject>(document: AgentDocument<T>, update: DocumentUpdate<T>): Promise<T> {
+    return writeDocument(this.fx, document, this.id, update)
+  }
+
+  /**
+   * The document's value now, then each new value as it is written (by this
+   * agent's tools, or `updateDocument`). Values written in quick succession
+   * may arrive as just the latest. Stop by breaking out of the loop.
+   */
+  watchDocument<T extends JsonObject>(document: AgentDocument<T>): AsyncIterable<T> {
+    const agentId = this.id
+    const current = Effect.flatMap(Database, (database) => database.read((storage) => storage.getDocument(agentId, document.kind)))
+    return runnerOf(this.fx).stream(
+      Stream.unwrap(
+        Effect.gen(function* () {
+          const database = yield* Database
+          const log = yield* EventLog
+          // The value and the event cursor in one read: later writes arrive as events after it.
+          const start = yield* database.read((storage) => ({
+            record: storage.getDocument(agentId, document.kind),
+            after: storage.lastEventSequence(agentId)
+          }))
+          const updates = log.subscribe(agentId, { after: start.after }).pipe(
+            Stream.filter((event) => event.type === "document.updated" && event.payload.kind === document.kind && event.payload.scope === "agent"),
+            Stream.mapEffect(() => current)
+          )
+          return Stream.concat(Stream.make(start.record), updates).pipe(
+            Stream.changesWith((a, b) => (a?.revision ?? 0) === (b?.revision ?? 0)),
+            Stream.map((record) => documentValue(document, record))
+          )
         })
       )
     )

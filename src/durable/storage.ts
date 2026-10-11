@@ -3,6 +3,7 @@ import type {
   AgentCheckpoint,
   AgentState,
   DurableAgentRecord,
+  DocumentRecord,
   DurableEvent,
   ReplayPolicyName,
   SubmissionRecord,
@@ -41,8 +42,9 @@ import type {
  * 8. Committed writes are durable: they survive a process crash.
  * 9. Constraints hold: one submission per `(agentId, requestId)`, one active
  *    (running or interrupted) turn per agent, one checkpoint per
- *    `(agentId, sequence)`, and event sequences per agent start at 1 and have
- *    no gaps.
+ *    `(agentId, sequence)`, one current document per `(agentId, kind)` and one
+ *    history entry per `(agentId, kind, revision)`, and event sequences per
+ *    agent start at 1 and have no gaps.
  */
 
 export interface ExecutorRecord {
@@ -168,6 +170,18 @@ export interface Storage {
   readonly getCheckpoint: (agentId: string, sequence: number) => AgentCheckpoint | null
   readonly insertCheckpoint: (checkpoint: AgentCheckpoint) => void
 
+  // documents
+  /** The current value of a document (`agentId` null: a global one). */
+  readonly getDocument: (agentId: string | null, kind: string) => DocumentRecord | null
+  /** Insert or replace the current value of the document at `(agentId, kind)`. */
+  readonly putDocument: (document: DocumentRecord) => void
+  /** Keep a value in the document's history (rewindable documents). */
+  readonly insertDocumentRevision: (document: DocumentRecord) => void
+  /** From a document's history: the latest value written before checkpoint `sequence` existed (`checkpointSeq < sequence`). */
+  readonly documentAsOf: (agentId: string, kind: string, sequence: number) => DocumentRecord | null
+  /** The current values of an agent's documents, by kind. */
+  readonly agentDocuments: (agentId: string) => ReadonlyArray<DocumentRecord>
+
   // events
   readonly appendEvent: (event: NewEvent) => DurableEvent
   readonly eventsAfter: (
@@ -175,6 +189,8 @@ export interface Storage {
     after: number,
     limit: number
   ) => ReadonlyArray<DurableEvent>
+  /** The sequence of the agent's latest event; 0 when it has none. */
+  readonly lastEventSequence: (agentId: string) => number
 
   // executors
   readonly registerExecutor: (executor: ExecutorRecord) => void
@@ -206,7 +222,11 @@ export type StorageReader = Pick<
   | "abandonedTasks"
   | "latestCheckpoint"
   | "getCheckpoint"
+  | "getDocument"
+  | "documentAsOf"
+  | "agentDocuments"
   | "eventsAfter"
+  | "lastEventSequence"
   | "getExecutor"
 >
 
@@ -232,6 +252,10 @@ export const readerOf = (storage: Storage): StorageReader => ({
   abandonedTasks: () => storage.abandonedTasks(),
   latestCheckpoint: (agentId) => storage.latestCheckpoint(agentId),
   getCheckpoint: (agentId, sequence) => storage.getCheckpoint(agentId, sequence),
+  getDocument: (agentId, kind) => storage.getDocument(agentId, kind),
+  documentAsOf: (agentId, kind, sequence) => storage.documentAsOf(agentId, kind, sequence),
+  agentDocuments: (agentId) => storage.agentDocuments(agentId),
   eventsAfter: (agentId, after, limit) => storage.eventsAfter(agentId, after, limit),
+  lastEventSequence: (agentId) => storage.lastEventSequence(agentId),
   getExecutor: (id) => storage.getExecutor(id)
 })

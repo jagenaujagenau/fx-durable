@@ -13,9 +13,10 @@ import { IdGenerator } from "./ids.js"
 import { Database } from "./database.js"
 import type { TaskRecord, UnknownOutcomeReason } from "../domain/schema.js"
 import { effectiveTask, unknownOutcomeNotice } from "../domain/tool-outcomes.js"
-import type { Json } from "../domain/json.js"
+import type { Json, JsonObject } from "../domain/json.js"
+import { applyUpdate, DocumentUpdateFailed, documentValue, ownValue, type DurableDocument } from "../domain/documents.js"
 import { hashInput, type TurnContext } from "./turn-context.js"
-import { OutcomeUnknown, type DurableTool } from "../tools/define-tool.js"
+import { OutcomeUnknown, type DocumentAccess, type DurableTool } from "../tools/define-tool.js"
 import type { ToolCall, ToolHookContext, ToolHooks } from "../tools/hooks.js"
 import { idempotencyKeyFor, policyName } from "../tools/replay-policy.js"
 
@@ -116,6 +117,29 @@ export const layer = Layer.effect(
           return Promise.allSettled(nestedRunning)
         })
 
+        // Document writes, staged in call order and committed with the result.
+        type Step = (value: JsonObject) => JsonObject
+        const staged = new Map<string, { readonly document: DurableDocument<JsonObject>; readonly steps: Array<Step> }>()
+        const ownerOf = (document: DurableDocument<JsonObject>) => (document.scope === "agent" ? task.agentId : null)
+        const readDocument = async <T extends JsonObject>(document: DurableDocument<T>): Promise<T> => {
+          const record = await Effect.runPromise(database.read((storage) => storage.getDocument(ownerOf(document), document.kind)))
+          const steps = staged.get(`${document.scope}:${document.kind}`)?.steps ?? []
+          return ownValue(document, steps.reduce<JsonObject>((value, step) => step(value), documentValue(document, record)))
+        }
+        const documents: DocumentAccess = {
+          get: (document) => readDocument(document),
+          update: async (document, update) => {
+            if (settled.done) throw new Error(`${tool.name} has returned; it can no longer update ${document.kind}`)
+            // Fail here, in the tool, rather than at commit.
+            const value = applyUpdate(document, await readDocument(document), update)
+            const key = `${document.scope}:${document.kind}`
+            const entry = staged.get(key) ?? { document, steps: [] }
+            entry.steps.push((current) => applyUpdate(document, ownValue(document, current), update))
+            staged.set(key, entry)
+            return value
+          }
+        }
+
         // Tool output reported while it runs, journaled at most every PROGRESS_MS.
         let progress = ""
         let pending: ReturnType<typeof setTimeout> | null = null
@@ -142,7 +166,8 @@ export const layer = Layer.effect(
               signal: controller.signal,
               replay: options.replay,
               progress: reportProgress,
-              executeTool
+              executeTool,
+              documents
             })
           )
           promise.catch(() => undefined)
@@ -196,12 +221,28 @@ export const layer = Layer.effect(
             : undefined
           const output = replaced ?? exit.value
           const durationMs = Date.now() - startedAt.getTime()
-          yield* database.run((journal) => journal.transitionTask(
-            task.id,
-            "completed",
-            { output, metadata: { durationMs, replay: options.replay } },
-            { type: "tool.completed", payload: { tool: tool.name, input, durationMs, replay: options.replay } }
-          ))
+          // The result and the call's document writes commit together. Updates run again here, on the current values.
+          const rejected = yield* database.run((journal) => {
+            try {
+              journal.transaction(() => {
+                const origin = { agentId: task.agentId, turnId: task.turnId, taskId: task.id }
+                for (const { document, steps } of staged.values()) {
+                  journal.updateDocument(document, ownerOf(document), [(draft) => steps.reduce<JsonObject>((value, step) => step(value), draft)], origin)
+                }
+                journal.transitionTask(
+                  task.id,
+                  "completed",
+                  { output, metadata: { durationMs, replay: options.replay } },
+                  { type: "tool.completed", payload: { tool: tool.name, input, durationMs, replay: options.replay } }
+                )
+              })
+              return null
+            } catch (cause: unknown) {
+              if (cause instanceof DocumentUpdateFailed) return cause.message
+              throw cause
+            }
+          })
+          if (rejected !== null) return yield* failTask(task, tool, rejected)
           yield* crash.hit("tool.after-result-persist", { name: tool.name })
           return output
         }
@@ -225,7 +266,11 @@ export const layer = Layer.effect(
             message: unknownOutcomeNotice(tool.name, input)
           })
         }
-        const message = errorMessage(error)
+        return yield* failTask(task, tool, errorMessage(error))
+      })
+
+    const failTask = (task: TaskRecord, tool: DurableTool, message: string) =>
+      Effect.gen(function* () {
         yield* database.run((journal) => journal.transitionTask(
           task.id,
           "failed",

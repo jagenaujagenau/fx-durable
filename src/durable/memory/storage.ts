@@ -1,6 +1,7 @@
 import { StorageError } from "../../domain/errors.js"
 import type {
   AgentCheckpoint,
+  DocumentRecord,
   DurableAgentRecord,
   DurableEvent,
   SubmissionRecord,
@@ -25,6 +26,9 @@ interface State {
   readonly turns: Map<string, TurnRecord>
   readonly tasks: Map<string, TaskRecord>
   readonly checkpoints: Map<string, AgentCheckpoint>
+  /** Current document values by `documentKey`, and their history by `documentKey` and revision. */
+  readonly documents: Map<string, DocumentRecord>
+  readonly revisions: Map<string, DocumentRecord>
   readonly events: Map<string, Array<DurableEvent>>
   readonly executors: Map<string, ExecutorRecord>
 }
@@ -35,11 +39,15 @@ const emptyState = (): State => ({
   turns: new Map(),
   tasks: new Map(),
   checkpoints: new Map(),
+  documents: new Map(),
+  revisions: new Map(),
   events: new Map(),
   executors: new Map()
 })
 
 const copy = <A>(value: A): A => structuredClone(value)
+
+const documentKey = (agentId: string | null, kind: string) => JSON.stringify([agentId, kind])
 
 const ACTIVE_TURN = new Set<TurnRecord["state"]>(["running", "interrupted"])
 const UNFINISHED_TASK = new Set<TaskRecord["state"]>(["pending", "running"])
@@ -233,6 +241,34 @@ export const openMemoryStorage = (): Storage => {
         state.checkpoints.set(key, copy(checkpoint))
       }),
 
+    getDocument: (agentId, kind) => op("getDocument", () => get(state.documents, documentKey(agentId, kind))),
+    putDocument: (document) =>
+      op("putDocument", () => {
+        state.documents.set(documentKey(document.agentId, document.kind), copy(document))
+      }),
+    insertDocumentRevision: (document) =>
+      op("insertDocumentRevision", () => {
+        const key = JSON.stringify([document.agentId, document.kind, document.revision])
+        if (state.revisions.has(key)) throw conflict("insertDocumentRevision", "document_revisions.owner, kind, revision")
+        state.revisions.set(key, copy(document))
+      }),
+    documentAsOf: (agentId, kind, sequence) =>
+      op("documentAsOf", () => {
+        let found: DocumentRecord | null = null
+        for (const d of state.revisions.values()) {
+          if (d.agentId === agentId && d.kind === kind && d.checkpointSeq < sequence && (found === null || d.revision > found.revision)) found = d
+        }
+        return found ? copy(found) : null
+      }),
+    agentDocuments: (agentId) =>
+      op("agentDocuments", () =>
+        [...state.documents.values()]
+          .filter((d) => d.agentId === agentId)
+          .sort((a, b) => (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0))
+          .map(copy)
+      ),
+
+    lastEventSequence: (agentId) => op("lastEventSequence", () => state.events.get(agentId)?.length ?? 0),
     appendEvent: (event) =>
       op("appendEvent", () => {
         const log = state.events.get(event.agentId) ?? []

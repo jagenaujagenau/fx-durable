@@ -1,5 +1,6 @@
 import { Schema } from "effect"
 import type { Json, JsonObject } from "../domain/json.js"
+import type { DocumentUpdate, DurableDocument } from "../domain/documents.js"
 import { formatIssues, type StandardSchemaV1 } from "./standard-schema.js"
 import { policyName, type ReplayPolicy } from "./replay-policy.js"
 
@@ -42,6 +43,24 @@ export interface DurableToolContext {
    * again. Nested calls still running when this tool returns are aborted.
    */
   readonly executeTool: (name: string, input: Json, options?: NestedCallOptions) => Promise<Json>
+  /** Read and change typed documents (`defineDocument`): the agent's own, and global ones. */
+  readonly documents: DocumentAccess
+}
+
+/**
+ * A tool's view of documents. Its changes commit in the same transaction as
+ * its result: none of them if the call fails or is cut off, and once if it is
+ * replayed.
+ */
+export interface DocumentAccess {
+  /** The committed value, with this call's changes applied. */
+  readonly get: <T extends JsonObject>(document: DurableDocument<T>) => Promise<T>
+  /**
+   * Change a document; resolves with the value this call now sees. The
+   * update runs again at commit, on the value current then (another call may
+   * have changed it meanwhile), so keep it a pure function of the draft.
+   */
+  readonly update: <T extends JsonObject>(document: DurableDocument<T>, update: DocumentUpdate<T>) => Promise<T>
 }
 
 export interface NestedCallOptions {

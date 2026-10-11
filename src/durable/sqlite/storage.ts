@@ -4,6 +4,7 @@ import { dirname } from "node:path"
 import { StorageError } from "../../domain/errors.js"
 import {
   AgentCheckpoint,
+  DocumentRecord,
   DurableAgentRecord,
   DurableEvent,
   SubmissionRecord,
@@ -31,6 +32,7 @@ const decodeTurn = decodeSync(TurnRecord, "turn row")
 const decodeTask = decodeSync(TaskRecord, "task row")
 const decodeCheckpoint = decodeSync(AgentCheckpoint, "checkpoint row")
 const decodeEvent = decodeSync(DurableEvent, "event row")
+const decodeDocument = decodeSync(DocumentRecord, "document row")
 
 type Row = Record<string, SQLOutputValue>
 
@@ -121,6 +123,34 @@ const checkpointFromRow = (r: Row): AgentCheckpoint =>
     model: r.model,
     createdAt: date(r.created_at)
   })
+
+const documentFromRow = (r: Row): DocumentRecord =>
+  decodeDocument({
+    agentId: r.owner === "" ? null : r.owner,
+    kind: r.kind,
+    version: Number(r.version),
+    revision: Number(r.revision),
+    value: decodePayloadSync(blobText(r.value), "document.value"),
+    history: r.history,
+    fork: r.fork,
+    checkpointSeq: Number(r.checkpoint_seq),
+    updatedAt: date(r.updated_at)
+  })
+
+/** Column order of `documentRow`, shared by the documents table and its history. */
+const DOCUMENT_COLUMNS = "owner, kind, version, revision, value, history, fork, checkpoint_seq, updated_at"
+
+const documentRow = (d: DocumentRecord): Array<SQLInputValue> => [
+  d.agentId ?? "",
+  d.kind,
+  d.version,
+  d.revision,
+  encodePayload(d.value),
+  d.history,
+  d.fork,
+  d.checkpointSeq,
+  ms(d.updatedAt)
+]
 
 const eventFromRow = (r: Row): DurableEvent =>
   decodeEvent({
@@ -430,6 +460,37 @@ export const openSqliteStorage = (options: SqliteOptions): Storage => {
         ).run(c.id, c.agentId, c.sequence, c.runtimeId, c.model, c.fxCheckpoint, c.summary, ms(c.createdAt))
       }),
 
+    getDocument: (agentId, kind) =>
+      op("getDocument", () => one("SELECT * FROM documents WHERE owner = ? AND kind = ?", documentFromRow, agentId ?? "", kind)),
+    putDocument: (d) =>
+      op("putDocument", () => {
+        stmt(
+          `INSERT OR REPLACE INTO documents (${DOCUMENT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(...documentRow(d))
+      }),
+    insertDocumentRevision: (d) =>
+      op("insertDocumentRevision", () => {
+        stmt(
+          `INSERT INTO document_revisions (${DOCUMENT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(...documentRow(d))
+      }),
+    documentAsOf: (agentId, kind, sequence) =>
+      op("documentAsOf", () =>
+        one(
+          "SELECT * FROM document_revisions WHERE owner = ? AND kind = ? AND checkpoint_seq < ? ORDER BY revision DESC LIMIT 1",
+          documentFromRow,
+          agentId,
+          kind,
+          sequence
+        )
+      ),
+    agentDocuments: (agentId) =>
+      op("agentDocuments", () => all("SELECT * FROM documents WHERE owner = ? ORDER BY kind", documentFromRow, agentId)),
+
+    lastEventSequence: (agentId) =>
+      op("lastEventSequence", () =>
+        Number(stmt("SELECT COALESCE(MAX(sequence), 0) AS seq FROM events WHERE agent_id = ?").get(agentId)?.seq ?? 0)
+      ),
     appendEvent: (e) =>
       op("appendEvent", () => {
         const row = stmt("SELECT COALESCE(MAX(sequence), 0) AS seq FROM events WHERE agent_id = ?").get(e.agentId)

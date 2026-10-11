@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert"
 import { StorageError } from "../domain/errors.js"
-import type { DurableAgentRecord, SubmissionRecord, TaskRecord, TurnRecord } from "../domain/schema.js"
+import type { DocumentRecord, DurableAgentRecord, SubmissionRecord, TaskRecord, TurnRecord } from "../domain/schema.js"
 import type { Storage } from "../durable/storage.js"
 
 /**
@@ -152,6 +152,48 @@ export const storageContract: ReadonlyArray<StorageContractCase> = [
       storage.insertTask(task("awaiting", "recovering", "interrupted"))
       storage.insertTask(task("left2", "ended", "interrupted"))
       assert.deepEqual(storage.abandonedTasks().map((t) => t.id), ["left", "left2"])
+    }
+  },
+  {
+    name: "documents: current values, history as of a checkpoint, and an agent's documents",
+    run: (storage) => {
+      storage.insertAgent(agent())
+      const doc = (agentId: string | null, kind: string, revision: number, checkpointSeq: number): DocumentRecord => ({
+        agentId,
+        kind,
+        version: 2,
+        revision,
+        value: { n: revision, nested: { list: [1, "two", null] } },
+        history: "rewindable",
+        fork: "asOf",
+        checkpointSeq,
+        updatedAt: at
+      })
+      assert.equal(storage.getDocument("a", "notes"), null)
+      for (const [revision, checkpointSeq] of [[1, 0], [2, 1], [3, 1], [4, 2]] as const) {
+        storage.putDocument(doc("a", "notes", revision, checkpointSeq))
+        storage.insertDocumentRevision(doc("a", "notes", revision, checkpointSeq))
+      }
+      storage.putDocument(doc(null, "notes", 1, 0))
+      storage.putDocument(doc("a", "board", 1, 0))
+      assert.deepEqual(storage.getDocument("a", "notes"), doc("a", "notes", 4, 2))
+      assert.deepEqual(storage.getDocument(null, "notes"), doc(null, "notes", 1, 0))
+      assert.equal(storage.documentAsOf("a", "notes", 1)?.revision, 1)
+      assert.equal(storage.documentAsOf("a", "notes", 2)?.revision, 3)
+      assert.equal(storage.documentAsOf("a", "notes", 0), null)
+      assert.deepEqual(storage.agentDocuments("a").map((d) => [d.kind, d.revision]), [["board", 1], ["notes", 4]])
+      assert.throws(() => storage.insertDocumentRevision(doc("a", "notes", 4, 2)), StorageError)
+    }
+  },
+  {
+    name: "lastEventSequence is the agent's latest event sequence, 0 without events",
+    run: (storage) => {
+      assert.equal(storage.lastEventSequence("a"), 0)
+      storage.appendEvent(event("e1"))
+      storage.appendEvent(event("e2"))
+      storage.appendEvent(event("x1", "b"))
+      assert.equal(storage.lastEventSequence("a"), 2)
+      assert.equal(storage.lastEventSequence("b"), 1)
     }
   },
   {

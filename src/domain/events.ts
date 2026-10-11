@@ -40,6 +40,7 @@ export const EVENT_TYPES = [
   "tool.abandon_failed",
   "checkpoint.created",
   "context.reset",
+  "document.updated",
   "recovery.started",
   "recovery.completed",
   "recovery.failed"

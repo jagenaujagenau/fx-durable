@@ -36,7 +36,7 @@ describe("SQLite storage (plain synchronous code)", () => {
     openTestJournal(db).storage.close()
     const raw = new DatabaseSync(db)
     expect(raw.prepare("PRAGMA journal_mode").get()?.journal_mode).toBe("wal")
-    expect(raw.prepare("SELECT version FROM schema_migrations").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }])
+    expect(raw.prepare("SELECT version FROM schema_migrations").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }])
     raw.close()
   })
 

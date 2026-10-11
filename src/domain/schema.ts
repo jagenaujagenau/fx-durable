@@ -186,6 +186,30 @@ export const AgentCheckpoint = Schema.Struct({
 })
 export interface AgentCheckpoint extends Schema.Schema.Type<typeof AgentCheckpoint> {}
 
+export const DocumentHistory = Schema.Literals(["latest", "rewindable"])
+export type DocumentHistory = typeof DocumentHistory.Type
+
+export const DocumentForkPolicy = Schema.Literals(["copy", "initial", "asOf"])
+export type DocumentForkPolicy = typeof DocumentForkPolicy.Type
+
+/** One stored value of a typed document (`defineDocument`). */
+export const DocumentRecord = Schema.Struct({
+  /** The agent it belongs to; null for a global document. */
+  agentId: Schema.NullOr(Schema.String),
+  kind: Schema.String,
+  /** The definition version the value was written with. */
+  version: Schema.Number,
+  /** Counts the document's writes, from 1. */
+  revision: Schema.Number,
+  value: Schema.JsonObject,
+  history: DocumentHistory,
+  fork: DocumentForkPolicy,
+  /** The agent's latest checkpoint sequence when this was written (0 before its first). */
+  checkpointSeq: Schema.Number,
+  updatedAt: Schema.Date
+})
+export interface DocumentRecord extends Schema.Schema.Type<typeof DocumentRecord> {}
+
 export const DurableEvent = Schema.Struct({
   id: Schema.String,
   agentId: Schema.String,

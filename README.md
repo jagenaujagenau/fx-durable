@@ -328,6 +328,93 @@ counted in `usage()`. It sees the agent's tools, but can't run them. If the proc
 recovered turn summarizes again. Automatic compaction runs after the turn whose last model request reached
 `maxContextTokens`, before anything else queued. Steering sent during a reset or compaction becomes a new request.
 
+### Documents
+
+Documents are your app's own state: a todo list, a plan, settings. They are typed JSON stored next to the journal.
+A tool's writes commit **in the same transaction as its result**. A call that fails or is cut off by a crash writes
+nothing, and a replayed call writes once.
+
+```ts
+import { defineDocument } from "fx-durable"
+
+const Todos = defineDocument<{ items: string[] }>({
+  kind: "app.todos", // the stored name; keep it stable
+  version: 1,
+  scope: "agent", // one per agent; "global" is one for the whole runtime
+  initial: () => ({ items: [] })
+})
+
+const addTodo = defineDurableTool({
+  name: "add_todo",
+  replay: "safe",
+  inputSchema: Schema.Struct({ item: Schema.String }),
+  execute: async ({ item }, { documents }) => {
+    await documents.update(Todos, (todos) => void todos.items.push(item)) // edit the draft, or return a new value
+    return `added ${item}`
+  }
+})
+
+await agent.document(Todos)                                  // { items: [...] }; the initial value if never written
+await agent.updateDocument(Todos, (todos) => ({ items: [] }))
+for await (const todos of agent.watchDocument(Todos)) render(todos)
+await fx.document(Settings)                                  // global documents live on `fx`
+```
+
+- **Reads inside a tool:** `documents.get()` returns the committed value with the call's own changes applied.
+- **Updates run twice:** when the tool makes them, and again at commit on the value current then. So parallel calls
+  that each add an item all keep their item. Keep updates pure and synchronous. An update that throws at commit
+  fails the call.
+- **Events:** each write is recorded as a `document.updated` event, carrying the tool call that made it.
+
+**Changing a document's shape:** raise `version` and add `migrate(value, fromVersion)`. Values written by an older
+version are migrated when read and stored in the new shape at the next write. A value stored by a newer version than
+the code knows is refused.
+
+**History and forks:** `history: "rewindable"` keeps every value of an agent document, so you can read it as of a
+checkpoint: `agent.document(Notes, { checkpoint: 3 })`. `fork` picks what a fork starts with:
+- `"copy"` (default): the current value;
+- `"initial"`: the initial value;
+- `"asOf"` (rewindable only): the value at the checkpoint the fork starts from, which matches its conversation.
+
+### Extensions
+
+An extension bundles tools, instructions and hooks under a name. A runtime lists the extensions its agents get by
+default, and each agent can choose its own.
+
+```ts
+import { defineExtension } from "fx-durable"
+
+const todo = defineExtension({
+  name: "todo",
+  tools: [addTodo],
+  // Text, or a function rendered before each turn; here the model sees the current list.
+  instructions: async ({ document }) => {
+    const { items } = await document(Todos)
+    return items.length ? `Your todo list:\n${items.map((i) => `- ${i}`).join("\n")}` : undefined
+  },
+  hooks: { beforeTool: (call) => (call.name === "bash" ? { block: "No shell here." } : undefined) }
+})
+
+const fx = await DurableFx.open({ storage, runtimes: { coding: { tools: [readFile], extensions: [todo] } } })
+
+await agent.setExtensions([todo, "web"])        // this agent's choice, in order; null goes back to the runtime's
+await agent.extensions()                        // ["todo", "web"]: what its next turn runs with
+await fx.installExtension(defineExtension({ name: "todo", tools: [addTodoV2] })) // reload: replaces "todo" by name
+await fx.uninstallExtension("todo")             // runtimes that list a "todo" fall back to theirs
+```
+
+- **When changes apply:** an agent's tools, instructions and hooks are its runtime's, followed by those of its
+  extensions in order. A change applies from the agent's next turn. A call already running finishes with the code it
+  started with.
+- **What is stored:** only the agent's choice of names. It is kept with the agent and copied to its forks. A chosen
+  extension that isn't installed is skipped until it is.
+- **Instructions:** text that changes rebuilds the agent's libfx session, which also restarts the provider's prompt
+  cache, so keep it stable when you can.
+- **Hooks:** they run in order. Each `beforeTool` sees the input the previous one settled on, and the first `block`
+  wins. Each `afterTool` can replace the result.
+- **Configuration errors:** two tools with the same name, or instructions that throw, park the turn with the agent in
+  `configuration_error`. Nothing is lost. Fix the extensions, then call `fx.resume()`.
+
 ### Hooks
 
 ```ts
@@ -602,12 +689,14 @@ fx-durable/
 │   ├── boundary/            # using fx-durable without Effect
 │   ├── context/             # reset, handoff, compaction
 │   ├── crash/               # SIGKILL crash matrix
+│   ├── documents/           # typed documents
+│   ├── extensions/          # extensions: selection, reload, instructions, hooks
 │   ├── fixtures/            # app process the crash suite kills
 │   ├── failure/             # storage errors close the runtime; reopening recovers
 │   ├── idempotency/
 │   ├── journal/             # exhaustive synchronous tests of durable state
 │   ├── libfx/               # what fx-durable assumes about libfx checkpoints
-│   ├── nested/              # tools calling tools, task graph
+│   ├── nested/              # tools calling tools, task graph, abandoned calls
 │   ├── live/                # crash scenarios against the real AI Gateway (opt-in)
 │   ├── reconnect/
 │   ├── recovery/

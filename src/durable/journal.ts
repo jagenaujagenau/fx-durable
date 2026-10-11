@@ -2,10 +2,12 @@ import { InterruptedError, NotFoundError, StorageError } from "../domain/errors.
 import type { AppendEvent } from "../domain/events.js"
 import { SystemClock, type Clock } from "./clock.js"
 import { executorGone, lostReason } from "../domain/executors.js"
-import type { Json } from "../domain/json.js"
+import type { Json, JsonObject } from "../domain/json.js"
+import { applyUpdate, DocumentUpdateFailed, documentValue, type DocumentUpdate, type DurableDocument } from "../domain/documents.js"
 import type {
   AgentCheckpoint,
   AgentState,
+  DocumentRecord,
   DurableAgentRecord,
   DurableEvent,
   ReplayPolicyName,
@@ -46,6 +48,13 @@ import { recoveryActionFor } from "../tools/replay-policy.js"
 
 export { EVENT_TYPES } from "../domain/events.js"
 export type { AppendEvent, EventType } from "../domain/events.js"
+
+/** Where a document write is reported: the agent's stream, and the tool call that made it, if any. */
+export interface DocumentOrigin {
+  readonly agentId: string | null
+  readonly turnId: string | null
+  readonly taskId: string | null
+}
 
 /** An event attached to a transition; the journal fills in the owning ids. */
 export type TransitionEvent = Omit<AppendEvent, "agentId"> | null
@@ -586,6 +595,7 @@ export class Journal {
       if (checkpoint) {
         this.#storage.insertCheckpoint({ ...checkpoint, id: this.nextId("ckpt"), agentId: newId, sequence: 1, createdAt: this.now() })
       }
+      this.forkDocuments(sourceId, newId, checkpoint)
       this.appendEvent({
         agentId: newId,
         type: "agent.forked",
@@ -593,6 +603,71 @@ export class Journal {
       })
       return this.#storage.getAgent(newId)
     })
+  }
+
+  /**
+   * Apply updates to a document's committed value and store the result, with
+   * a `document.updated` event on the agent's stream (`origin`, for a global
+   * document written by a tool). An update that throws aborts the enclosing
+   * transaction with `DocumentUpdateFailed`.
+   */
+  updateDocument<T extends JsonObject>(
+    document: DurableDocument<T>,
+    agentId: string | null,
+    updates: ReadonlyArray<DocumentUpdate<T>>,
+    origin: DocumentOrigin = { agentId, turnId: null, taskId: null }
+  ): DocumentRecord {
+    return this.transaction(() => {
+      if (agentId !== null && !this.#storage.getAgent(agentId)) throw new NotFoundError({ entity: "agent", id: agentId })
+      const current = this.#storage.getDocument(agentId, document.kind)
+      let value: T
+      try {
+        value = documentValue(document, current)
+        for (const update of updates) value = applyUpdate(document, value, update)
+      } catch (cause) {
+        throw new DocumentUpdateFailed(document.kind, cause)
+      }
+      const record: DocumentRecord = {
+        agentId,
+        kind: document.kind,
+        version: document.version,
+        revision: (current?.revision ?? 0) + 1,
+        value,
+        history: document.history,
+        fork: document.fork,
+        checkpointSeq: agentId === null ? 0 : (this.#storage.latestCheckpoint(agentId)?.sequence ?? 0),
+        updatedAt: this.now()
+      }
+      this.#storage.putDocument(record)
+      if (record.history === "rewindable") this.#storage.insertDocumentRevision(record)
+      if (origin.agentId !== null) {
+        this.appendEvent({
+          agentId: origin.agentId,
+          type: "document.updated",
+          turnId: origin.turnId,
+          taskId: origin.taskId,
+          payload: { kind: document.kind, scope: document.scope, revision: record.revision }
+        })
+      }
+      return record
+    })
+  }
+
+  /** A fork's documents, by each one's stored fork policy. */
+  private forkDocuments(sourceId: string, newId: string, checkpoint: AgentCheckpoint | null): void {
+    for (const document of this.#storage.agentDocuments(sourceId)) {
+      const value =
+        document.fork === "copy"
+          ? document
+          : document.fork === "asOf" && checkpoint
+            ? this.#storage.documentAsOf(sourceId, document.kind, checkpoint.sequence)
+            : null
+      if (!value) continue
+      // The copy is the fork's value as of its first checkpoint.
+      const copy: DocumentRecord = { ...value, agentId: newId, revision: 1, checkpointSeq: 0, updatedAt: this.now() }
+      this.#storage.putDocument(copy)
+      if (copy.history === "rewindable") this.#storage.insertDocumentRevision(copy)
+    }
   }
 
   /** Accept a submission, or resolve to the existing one with the same `(agent, requestId)`. */

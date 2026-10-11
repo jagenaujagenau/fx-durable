@@ -8,6 +8,7 @@ export type {
   AgentOptions,
   CloseReason,
   CompactOptions,
+  DocumentReadOptions,
   DurableFxOptions,
   EventsOptions,
   ResetOptions,
@@ -15,15 +16,28 @@ export type {
   UsageOptions
 } from "./runtime/durable-fx.js"
 export type { CompactionOptions } from "./domain/context.js"
+export { defineDocument } from "./domain/documents.js"
+export type {
+  AgentDocument,
+  AgentDocumentDefinition,
+  DocumentScope,
+  DocumentUpdate,
+  DurableDocument,
+  GlobalDocument,
+  GlobalDocumentDefinition
+} from "./domain/documents.js"
 export type { QueuedWork, TaskGraph, TaskGraphNode } from "./domain/task-graph.js"
 export { usageOf } from "./domain/usage.js"
 export type { ModelPrice, ModelPrices, UsageReport, UsageTotals } from "./domain/usage.js"
 export { defineDurableTool, OutcomeUnknown } from "./tools/define-tool.js"
 export { defineSubagent, subagentId } from "./tools/subagent.js"
+export { defineExtension } from "./tools/extension.js"
+export type { Extension, ExtensionDefinition, ExtensionInstructions, InstructionsInput } from "./tools/extension.js"
 export type { SubagentDefinition } from "./tools/subagent.js"
 export type {
   DurableTool,
   DurableToolContext,
+  DocumentAccess,
   NestedCallOptions,
   ToolCallers,
   AbandonedCall,
@@ -47,6 +61,9 @@ export * from "./domain/errors.js"
 export type {
   AgentCheckpoint,
   AgentState,
+  DocumentForkPolicy,
+  DocumentHistory,
+  DocumentRecord,
   DurableAgentRecord,
   DurableEvent,
   SubmissionContent,

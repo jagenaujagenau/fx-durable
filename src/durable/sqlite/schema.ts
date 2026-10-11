@@ -3,8 +3,9 @@ import { migration001 } from "./migrations/001_initial.js"
 import { migration002 } from "./migrations/002_context.js"
 import { migration003 } from "./migrations/003_nested_calls.js"
 import { migration004 } from "./migrations/004_abandoned_calls.js"
+import { migration005 } from "./migrations/005_documents.js"
 
-export const migrations = [migration001, migration002, migration003, migration004] as const
+export const migrations = [migration001, migration002, migration003, migration004, migration005] as const
 
 /**
  * Apply pending migrations atomically. Each migration and its version row

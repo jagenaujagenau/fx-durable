@@ -17,7 +17,8 @@ const contextFor = (cwd: string | null, progress: Array<string> = []): DurableTo
   signal: new AbortController().signal,
   replay: false,
   progress: (chunk) => progress.push(chunk),
-  executeTool: () => Promise.reject(new Error("no nested calls"))
+  executeTool: () => Promise.reject(new Error("no nested calls")),
+  documents: { get: () => Promise.reject(new Error("no documents")), update: () => Promise.reject(new Error("no documents")) }
 })
 
 describe("createCodingTools", () => {

@@ -73,6 +73,7 @@ interface AgentSession {
   readonly scope: Scope.Closeable
   readonly runtimeId: string
   readonly model: string
+  readonly configurationKey: string
   checkpointSeq: number | null
 }
 
@@ -129,25 +130,28 @@ export const layer = (options: SupervisorOptions = {}) =>
       /** Build (or reuse) the live libfx agent, restored from the latest durable checkpoint. */
       const getSession = (agent: DurableAgentRecord, expectedSeq: number | null) =>
         Effect.gen(function* () {
+          const runtime = yield* registry.resolve(agent.runtimeId)
+          // Extensions and their instructions can change between turns; a change rebuilds the session.
+          const configuration = yield* toolRegistry.configure(agent, runtime)
           const existing = sessions.get(agent.id)
           if (
             existing &&
             existing.checkpointSeq === expectedSeq &&
             existing.runtimeId === agent.runtimeId &&
-            existing.model === agent.model
+            existing.model === agent.model &&
+            existing.configurationKey === configuration.key
           ) {
             return existing
           }
           if (existing) yield* closeSession(agent.id)
 
-          const runtime = yield* registry.resolve(agent.runtimeId)
           const scope = yield* Scope.make()
           const built = yield* Effect.gen(function* () {
-            const resolved = yield* toolRegistry.resolve(agent, runtime).pipe(Scope.provide(scope))
+            const resolved = yield* toolRegistry.resolve(agent, runtime, configuration).pipe(Scope.provide(scope))
             const checkpoint = yield* database.read((storage) => storage.latestCheckpoint(agent.id))
             const holder: ModelTransportHolder = { current: null }
             const fetch = makeDurableFetch(holder, libfx.transport, database.models, crash)
-            const toolSet: ToolSet = { byName: resolved.byName, hooks: runtime.hooks }
+            const toolSet: ToolSet = { byName: resolved.byName, hooks: resolved.hooks }
             const tools: Array<LibfxTool> = resolved.tools.filter(offeredToModel).map((tool) => ({
               name: tool.name,
               description: tool.description,
@@ -183,6 +187,7 @@ export const layer = (options: SupervisorOptions = {}) =>
               scope,
               runtimeId: agent.runtimeId,
               model: agent.model,
+              configurationKey: configuration.key,
               checkpointSeq: checkpoint?.sequence ?? null
             }
             return session

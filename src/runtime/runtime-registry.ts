@@ -4,6 +4,7 @@ import { Context, Effect, Layer } from "effect"
 import type { McpClient } from "libfx/mcp"
 import type { DurableTool } from "../tools/define-tool.js"
 import type { ToolHooks } from "../tools/hooks.js"
+import type { Extension } from "../tools/extension.js"
 import type { ReplayPolicy } from "../tools/replay-policy.js"
 import { RuntimeConfigurationError } from "../domain/errors.js"
 import type { DurableAgentRecord } from "../domain/schema.js"
@@ -32,6 +33,12 @@ export interface RuntimeDefinition {
   readonly instructions?: string
   /** Hooks around this runtime's tool calls, e.g. permission checks. */
   readonly hooks?: ToolHooks
+  /**
+   * The extensions its agents get, in order, unless an agent selects others
+   * (`agent.setExtensions()`). An installed extension with the same name
+   * (`fx.installExtension()`) is used instead of the one listed here.
+   */
+  readonly extensions?: ReadonlyArray<Extension>
   /** Compact automatically once the context reaches a size (see `agent.compact()`). */
   readonly compaction?: CompactionOptions
   readonly createMcpClients?: (agent: DurableAgentRecord) => Promise<ReadonlyArray<McpClientSpec>>
@@ -42,6 +49,11 @@ export interface RuntimeRegistryInterface {
   readonly resolve: (id: string) => Effect.Effect<RuntimeDefinition, RuntimeConfigurationError>
   readonly has: (id: string) => Effect.Effect<boolean>
   readonly ids: () => Effect.Effect<ReadonlyArray<string>>
+  /** Install an extension, replacing any installed one with its name. */
+  readonly install: (extension: Extension) => Effect.Effect<void>
+  /** Remove the installed extension with this name; runtimes that list one by that name fall back to it. */
+  readonly uninstall: (name: string) => Effect.Effect<void>
+  readonly installed: (name: string) => Effect.Effect<Extension | null>
 }
 
 export class RuntimeRegistry extends Context.Service<RuntimeRegistry, RuntimeRegistryInterface>()(
@@ -50,7 +62,17 @@ export class RuntimeRegistry extends Context.Service<RuntimeRegistry, RuntimeReg
   static readonly layer = (initial: Readonly<Record<string, RuntimeDefinition>> = {}) =>
     Layer.sync(RuntimeRegistry, () => {
       const runtimes = new Map<string, RuntimeDefinition>(Object.entries(initial))
+      const extensions = new Map<string, Extension>()
       return RuntimeRegistry.of({
+        install: (extension) =>
+          Effect.sync(() => {
+            extensions.set(extension.name, extension)
+          }),
+        uninstall: (name) =>
+          Effect.sync(() => {
+            extensions.delete(name)
+          }),
+        installed: (name) => Effect.sync(() => extensions.get(name) ?? null),
         register: (id, definition) =>
           Effect.sync(() => {
             const names = new Set<string>()

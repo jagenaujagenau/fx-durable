@@ -6,6 +6,11 @@
 
 - Custom `Storage` implementations must persist `TaskRecord.callerTaskId` and `callKey` (nested tool calls). SQLite
   migrates itself (migration 3); the storage contract checks them.
+- `Storage` gains documents (`getDocument`, `putDocument`, `insertDocumentRevision`, `documentAsOf`,
+  `agentDocuments`) and `lastEventSequence`. SQLite adds the tables (migration 5); the storage contract checks them.
+- `ToolRegistry` (`fx-durable/effect`) needs `Database` and `RuntimeRegistry`, has `configure`, and its resolved
+  tools carry the composed `hooks`.
+- `DurableToolContext` has `documents`; code that builds a tool context by hand must provide it.
 - `Storage` gains `abandonedTasks()`: interrupted tool tasks of ended turns that no task retries. SQLite adds an
   index for it (migration 4); the storage contract checks it.
 - `DurableTool` has an `abandon` field (null unless set), and `AgentSupervisor` (`fx-durable/effect`) an `abandon`
@@ -30,6 +35,9 @@
 
 ### Fixed
 
+- Registering a runtime again under the same id now reaches agents with a live session from their next turn. Before,
+  they kept the old tools and instructions until the process restarted.
+
 - `fx.close()` cancelled running subagents: the subagent tool cancelled its child whenever its signal aborted, and
   stopping aborts in-flight calls. The child now keeps running, and the call resumes it after the restart.
 
@@ -38,6 +46,16 @@
 - **Tools calling tools:** `context.executeTool(name, input, { key })`. A nested call is a durable task owned by its
   caller, with hooks and its own replay policy; a caller that runs again after a crash gets its journaled nested
   calls back by key. Calls left running when the caller returns are aborted. Two crash-matrix cases cover it.
+- **Documents:** `defineDocument({ kind, version, scope: "agent" | "global", initial, migrate?, history?, fork? })`
+  for typed JSON state. A tool's `documents.update()` commits in the same transaction as its result (none on failure,
+  once on replay); updates run again at commit so parallel calls compose. `agent.document()`,
+  `agent.updateDocument()`, `agent.watchDocument()`, `fx.document()`, `fx.updateDocument()`. Rewindable documents
+  read as of a checkpoint and fork as of it; versioned values migrate on read. Writes are `document.updated` events.
+- **Extensions:** `defineExtension({ name, tools, instructions, hooks })`. `RuntimeDefinition.extensions` sets the
+  default for a runtime's agents; `agent.setExtensions()` sets an agent's own choice, which is stored and copied to
+  forks. `fx.installExtension()` replaces an extension by name (a reload); `fx.uninstallExtension()` removes it.
+  Instructions can be rendered before each turn, from documents. Hooks compose in order. Changes apply from the next
+  turn.
 - **Abandoned calls:** when a turn ends without calling an interrupted call again, the tool's `abandon` hook runs
   (at the next `resume()` if the process died first, retried until it succeeds) and the call is recorded as
   cancelled (`tool.abandoned`). Subagents use it to cancel the child's request, so a recovered turn that moves on
