@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 fx-durable now depends on libfx 0.0.14, the stable release with durable sessions, instead of a dev build. fx-durable's
 API does not change.

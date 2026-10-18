@@ -1,6 +1,6 @@
 {
   "name": "fx-durable",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Durable agents on libfx: tool calls with replay policies, documents, subagents, and extensions around libfx's durable sessions.",
   "keywords": [
     "libfx",
