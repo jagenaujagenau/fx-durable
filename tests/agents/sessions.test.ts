@@ -103,6 +103,8 @@ describe("agent sessions", () => {
     const steered = await agent.submit("work")
     await started.promise
     await agent.steer("Keep it short.")
+    // libfx 0.0.14 (local()) misses a steer stored a millisecond before the tool returns (vercel-labs/fx#1342).
+    await new Promise((resolve) => setTimeout(resolve, 50))
     release.resolve()
     expect((await steered.result()).text).toContain("Keep it short.")
     await fx.close()
@@ -152,5 +154,18 @@ describe("agent sessions", () => {
     const [ra, rb] = await Promise.all([(await a.submit("go")).result(), (await b.submit("go")).result()])
     expect([ra.text, rb.text]).toEqual(["done", "done"])
     await fx.close()
+  })
+
+  it("fails a request libfx refuses as too large, so it is not prompted again on every open", async () => {
+    const db = tempDb()
+    const fx = await openFx(db, () => ({ text: "ok" }), { runtimes: { r: {} } })
+    const agent = await fx.agent("a", { runtime: "r", model: "test/model" })
+    await expect(agent.submit("x".repeat(9 * 1024 * 1024))).rejects.toThrow(/the request was not accepted/)
+    expect((await fx.taskGraph()).nodes).toEqual([])
+    expect((await (await agent.submit("hello")).result()).text).toBe("ok")
+    await fx.close()
+    const reopened = await openFx(db, () => ({ text: "ok" }), { runtimes: { r: {} } })
+    expect((await reopened.taskGraph()).nodes).toEqual([])
+    await reopened.close()
   })
 })

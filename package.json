@@ -64,7 +64,7 @@
   },
   "dependencies": {
     "effect": "4.0.0",
-    "libfx": "0.0.13-dev.1432.g1df91f0b4ebf"
+    "libfx": "0.0.14"
   },
   "devDependencies": {
     "@oxlint/plugins": "1.86.0",

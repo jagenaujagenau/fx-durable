@@ -1,7 +1,8 @@
 import type { DatabaseSync } from "node:sqlite"
 import { migration001 } from "./migrations/001_records.js"
+import { migration002 } from "./migrations/002_libfx_0_0_14_sessions.js"
 
-export const migrations = [migration001] as const
+export const migrations = [migration001, migration002] as const
 
 /** The table that records applied migrations. Not `schema_migrations`, which fx-durable 0.2 used for another schema. */
 const MIGRATIONS_TABLE = "fxd_migrations"

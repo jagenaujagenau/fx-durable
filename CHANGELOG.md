@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+fx-durable now depends on libfx 0.0.14, the stable release with durable sessions, instead of a dev build. fx-durable's
+API does not change.
+
+### Breaking
+
+- **Conversations from 0.3 do not carry over.** libfx 0.0.14 deletes session stores written by the dev build 0.3 used
+  (their storage layout changed), and a session older than a day cannot be prompted again. Opening a 0.3 database
+  moves every agent to a new session on its next request. An agent waiting to start from a checkpoint (a fork, or a
+  change of tools) keeps it. Requests that were running fail with "send the request again", and their running tool
+  calls get an unknown outcome. Agents, documents, usage, and finished requests are kept.
+
+### Fixed
+
+- A request over libfx's input limit (8 MiB of JSON) fails with a `ModelError`. Before, it stayed running and every
+  later open of the database failed while trying to resume it.
+
+### Known libfx issues
+
+- With `local()` durability, a steer stored a millisecond or so before a running tool returns misses that turn and
+  runs as a turn of its own ([vercel-labs/fx#1342](https://github.com/vercel-labs/fx/issues/1342)).
+- A crash in the first moments of a call to a tool that may run twice can lose the call; fx-durable still matches the
+  model's new call to the lost one.
+
 ## 0.3.0
 
 fx-durable is rebuilt on libfx's durable sessions (the next libfx release; until it ships, fx-durable pins

@@ -3,7 +3,7 @@
  * scripted model). An upgrade that changes one of these fails here first.
  */
 import { describe, expect, it } from "vitest"
-import { createFxAgent, memory, type FxHostTool, type FxToolContext } from "libfx"
+import { createFxAgent, memory, type FxAgentHostTool, type FxToolContext } from "libfx"
 import { scriptedModel, type Script, type ScriptedRequest } from "../../src/testing/index.js"
 import { isJsonString } from "../../src/domain/json.js"
 
@@ -13,12 +13,12 @@ const users = (req: ScriptedRequest) =>
     .map((m) => (isJsonString(m.content) ? m.content : m.content.map((p) => p.text ?? "").join("")))
     .join(" | ")
 
-const agentWith = (script: Script, tools: ReadonlyArray<FxHostTool> = [], checkpoint?: Uint8Array) => {
+const agentWith = (script: Script, tools: ReadonlyArray<FxAgentHostTool> = [], checkpoint?: Uint8Array) => {
   const options = { apiKey: "k", model: "test/model", fetch: scriptedModel(script), modelCatalog: [], tools: [...tools], durability: memory() }
   return createFxAgent(checkpoint ? { ...options, checkpoint } : options)
 }
 
-const tool = (name: string, execute: FxHostTool["execute"]): FxHostTool => ({ name, description: name, inputSchema: { type: "object", properties: {} }, execute })
+const tool = (name: string, execute: FxAgentHostTool["execute"]): FxAgentHostTool => ({ name, description: name, idempotent: true, inputSchema: { type: "object", properties: {} }, execute })
 
 describe("libfx assumptions", () => {
   it("a tool call gets the model's call id as its executionId, its session id, and the turn's context", async () => {

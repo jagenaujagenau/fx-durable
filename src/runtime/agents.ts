@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto"
-import { Context, Effect, Layer, Queue, Stream } from "effect"
+import { Context, Effect, Layer, Queue, Schema, Stream } from "effect"
 import type { FxStreamLine, FxTurn, FxTurnResult } from "libfx"
 import { Database } from "./database.js"
 import { CrashInjector } from "./crash.js"
@@ -58,6 +58,9 @@ export const messageIdFor = (requestId: string | null): string => {
 }
 
 const message = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause))
+
+/** libfx refused the input itself, so prompting it again cannot succeed. */
+const refused = Schema.is(Schema.Struct({ code: Schema.Literal("FX_INPUT_TOO_LARGE") }))
 
 const usageOf = (usage: FxTurnResult["usage"]): TurnUsage | null => (usage ? { ...usage } : null)
 
@@ -232,18 +235,28 @@ export const layer = Layer.effect(
         return answerOf(seen, record.id)
       }).pipe(Effect.orElseSucceed(() => ""))
 
-    /** Prompt a recorded request into its session (again, after a crash) and follow its turn. */
+    /**
+     * Prompt a recorded request into its session (again, after a crash) and follow its turn. A
+     * request libfx refuses outright (over its input size limit) is recorded as failed, so it is not
+     * prompted again on every resume.
+     */
     const prompt = (agent: DurableAgentRecord, record: SubmissionRecord) =>
       Effect.gen(function* () {
         if (followed.has(keyOf(record.agentId, record.id))) return
         const placement = placementOf(record)
         const session = yield* open(agent, yield* tools.toolSet(agent), placement, record.id)
         const abort = new AbortController()
-        const turn = session.prompt(record.content, { messageId: record.id, signal: abort.signal })
-        const accepted = yield* Effect.tryPromise({
-          try: () => turn.accepted,
-          catch: (cause) => new ModelError({ agentId: agent.id, message: `the request was not accepted: ${message(cause)}`, cause })
-        })
+        const notAccepted = (cause: unknown) => {
+          const error = new ModelError({ agentId: agent.id, message: `the request was not accepted: ${message(cause)}`, cause })
+          if (!refused(cause)) return Effect.fail(error)
+          return database
+            .run((journal) => journal.finishSubmission(agent.id, record.id, { state: "failed", result: null, error: error.message }))
+            .pipe(Effect.andThen(Effect.fail(error)))
+        }
+        const turn = yield* Effect.try({ try: () => session.prompt(record.content, { messageId: record.id, signal: abort.signal }), catch: (cause) => cause }).pipe(
+          Effect.catch(notAccepted)
+        )
+        const accepted = yield* Effect.tryPromise({ try: () => turn.accepted, catch: (cause) => cause }).pipe(Effect.catch(notAccepted))
         if (placement.sessionId === null) yield* database.run((journal) => journal.assignSession(agent.id, record.id, accepted.sessionId, placement.store))
         follow(record, turn, abort)
         yield* crash.hit("submission.after-accept")
@@ -281,8 +294,15 @@ export const layer = Layer.effect(
       for (const record of yield* database.read((storage) => storage.runningSubmissions())) {
         const agent = yield* database.read((storage) => storage.getAgent(record.agentId))
         if (!agent || !(yield* registry.has(agent.runtimeId))) continue // its runtime is registered later; resume() again then
-        yield* prompt(agent, record)
-        resumed.push(record.id)
+        // A request libfx refused is recorded as failed by now; the others still resume.
+        const refusedHere = yield* prompt(agent, record).pipe(
+          Effect.as(false),
+          Effect.catchIf(
+            (error) => error._tag === "ModelError" && refused(error.cause),
+            () => Effect.succeed(true)
+          )
+        )
+        if (!refusedHere) resumed.push(record.id)
       }
       return resumed
     })

@@ -30,8 +30,7 @@ sessions:
 - **Stable agents** that move between sessions on reset, fork, or a change of tools.
 - **Usage and cost**, ready-made **coding tools**, and a **test kit** with a scripted model and a crash matrix.
 
-> fx-durable builds on the durable sessions of the next libfx release. Until it ships, it pins
-> `libfx@0.0.13-dev.1432.g1df91f0b4ebf`.
+> fx-durable builds on the durable sessions of libfx 0.0.14.
 
 ## Quick Start
 
@@ -323,10 +322,10 @@ The [crash suite](tests/crash/crash-matrix.test.ts) checks each of these by kill
 - **Requests are idempotent.** The same `requestId` is the same request, across processes.
 - **Agents are stable.** `fx.agent("engineer")` is the same agent, in the same conversation, after every restart.
 
-libfx `0.0.13-dev.1432` starts a call to a tool that may run twice before storing it. A crash in that instant loses
-the call, and the model calls again with a new id; fx-durable matches such a call to the journal entry of the lost one
-(same request, tool, and input), so its nested calls and idempotency key carry over. libfx's main branch stores those
-calls first; the matching becomes unnecessary once that ships.
+libfx 0.0.14 can lose a call to a tool that may run twice when a crash comes in the first moments of the call
+(within about 100 ms in our runs): the continued turn asks the model again, which calls again with a new id.
+fx-durable matches such a call to the journal entry of the lost one (same request, tool, and input), so its nested
+calls and idempotency key carry over.
 
 ## How it works
 

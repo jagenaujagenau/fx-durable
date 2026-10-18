@@ -1,5 +1,5 @@
 import { Context, Effect, Layer, Schema } from "effect"
-import type { FxHostTool, FxToolContext } from "libfx"
+import type { FxAgentHostTool, FxToolContext } from "libfx"
 import { CrashInjector } from "./crash.js"
 import { Database } from "./database.js"
 import { ToolBlockedError, ToolExecutionError, UnknownOutcomeError } from "../domain/errors.js"
@@ -56,7 +56,7 @@ export interface ToolExecutorInterface {
    * call runs the calling agent's own code and hooks for that tool, as its
    * tool set is at the time of the call.
    */
-  readonly hostTools: (offered: ReadonlyArray<DurableTool>) => ReadonlyArray<FxHostTool>
+  readonly hostTools: (offered: ReadonlyArray<DurableTool>) => ReadonlyArray<FxAgentHostTool>
 }
 
 export class ToolExecutor extends Context.Service<ToolExecutor, ToolExecutorInterface>()("fx-durable/ToolExecutor") {}
@@ -128,9 +128,9 @@ export const layer = Layer.effect(
     const live = new Set<string>()
 
     /**
-     * libfx (until a release that stores an idempotent call before running it)
-     * can lose a call a crash cut off right as it started: the continued turn
-     * asks the model again, which calls again under a new `executionId`. Such a
+     * libfx (0.0.14 still) can lose an idempotent call a crash cut off in its
+     * first moments: the continued turn asks the model again, which calls
+     * again under a new `executionId`. Such a
      * call takes over the journal entry of the lost one, matched by request,
      * tool, and input, so its nested calls and idempotency key carry over.
      */
@@ -357,9 +357,9 @@ export const layer = Layer.effect(
       return { tools: current, tool: current.byName.get(tool.name) ?? tool }
     }
 
-    const hostTools = (offered: ReadonlyArray<DurableTool>): ReadonlyArray<FxHostTool> =>
+    const hostTools = (offered: ReadonlyArray<DurableTool>): ReadonlyArray<FxAgentHostTool> =>
       offered.map(
-        (descriptor): FxHostTool => ({
+        (descriptor): FxAgentHostTool => ({
           name: descriptor.name,
           description: descriptor.description,
           inputSchema: descriptor.jsonSchema,
